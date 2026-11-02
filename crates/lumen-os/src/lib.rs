@@ -3,6 +3,8 @@
 //! thread-safe message queue behind JS message ports and Python interpreter channels, plus
 //! executable memory mappings shared by language runtimes and code generators.
 
+#[cfg(target_os = "android")]
+mod bionic;
 pub mod channel;
 pub mod child;
 pub mod consts;

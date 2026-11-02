@@ -1,5 +1,8 @@
 //! Identity of the calling OS thread, as the Python `_thread` module reports it.
 
+#[cfg(target_os = "android")]
+use crate::bionic as libc;
+
 /// An identifier unique among the live threads of the process (`pthread_self`).
 pub fn ident() -> u64 {
     #[cfg(unix)]

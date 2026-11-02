@@ -3,6 +3,8 @@
 //! an external `lumen_common::buffer::ByteStore` kept alive by a [`Mapping`]. Off Unix mapping
 //! fails with `ENOSYS`.
 
+#[cfg(target_os = "android")]
+use crate::bionic as libc;
 use crate::errno::FsError;
 use std::cell::Cell;
 

@@ -3,6 +3,8 @@
 //! and the Linux-only descriptors (`eventfd`, `timerfd`, `pidfd_open`, ...). Plain arguments and
 //! results; errors are carried as [`FsError`]. Calls a platform lacks fail with `ENOSYS`.
 
+#[cfg(target_os = "android")]
+use crate::bionic as libc;
 use crate::errno::FsError;
 
 pub type R<T> = Result<T, FsError>;
@@ -509,19 +511,27 @@ pub fn getloadavg() -> Option<[f64; 3]> {
 sys! {
     /// `confstr(3)`; `None` when the variable has no value.
     pub fn confstr(name: i32) -> R<Option<String>> {
-        clear_errno();
-        let mut buf = vec![0u8; 256];
-        loop {
-            // SAFETY: `buf` is a live buffer of the length passed.
-            let n = unsafe { libc::confstr(name, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-            if n == 0 {
-                return if errno_is_set() { Err(last()) } else { Ok(None) };
+        #[cfg(target_os = "android")]
+        {
+            let _ = name;
+            Err(FsError("ENOSYS"))
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            clear_errno();
+            let mut buf = vec![0u8; 256];
+            loop {
+                // SAFETY: `buf` is a live buffer of the length passed.
+                let n = unsafe { libc::confstr(name, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+                if n == 0 {
+                    return if errno_is_set() { Err(last()) } else { Ok(None) };
+                }
+                if n > buf.len() {
+                    buf = vec![0u8; n];
+                    continue;
+                }
+                return Ok(Some(text(&buf[..n - 1])));
             }
-            if n > buf.len() {
-                buf = vec![0u8; n];
-                continue;
-            }
-            return Ok(Some(text(&buf[..n - 1])));
         }
     }
 }
@@ -816,10 +826,15 @@ sys! {
     /// `preadv(2)` into `bufs` at `offset`; the bytes read.
     pub fn preadv(fd: i32, bufs: &mut [Vec<u8>], offset: i64, flags: i32) -> R<usize> {
         let v = iovecs_mut(bufs);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         // SAFETY: each iovec points into a live buffer of its length.
         let r = unsafe { if flags == 0 { libc::preadv(fd, v.as_ptr(), v.len() as _, offset as _) } else { libc::preadv2(fd, v.as_ptr(), v.len() as _, offset as _, flags) } };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        // bionic has preadv2 only from API 33.
+        #[cfg(target_os = "android")]
+        if flags != 0 {
+            return Err(FsError("ENOSYS"));
+        }
+        #[cfg(not(target_os = "linux"))]
         let r = {
             let _ = flags;
             // SAFETY: each iovec points into a live buffer of its length.
@@ -833,10 +848,15 @@ sys! {
     /// `pwritev(2)` at `offset`; the bytes written.
     pub fn pwritev(fd: i32, bufs: &[&[u8]], offset: i64, flags: i32) -> R<usize> {
         let v = iovecs(bufs);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         // SAFETY: each iovec points into a live buffer of its length.
         let r = unsafe { if flags == 0 { libc::pwritev(fd, v.as_ptr(), v.len() as _, offset as _) } else { libc::pwritev2(fd, v.as_ptr(), v.len() as _, offset as _, flags) } };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        // bionic has pwritev2 only from API 33.
+        #[cfg(target_os = "android")]
+        if flags != 0 {
+            return Err(FsError("ENOSYS"));
+        }
+        #[cfg(not(target_os = "linux"))]
         let r = {
             let _ = flags;
             // SAFETY: each iovec points into a live buffer of its length.
@@ -922,6 +942,13 @@ linux! {
         let (mut os, mut od) = (offset_src.unwrap_or(0) as libc::off64_t, offset_dst.unwrap_or(0) as libc::off64_t);
         let ps = if offset_src.is_some() { &mut os as *mut libc::off64_t } else { std::ptr::null_mut() };
         let pd = if offset_dst.is_some() { &mut od as *mut libc::off64_t } else { std::ptr::null_mut() };
+        #[cfg(target_os = "android")]
+        {
+            // bionic has copy_file_range only from API 34.
+            let _ = (src, dst, count, ps, pd);
+            Err(FsError("ENOSYS"))
+        }
+        #[cfg(not(target_os = "android"))]
         // SAFETY: the offset pointers are null or point at live offsets.
         ck_size(unsafe { libc::copy_file_range(src, ps, dst, pd, count, 0) as isize })
     }
@@ -1276,6 +1303,8 @@ pub fn posix_spawn(
 #[cfg(unix)]
 mod spawn_imp {
     use super::*;
+    #[cfg(target_os = "android")]
+    use crate::bionic as libc;
     use std::mem::MaybeUninit;
 
     #[cfg(target_vendor = "apple")]
