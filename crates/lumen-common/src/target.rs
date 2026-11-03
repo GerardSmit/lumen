@@ -30,6 +30,8 @@ pub enum Arch {
     Aarch64 = 1,
     X86_64 = 2,
     Wasm32 = 3,
+    /// 32-bit ARM: the interpreter only, never native code.
+    Arm32 = 4,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -39,6 +41,7 @@ pub enum Abi {
     SysV64 = 3,
     Win64 = 4,
     Wasm = 5,
+    Aapcs32 = 6,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -114,6 +117,7 @@ impl TargetSpec {
                 self.pointer_width == 64 && matches!(self.abi, Abi::SysV64 | Abi::Win64)
             }
             Arch::Wasm32 => self.pointer_width == 32 && self.abi == Abi::Wasm,
+            Arch::Arm32 => self.pointer_width == 32 && self.abi == Abi::Aapcs32,
         };
         if !valid {
             return Err("inconsistent architecture, ABI or pointer width");
@@ -124,7 +128,7 @@ impl TargetSpec {
         let allowed = match self.arch {
             Arch::Aarch64 => aarch64::ALL,
             Arch::X86_64 => x64::ALL,
-            Arch::Wasm32 => 0,
+            Arch::Wasm32 | Arch::Arm32 => 0,
         };
         if self.features & !allowed != 0 {
             return Err("unknown CPU features for architecture");
@@ -191,6 +195,7 @@ impl TargetSpec {
             3 => Abi::SysV64,
             4 => Abi::Win64,
             5 => Abi::Wasm,
+            6 => Abi::Aapcs32,
             _ => return Err("unknown ABI"),
         };
         let spec = Self {
@@ -201,6 +206,7 @@ impl TargetSpec {
                 1 => Arch::Aarch64,
                 2 => Arch::X86_64,
                 3 => Arch::Wasm32,
+                4 => Arch::Arm32,
                 _ => return Err("unknown architecture"),
             },
             abi,

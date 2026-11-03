@@ -1011,8 +1011,9 @@ linux! {
     /// `getrandom(2)`.
     pub fn getrandom(size: usize, flags: u32) -> R<Vec<u8>> {
         let mut buf = vec![0u8; size];
+        // The system call, not bionic's wrapper: that only exists from API 28.
         // SAFETY: `buf` is a live buffer of `size` bytes.
-        let n = ck_size(unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, size, flags) as isize })?;
+        let n = ck_size(unsafe { libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), size, flags) as isize })?;
         buf.truncate(n);
         Ok(buf)
     }

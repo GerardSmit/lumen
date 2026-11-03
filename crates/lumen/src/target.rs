@@ -146,6 +146,8 @@ pub fn host() -> TargetSpec {
         )
     } else if cfg!(target_arch = "wasm32") {
         (Arch::Wasm32, Abi::Wasm, 32)
+    } else if cfg!(target_arch = "arm") {
+        (Arch::Arm32, Abi::Aapcs32, 32)
     } else {
         panic!("AOT target description is unsupported on this architecture")
     };

@@ -28,7 +28,8 @@ unsafe extern "system" {
     fn RtlDeleteFunctionTable(table: *mut RuntimeFunction) -> u8;
 }
 
-#[cfg(unix)]
+// 32-bit ARM unwinds through EHABI tables; it has no DWARF frame registry.
+#[cfg(all(unix, not(target_arch = "arm")))]
 unsafe extern "C" {
     fn __register_frame(frame: *const u8);
     fn __deregister_frame(frame: *const u8);
@@ -86,9 +87,9 @@ impl Registration {
             let result = Self {
                 frames,
                 custom: None,
-                registered: true,
+                registered: cfg!(not(target_arch = "arm")),
             };
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_arch = "arm")))]
             __register_frame(result.frames.as_ptr());
             #[cfg(target_os = "macos")]
             result.for_each_fde(|fde| __register_frame(fde));
@@ -175,7 +176,7 @@ impl Drop for Registration {
             if !self.registered {
                 return;
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "arm")))]
             __deregister_frame(self.frames.as_ptr());
             #[cfg(target_os = "macos")]
             self.for_each_fde(|fde| __deregister_frame(fde));

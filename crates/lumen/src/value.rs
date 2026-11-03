@@ -556,6 +556,10 @@ pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, V
 #[inline(always)]
 pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
     const { assert!(cfg!(target_endian = "little") && std::mem::size_of::<Value>() == 16) };
+    // With 4-byte pointers a handle variant keeps its pointer at byte 4, its own alignment;
+    // only `Num`'s `f64` sits at byte 8.
+    #[cfg(target_pointer_width = "32")]
+    let tag = if matches!(tag & 0xff, 5..=8) { tag & 0xffff_ffff | payload << 32 } else { tag };
     std::mem::transmute::<[u64; 2], Value>([tag, payload])
 }
 
@@ -567,6 +571,12 @@ pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
 /// `p` must point to a valid, owned `Value`.
 #[inline(always)]
 pub(crate) unsafe fn take_value_words(p: *mut Value) -> Value {
+    #[cfg(target_pointer_width = "32")]
+    {
+        let value = std::ptr::read(p);
+        std::ptr::write(p as *mut u64, 0);
+        return value;
+    }
     let w = p as *mut u64;
     let (tag, payload) = (
         std::ptr::read_volatile(w),
