@@ -1,14 +1,16 @@
 //! lumen-codegen: a target-neutral optimizing compiler backend.
 //!
 //! Pipeline: front end → [`builder`] (SSA IR, [`ir`]) → [`opt`] → lowering → register
-//! allocation → machine code for x86-64 or ARM64, or a WebAssembly module ([`wasm`]). [`interp`] runs IR directly and is the
+//! allocation → machine code for x86-64, ARM64 or ARM32, or a WebAssembly module ([`wasm`]). [`interp`] runs IR directly and is the
 //! reference every later stage is differentially tested against. See docs/jit.md.
 
 pub mod aarch64;
+pub mod arm32;
 pub mod aot_image;
 pub mod atomics;
 pub mod builder;
 pub mod cfg;
+pub mod divmagic;
 pub mod eval;
 pub mod guard;
 pub mod interp;

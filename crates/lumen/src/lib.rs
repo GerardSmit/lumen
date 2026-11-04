@@ -279,7 +279,9 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 pub use parser::transpile_jsx;
 pub use parser::with_eager_bodies;
 pub use parser::{JsxOptions, JsxRuntime};
-pub use stack::{set_thread_stack_bounds, set_thread_stack_size, THREAD_STACK_SIZE};
+pub use stack::{
+    set_thread_stack_bounds, set_thread_stack_size, MAIN_THREAD_STACK_SIZE, THREAD_STACK_SIZE,
+};
 pub use value::HeapStats;
 
 /// Starts a thread through the process scheduler with `stack_bytes` of stack (0 for the engine's

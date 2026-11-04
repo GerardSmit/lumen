@@ -1,6 +1,6 @@
 //! Host feedback. File identities depend on source operations, never heap addresses.
 use crate::value::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Default)]
@@ -10,6 +10,16 @@ pub struct Profile {
 
 thread_local! {
     static ACTIVE: RefCell<Option<Profile>> = const { RefCell::new(None) };
+    /// Whether `ACTIVE` holds a profile. Destructor-free, so the bytecode loop's per-op check
+    /// is a plain TLS load (`ACTIVE` has a destructor, so every access to it also checks the
+    /// local's lifecycle state).
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a [`record`] is collecting on this thread.
+#[inline(always)]
+pub(crate) fn recording() -> bool {
+    RECORDING.with(Cell::get)
 }
 
 /// Record this host execution, restoring an enclosing collector on unwind.
@@ -17,10 +27,13 @@ pub fn record<R>(body: impl FnOnce() -> R) -> (R, Profile) {
     struct Restore(Option<Profile>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            ACTIVE.with(|a| *a.borrow_mut() = self.0.take());
+            let previous = self.0.take();
+            RECORDING.with(|r| r.set(previous.is_some()));
+            ACTIVE.with(|a| *a.borrow_mut() = previous);
         }
     }
     let _restore = Restore(ACTIVE.with(|a| a.replace(Some(Profile::default()))));
+    RECORDING.with(|r| r.set(true));
     let result = body();
     let profile = ACTIVE.with(|a| a.borrow_mut().take().unwrap());
     (result, profile)

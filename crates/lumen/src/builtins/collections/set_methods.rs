@@ -152,7 +152,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE by index, probing the other's `has` — the callback may delete
             // and re-append entries, and the walk observes that (appended entries are visited).
-            let mut idx = 0usize;
+            let mut idx = 0u64;
             loop {
                 let entry = i
                     .map_data
@@ -234,7 +234,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         if (coll_live_len(i, ptr) as f64) > other_size {
             return Ok(Value::Bool(false));
         }
-        let mut idx = 0usize;
+        let mut idx = 0u64;
         loop {
             let entry = i
                 .map_data
@@ -274,7 +274,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         let vals = set_values(i, &this)?;
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
-            let mut idx = 0usize;
+            let mut idx = 0u64;
             loop {
                 let entry = i
                     .map_data

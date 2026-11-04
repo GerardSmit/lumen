@@ -12,7 +12,8 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-pub const DEFAULT_DECODED_IMAGE_BUDGET: usize = 256 * 1024 * 1024;
+/// Desktop: 256 MiB; small (32-bit) devices: an eighth (see `lumen_common::budget`).
+pub const DEFAULT_DECODED_IMAGE_BUDGET: usize = lumen_common::budget::retained(256 * 1024 * 1024);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static HITS: AtomicU64 = AtomicU64::new(0);

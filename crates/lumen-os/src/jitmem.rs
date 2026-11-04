@@ -273,7 +273,7 @@ impl Drop for ExecMemory {
 #[cfg(target_os = "macos")]
 mod sys {
     extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: isize) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
         fn pthread_jit_write_protect_np(enabled: i32);
         fn sys_icache_invalidate(start: *mut u8, len: usize);
@@ -346,15 +346,29 @@ mod sys {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod sys {
-    extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-        fn munmap(addr: *mut u8, len: usize) -> i32;
+    // The `libc` declarations: `off_t` is 64-bit on musl (and with LFS) even on 32-bit
+    // targets, so a hand-written `mmap` prototype would pass the offset wrongly there.
+    use libc::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    const MAP_PRIVATE_ANON: i32 = libc::MAP_PRIVATE | libc::MAP_ANON;
+
+    unsafe fn mmap(
+        addr: *mut u8,
+        len: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> *mut u8 {
+        libc::mmap(addr.cast(), len, prot, flags, fd, offset as libc::off_t).cast()
     }
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-    const PROT_EXEC: i32 = 4;
-    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+
+    unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32 {
+        libc::mprotect(addr.cast(), len, prot)
+    }
+
+    unsafe fn munmap(addr: *mut u8, len: usize) -> i32 {
+        libc::munmap(addr.cast(), len)
+    }
 
     #[cfg(target_arch = "aarch64")]
     unsafe fn flush_icache(start: *mut u8, len: usize) {
@@ -378,7 +392,28 @@ mod sys {
         asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    /// AArch32 has no user-mode cache maintenance: the kernel's ARM-private
+    /// `cacheflush` call cleans D and invalidates I. Called directly (it is all
+    /// libgcc's `__clear_cache` does), so musl builds, which lack that helper, link.
+    #[cfg(all(target_arch = "arm", any(target_os = "linux", target_os = "android")))]
+    unsafe fn flush_icache(start: *mut u8, len: usize) {
+        const ARM_NR_CACHEFLUSH: libc::c_long = 0x0f_0002;
+        libc::syscall(ARM_NR_CACHEFLUSH, start, start.add(len), 0);
+    }
+
+    /// Other AArch32 systems: the libgcc/compiler-rt helper.
+    #[cfg(all(
+        target_arch = "arm",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    unsafe fn flush_icache(start: *mut u8, len: usize) {
+        extern "C" {
+            fn __clear_cache(start: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
+        }
+        __clear_cache(start.cast(), start.add(len).cast());
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
     unsafe fn flush_icache(_: *mut u8, _: usize) {}
 
     pub unsafe fn alloc(len: usize) -> *mut u8 {
@@ -451,7 +486,7 @@ mod sys {
 
 /// No executable memory on targets without an OS memory API (wasm32): allocation fails and
 /// callers fall back (on wasm32, to the WebAssembly backend).
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), target_os = "none"))]
 mod sys {
     pub unsafe fn alloc(len: usize) -> *mut u8 {
         match super::NATIVE_BACKEND.get() {
@@ -478,7 +513,7 @@ mod sys {
     }
 }
 
-#[cfg(not(any(unix, windows, all(target_arch = "aarch64", target_os = "none"))))]
+#[cfg(not(any(unix, windows, all(any(target_arch = "aarch64", target_arch = "x86_64"), target_os = "none"))))]
 mod sys {
     pub unsafe fn alloc(_len: usize) -> *mut u8 {
         std::ptr::null_mut()

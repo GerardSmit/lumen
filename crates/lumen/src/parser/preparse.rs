@@ -600,9 +600,13 @@ impl<'a> Pre<'a> {
     }
 
     fn loop_body(&mut self) -> Option<()> {
+        // Restore rather than decrement: a nested function body that fails leaves its own
+        // `iter_depth = 0` behind (`fn_body` restores only on success), and that `None` reaches
+        // here with the count already reset.
+        let saved = self.iter_depth;
         self.iter_depth += 1;
         let r = self.substatement(false);
-        self.iter_depth -= 1;
+        self.iter_depth = saved;
         r
     }
 

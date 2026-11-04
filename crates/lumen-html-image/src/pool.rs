@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_BUFFERS: usize = 8;
 const MAX_POOLED_BYTES: usize = 32 << 20;
-const MAX_TOTAL_POOLED_BYTES: usize = 48 << 20;
+const MAX_TOTAL_POOLED_BYTES: usize = lumen_common::budget::retained(48 << 20);
 const MIN_POOLED_BYTES: usize = 64 << 10;
 
 /// Capacity held by every thread's list together.
@@ -114,7 +114,8 @@ mod tests {
     #[test]
     fn pooled_bytes_across_threads_stay_under_the_global_cap() {
         let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let size = 16 << 20;
+        // Half the global cap (16 MiB on 64-bit; the cap is smaller on 32-bit targets).
+        let size = MAX_TOTAL_POOLED_BYTES / 3;
         let handles: Vec<_> = (0..6)
             .map(|_| {
                 std::thread::spawn(move || {
@@ -132,7 +133,8 @@ mod tests {
     #[test]
     fn exited_threads_do_not_use_up_the_global_cap() {
         let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let size = 16 << 20;
+        // Half the global cap (16 MiB on 64-bit; the cap is smaller on 32-bit targets).
+        let size = MAX_TOTAL_POOLED_BYTES / 3;
         for _ in 0..8 {
             let pooled = std::thread::spawn(move || {
                 recycle(vec![0u8; size]);

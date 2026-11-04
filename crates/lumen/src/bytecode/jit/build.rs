@@ -1495,7 +1495,7 @@ fn plan(
             .is_some_and(|x| &**x == "length")
     };
     let mut p = Plan::default();
-    if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+    if cfg!(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "arm")) {
         for pc in header + 1..=backedge {
             let Op::GetMethod(name, _) = ops[pc] else {
                 continue;
@@ -2726,6 +2726,12 @@ impl<'a, 'f> Tr<'a, 'f> {
             .fb
             .func
             .import_function(lumen_codegen::atomics::signature(id).unwrap(), id);
+        // The intrinsics take the address as I64 on every target.
+        let pointer = if PTR == Type::I64 {
+            pointer
+        } else {
+            self.fb.convert(ConvOp::Uext, Type::I64, pointer)
+        };
         let mut args = vec![pointer];
         args.extend(operands);
         let old = self.fb.call_fn(function, &args)[0];
@@ -4480,11 +4486,11 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     fn to_int32_raw(&mut self, x: V) -> V {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
         {
             return self.fb.convert(ConvOp::ToJsInt32, Type::I32, x);
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
         {
             // |x| < 2^63: the truncation to I64 is exact and its low 32 bits are ToInt32 (native
             // targets use the plain conversion, as in `to_index`; wasm32's traps, so it saturates).
@@ -4517,7 +4523,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     /// ToInt32 of any F64 (the modular reduction).
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
     fn to_int32_big(&mut self, x: V) -> V {
         let ax = self.fb.unary(UnaryOp::Fabs, x);
         let lim = self.fb.f64const(9223372036854775808.0);
@@ -6621,7 +6627,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let tag = self.fb.load(MemKind::I32U8, obj, 0);
                 let objt = self.i32c(TAG_OBJ as i64);
                 let is_obj = self.fb.icmp(IntCC::Eq, tag, objt);
-                let payload = self.fb.load(MemKind::I64, obj, VALUE_PAYLOAD);
+                let payload = self.fb.load(HANDLE_AS_I64, obj, VALUE_PAYLOAD);
                 let cached_recv = self.fb.use_var(rv);
                 let same = self.fb.icmp(IntCC::Eq, payload, cached_recv);
                 let ok = self.fb.binary(BinaryOp::Band, is_obj, same);
@@ -7494,7 +7500,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let tag = self.fb.load(MemKind::I32U8, self.slots, off);
         let obj = self.i32c(TAG_OBJ as i64);
         let is_obj = self.fb.icmp(IntCC::Eq, tag, obj);
-        let payload = self.fb.load(MemKind::I64, self.slots, off + VALUE_PAYLOAD);
+        let payload = self.fb.load(HANDLE_AS_I64, self.slots, off + VALUE_PAYLOAD);
         let want = self.fb.iconst(Type::I64, expect as i64);
         let same = self.fb.icmp(IntCC::Eq, payload, want);
         let hit = self.fb.binary(BinaryOp::Band, is_obj, same);

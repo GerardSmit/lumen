@@ -587,6 +587,30 @@ fn merge<'a>(outputs: Vec<ChunkOutput>, root: &StylesheetSource) -> Option<Style
     Some(parser)
 }
 
+/// A comparable text form of a parse result for the chunked-parse tests. Every rule shares its
+/// sheet's whole source text; printed once per rule, a few-thousand-rule sheet dumped to over a
+/// gigabyte (more than a 32-bit address space can allocate), so each rule's text is compared by
+/// length and hash instead.
+#[cfg(test)]
+fn dump_parsed(parsed: &ParsedStylesheets) -> alloc::string::String {
+    let rules: alloc::vec::Vec<_> = parsed
+        .rules
+        .iter()
+        .map(|rule| {
+            let mut rule = rule.clone();
+            let text = rule
+                .source_text
+                .take()
+                .map(|text| (text.len(), lumen_common::fasthash::fnv1a64(0, text.as_bytes())));
+            (rule, text)
+        })
+        .collect();
+    alloc::format!(
+        "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+        rules, parsed.font_faces, parsed.family_display, parsed.keyframes, parsed.layers
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,10 +639,7 @@ mod tests {
     }
 
     fn dump(parsed: &ParsedStylesheets) -> alloc::string::String {
-        format!(
-            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
-            parsed.rules, parsed.font_faces, parsed.family_display, parsed.keyframes, parsed.layers
-        )
+        dump_parsed(parsed)
     }
 
     fn assert_same(text: &str, threads: usize, expect_parallel: bool) {
@@ -901,7 +922,7 @@ mod tests {
     fn primer_like(custom_properties: usize, media_blocks: usize, rules_per_block: usize) -> alloc::string::String {
         let mut text = alloc::string::String::from(":root{");
         for n in 0..custom_properties {
-            text += &format!("--token-{n}:var(--base-{},#{:06x});", n % 17, (n * 2_654_435) % 0xff_ffff);
+            text += &format!("--token-{n}:var(--base-{},#{:06x});", n % 17, (n as u64 * 2_654_435) % 0xff_ffff);
         }
         text += "}:root,[data-color-mode=light]{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}";
         text += "@layer primer-css-base{html{-webkit-text-size-adjust:100%;font-size:16px}body{margin:0}}";

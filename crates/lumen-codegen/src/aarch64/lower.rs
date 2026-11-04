@@ -1147,7 +1147,7 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
 /// Loop rotation by layout (as on x64): a loop header that ends in a conditional branch moves
 /// to just after its last latch, so the back edge falls through into the exit test and each
 /// iteration takes one branch instead of two.
-fn rotate_loops(f: &Function, cfg: &Cfg, mut order: Vec<Block>) -> Vec<Block> {
+pub(crate) fn rotate_loops(f: &Function, cfg: &Cfg, mut order: Vec<Block>) -> Vec<Block> {
     let is_brif = |b: Block| {
         f.terminator(b)
             .is_some_and(|t| matches!(f.inst(t), InstData::Brif { .. }))

@@ -1636,6 +1636,14 @@ pub(crate) struct InlineCallee {
     class_fields: bool,
 }
 
+/// Whether `f` is the built-in native `nf` (a `Function.prototype.call`-style adaptor).
+#[inline]
+fn is_native_fn(f: &Value, nf: crate::value::NativeFn) -> bool {
+    let Value::Obj(o) = f else { return false };
+    let Ok(b) = o.try_borrow() else { return false };
+    matches!(&b.call, crate::value::Callable::Native(fp) if *fp as usize == nf as usize)
+}
+
 #[inline]
 pub(crate) fn inline_callee(i: &Interp, callee: &Value) -> Option<InlineCallee> {
     let Value::Obj(o) = callee else {
@@ -2455,7 +2463,10 @@ fn run_vm_frames<const ONE: bool>(
             stepped = true;
         }
         let op = ops[*pc];
-        if matches!(
+        // One plain thread-local load per op when no host profile is being recorded (always,
+        // outside `feedback::record`).
+        if !crate::feedback::recording() {
+        } else if matches!(
             op,
             Op::Add
                 | Op::Sub
@@ -2649,15 +2660,19 @@ fn run_vm_frames<const ONE: bool>(
             Op::LoadLexicalThis => stack.push(i.lexical_this(env)?),
             Op::GetProp(n, c) => {
                 let obj = pop!();
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
+                let cache = chunk.caches.at(c as usize);
+                let v = match Interp::ic_data_hit(&obj, cache) {
+                    Some(v) => v,
+                    None => i.get_prop_ic(&obj, &chunk.names[n as usize], cache)?,
+                };
                 stack.push(v);
             }
             Op::GetPropThis(n, c) => {
-                let v = i.get_prop_ic(
-                    this_val,
-                    &chunk.names[n as usize],
-                    chunk.caches.at(c as usize),
-                )?;
+                let cache = chunk.caches.at(c as usize);
+                let v = match Interp::ic_data_hit(this_val, cache) {
+                    Some(v) => v,
+                    None => i.get_prop_ic(this_val, &chunk.names[n as usize], cache)?,
+                };
                 stack.push(v);
             }
             Op::GetPropLocal(s, n, c) => {
@@ -2673,7 +2688,11 @@ fn run_vm_frames<const ONE: bool>(
                 }
                 // Borrowed, not cloned: only this frame's own code writes its slots, and none
                 // runs during the read (like GetPropThis's receiver).
-                let v = i.get_prop_ic(obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
+                let cache = chunk.caches.at(c as usize);
+                let v = match Interp::ic_data_hit(obj, cache) {
+                    Some(v) => v,
+                    None => i.get_prop_ic(obj, &chunk.names[n as usize], cache)?,
+                };
                 stack.push(v);
             }
             Op::SetProp(n, c) => {
@@ -3050,7 +3069,11 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::GetMethod(n, c) => {
                 let obj = pop!();
-                let m = i.get_prop_ic(&obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
+                let cache = chunk.caches.at(c as usize);
+                let m = match Interp::ic_data_hit(&obj, cache) {
+                    Some(m) => m,
+                    None => i.get_prop_ic(&obj, &chunk.names[n as usize], cache)?,
+                };
                 stack.push(obj);
                 stack.push(m);
             }
@@ -3348,6 +3371,46 @@ fn run_vm_frames<const ONE: bool>(
                 i.cur_site = crate::interpreter::frames::SITE_PC | (*pc - 1) as u32;
                 let at = stack.len() - argc as usize;
                 try_inline_call!(at, true);
+                // `f.call(thisArg, ...args)` with an inlinable user `f` (old-style inheritance,
+                // transpiled classes): rewrite the window `[f, call, thisArg, args..]` to the
+                // direct call `[thisArg, f, args..]` and run `f` as an inline frame, instead of
+                // entering `Function.prototype.call` natively and a nested VM for `f`. The
+                // JIT does the same (`jit::call`'s `Adaptor::Call`); without a JIT (32-bit
+                // ARM) this is the only path. `call` is transparent in stack traces either way.
+                if !ONE
+                    && !frames.is_null()
+                    && is_native_fn(&stack[at - 1], crate::builtins::nf_function_call)
+                    && inline_callee(i, &stack[at - 2]).is_some()
+                {
+                    stack.with_vec(|v| {
+                        let this_arg = if argc > 0 { v.remove(at) } else { Value::Undefined };
+                        let f = std::mem::replace(&mut v[at - 2], this_arg);
+                        v[at - 1] = f;
+                    });
+                    // One argument fewer, the window starts at the same index.
+                    try_inline_call!(at, true);
+                }
+                // `f.apply(thisArg, list)` likewise (`Super.apply(this, arguments)` in ES5
+                // output of TypeScript and Babel). The list is built first, as `apply` does
+                // (its getters may run code); the stack is only rewritten once it succeeded.
+                if !ONE
+                    && !frames.is_null()
+                    && argc <= 2
+                    && is_native_fn(&stack[at - 1], crate::builtins::nf_function_apply)
+                    && inline_callee(i, &stack[at - 2]).is_some()
+                {
+                    let list_arg = if argc == 2 { stack[at + 1].clone() } else { Value::Undefined };
+                    let list =
+                        crate::builtins::apply_arg_list(i, list_arg).map_err(Abrupt::Throw)?;
+                    stack.with_vec(|v| {
+                        let this_arg = if argc > 0 { v[at].clone() } else { Value::Undefined };
+                        v.truncate(at);
+                        let f = std::mem::replace(&mut v[at - 2], this_arg);
+                        v[at - 1] = f;
+                        v.extend(list);
+                    });
+                    try_inline_call!(at, true);
+                }
                 let m = stack[at - 1].clone();
                 let this = stack[at - 2].clone();
                 let fused = matches!(ops.get(*pc), Some(Op::Await));

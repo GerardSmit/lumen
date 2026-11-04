@@ -126,8 +126,9 @@ struct ConsHdr {
 /// The registry entry of a root with views.
 struct Root {
     views: Vec<NonNull<ViewHdr>>,
-    /// Sum of the views' lengths (overlaps counted twice).
-    bytes: usize,
+    /// Sum of the views' lengths (overlaps counted twice). `u64`: many views of one large root
+    /// sum past `usize::MAX` on 32-bit targets.
+    bytes: u64,
 }
 
 /// Views are on unless `LUMEN_NO_STR_VIEWS` is set (A/B measurement).
@@ -625,7 +626,7 @@ impl LStr {
                     bytes: 0,
                 });
                 e.views.push(v);
-                e.bytes += piece.len();
+                e.bytes += piece.len() as u64;
                 (e.views.len() - 1) as u32
             });
             v.as_ptr().write(ViewHdr {
@@ -695,7 +696,7 @@ impl LStr {
                 if let Some(moved) = e.views.get(slot) {
                     (*moved.as_ptr()).slot = slot as u32;
                 }
-                e.bytes = e.bytes.saturating_sub(len);
+                e.bytes = e.bytes.saturating_sub(len as u64);
                 if e.views.is_empty() {
                     r.remove(&key);
                 } else if e.views.capacity() > 64 && e.views.len() < e.views.capacity() / 4 {
@@ -956,7 +957,7 @@ pub fn compact_views() -> usize {
             .iter()
             .filter(|(&k, e)| unsafe {
                 let h = &*(k as *const Header);
-                h.strong.get() as usize == e.views.len() && e.bytes < h.len.get() as usize / 2
+                h.strong.get() as usize == e.views.len() && e.bytes < h.len.get() as u64 / 2
             })
             .map(|(&k, _)| k)
             .collect()
@@ -1018,7 +1019,7 @@ pub fn compact_views() -> usize {
             e.bytes = e
                 .views
                 .iter()
-                .map(|v| (*v.as_ptr()).h.len.get() as usize)
+                .map(|v| (*v.as_ptr()).h.len.get() as u64)
                 .sum();
             with_roots(|r| r.borrow_mut().insert(nk, e));
         }

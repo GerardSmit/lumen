@@ -57,7 +57,10 @@ mod tests {
         assert_eq!(sum(3, 4, 7), Ok(7));
         assert_eq!(sum(3, 5, 7), Err(TooLarge));
         assert_eq!(sum(usize::MAX, 1, usize::MAX), Err(TooLarge));
-        assert_eq!(repeat(1 << 20, 1 << 20, 1 << 40), Ok(1 << 40));
+        // A product exactly at the cap is allowed (2^21 * 2^21 on 64-bit, 2^10 * 2^10 on
+        // 32-bit targets).
+        let half: usize = 1 << (usize::BITS / 3);
+        assert_eq!(repeat(half, half, half * half), Ok(half * half));
         assert_eq!(repeat(usize::MAX, 2, usize::MAX), Err(TooLarge));
     }
 

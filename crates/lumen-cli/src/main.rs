@@ -38,7 +38,7 @@ static GLOBAL_ALLOC: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc
 /// the native stack, and a debug build's frames are several KiB each — deep enough JS recursion
 /// (well within the engine's own `MAX_EVAL_DEPTH` guard) overflows the default 8 MiB main-thread
 /// stack before the guard fires. The reservation is virtual; pages are committed as touched.
-const MAIN_STACK_BYTES: usize = 256 * 1024 * 1024;
+const MAIN_STACK_BYTES: usize = lumen::MAIN_THREAD_STACK_SIZE;
 
 /// Writing past RLIMIT_FSIZE must fail with EFBIG, not kill the process with SIGXFSZ.
 #[cfg(unix)]

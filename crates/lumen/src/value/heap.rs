@@ -369,16 +369,24 @@ fn slot(chunk: NonNull<ChunkHdr>, i: usize) -> *mut GcBox {
     }
 }
 
-/// The free list's link lives in the dead box's second word, after the header word that holds
-/// the zero weak count marking the slot free.
+/// Byte offset of the free list's link in a dead box: just past the 8-byte header, whose zero
+/// weak count (bytes 4..6) marks the slot free. A pointer-sized step from the box start is the
+/// same place on 64-bit targets, but on 32-bit it lands on the header itself: the link
+/// overwrote the weak count, free slots read as live, their pages were never released and a
+/// free-list rebuild dropped them for good.
+const FREE_LINK_OFF: usize = std::mem::offset_of!(GcBox, value);
+const _: () = assert!(FREE_LINK_OFF == 8);
+
+/// The free list's link lives in the dead box's first word after the header (see
+/// [`FREE_LINK_OFF`]).
 #[inline(always)]
 unsafe fn free_next(p: *mut GcBox) -> *mut GcBox {
-    p.cast::<*mut GcBox>().add(1).read()
+    p.cast::<u8>().add(FREE_LINK_OFF).cast::<*mut GcBox>().read()
 }
 
 #[inline(always)]
 unsafe fn set_free_next(p: *mut GcBox, next: *mut GcBox) {
-    p.cast::<*mut GcBox>().add(1).write(next)
+    p.cast::<u8>().add(FREE_LINK_OFF).cast::<*mut GcBox>().write(next)
 }
 
 #[inline]
@@ -875,6 +883,7 @@ impl Drop for ObjHeap {
                 if hdr.used == 0 {
                     unsafe { chunk_free(c.as_ptr()) };
                 } else {
+                    keep_leaked_chunk(c.as_ptr());
                     hdr.live = *sink.get_or_insert_with(|| Box::leak(Box::new(super::LiveCount::new(0))));
                     hdr.free_head = *free_sink.get_or_insert_with(|| {
                         Box::leak(Box::new(Cell::new(std::ptr::null_mut())))
@@ -884,6 +893,17 @@ impl Drop for ObjHeap {
                 }
             }
         }
+    }
+}
+
+/// Record a chunk [`ObjHeap::drop`] leaks on purpose. The list is never read: it only keeps the
+/// chunk referenced, so leak checkers (LeakSanitizer in the fuzz and ASan jobs) see it and what
+/// its boxes own as still reachable instead of reporting the whole graph as leaked.
+#[cold]
+fn keep_leaked_chunk(c: *mut ChunkHdr) {
+    static LEAKED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut leaked) = LEAKED.lock() {
+        leaked.push(c as usize);
     }
 }
 

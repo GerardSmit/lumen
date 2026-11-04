@@ -2921,6 +2921,20 @@ impl Interp {
         // Holes leave the index absent (a real elision), not `undefined`.
         // Elements are created as own data properties (CreateDataProperty), so accessors on
         // Array.prototype are never consulted.
+        //
+        // No holes or spreads (the common literal): evaluate the elements in order and build
+        // the packed array once, as the bytecode VM does, instead of inserting each element
+        // under a formatted index string. The array is unobservable until the literal
+        // completes, so building it last changes nothing visible.
+        if elems.iter().all(|e| matches!(e, ArrayElem::Item(_))) {
+            let mut items = Vec::with_capacity(elems.len());
+            for e in elems {
+                if let ArrayElem::Item(e) = e {
+                    items.push(self.eval(e, env)?);
+                }
+            }
+            return Ok(self.make_array(items));
+        }
         let arr = self.make_array(Vec::new());
         let Value::Obj(ao) = &arr else { unreachable!() };
         let mut idx: usize = 0;
@@ -3018,7 +3032,16 @@ impl Interp {
     }
 
     fn eval_object(&mut self, props: &[PropDef], env: &Env) -> Result<Value, Abrupt> {
-        let obj = self.new_object();
+        // Size the box by the literal's own properties, as the bytecode compiler's templates
+        // do: unsized, every literal took the 4-slot class and spilled past 4 properties to a
+        // heap vector (157 B for `{x, y}` instead of 131, 296 B for five fields instead of
+        // 198). Top-level code and functions before tier-up run here. Spread adds an unknown
+        // number; an empty literal keeps the default class for properties added later.
+        let own = props
+            .iter()
+            .filter(|p| !matches!(p, PropDef::Spread(_) | PropDef::Proto(_)))
+            .count();
+        let obj = Object::new_with_capacity(Some(self.object_proto.clone()), own);
         // Methods/getters/setters carry a [[HomeObject]] (the literal itself) so `super.x` resolves
         // against the object's *current* prototype, evaluated dynamically at access time.
         // Built on first use: a literal whose methods can't reach their home object (no `super`,
@@ -7568,7 +7591,7 @@ impl Interp {
     pub(crate) fn num_to_str(&self, n: f64) -> String {
         // Integer fast path: array indices and loop counters dominate ToString(Number) traffic,
         // and integers never need the shortest-float machinery. (-0.0 correctly prints "0".)
-        if n.trunc() == n && n.abs() <= 9_007_199_254_740_992.0 {
+        if is_safe_integral(n) {
             return (n as i64).to_string();
         }
         if n.is_nan() {
@@ -8230,6 +8253,22 @@ pub(crate) fn to_int32(n: f64) -> i32 {
     to_int32_slow(n)
 }
 
+/// `n` as an array index (an integer in `0..2^32 - 1`; `-0` is 0). Uses a saturating cast
+/// instead of `f64::trunc`, which is a libm call on baseline x86_64 (no SSE4.1) and on ARM
+/// VFPv2 (Raspberry Pi 1); element access runs this on every `a[i]`.
+#[inline(always)]
+pub(crate) fn array_index(n: f64) -> Option<u32> {
+    let i = n as u32; // saturating; NaN becomes 0, which then fails the compare
+    (i as f64 == n && i != u32::MAX).then_some(i)
+}
+
+/// Whether `n` is an integer of magnitude at most 2^53 (`trunc(n) == n && |n| <= 2^53`
+/// without the `trunc` call; see [`array_index`]).
+#[inline(always)]
+pub(crate) fn is_safe_integral(n: f64) -> bool {
+    n.abs() <= 9_007_199_254_740_992.0 && n as i64 as f64 == n
+}
+
 #[inline(never)]
 fn to_int32_slow(n: f64) -> i32 {
     if !n.is_finite() || n == 0.0 {
@@ -8251,7 +8290,7 @@ fn to_int32_slow(n: f64) -> i32 {
 /// `String`). `None` for anything else; `-0` prints as `0`.
 #[inline]
 pub(crate) fn int_str(n: f64) -> Option<([u8; 20], usize)> {
-    if !(n.trunc() == n && n.abs() <= 9_007_199_254_740_992.0) {
+    if !is_safe_integral(n) {
         return None;
     }
     let neg = n < 0.0;
@@ -8846,6 +8885,28 @@ impl Interp {
                     referrer,
                 ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod integral_tests {
+    use super::{array_index, is_safe_integral};
+
+    /// The cast-based checks agree with the `trunc` forms they replace.
+    #[test]
+    fn integral_checks_match_trunc_forms() {
+        let cases = [
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1.5, 2147483647.0, 2147483648.0, 4294967294.0,
+            4294967295.0, 4294967296.0, 1e15, 9_007_199_254_740_991.0, 9_007_199_254_740_992.0,
+            9_007_199_254_740_994.0, -9_007_199_254_740_992.0, 1e300, f64::MAX, f64::MIN_POSITIVE,
+            f64::EPSILON, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        ];
+        for n in cases {
+            let index = (n.trunc() == n && (0.0..u32::MAX as f64).contains(&n)).then_some(n as u32);
+            assert_eq!(array_index(n), index, "array_index({n})");
+            let integral = n.trunc() == n && n.abs() <= 9_007_199_254_740_992.0;
+            assert_eq!(is_safe_integral(n), integral, "is_safe_integral({n})");
         }
     }
 }

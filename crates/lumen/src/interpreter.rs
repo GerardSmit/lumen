@@ -4202,9 +4202,7 @@ impl Interp {
 
     pub(crate) fn fast_get_elem(&mut self, o: &Gc, n: f64) -> Option<Value> {
         // (See `fast_get_str`.)
-        if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
-            return None;
-        }
+        crate::eval::array_index(n)?;
         if !o.borrow().ic_plain.get() {
             // A split view reads its own elements without touching the property map (a miss
             // past its length takes the generic path: the prototype chain).
@@ -4296,11 +4294,10 @@ impl Interp {
     /// (negative, fractional, NaN, infinite or past the end; `-0` is the key "0").
     #[inline]
     pub(crate) fn ta_num_index(&self, info: &TaInfo, n: f64) -> Option<usize> {
-        if n >= 0.0 && n.fract() == 0.0 && n < self.ta_len(info).unwrap_or(0) as f64 {
-            Some(n as usize)
-        } else {
-            None
-        }
+        // Saturating cast instead of `fract` (a libm call; see `eval::array_index`): NaN casts
+        // to 0 and fails the compare, `-0` is index 0.
+        let i = n as usize;
+        (i as f64 == n && i < self.ta_len(info).unwrap_or(0)).then_some(i)
     }
 
     /// `base[key]` after the element fast paths missed: a Number key on a TypedArray reads the
@@ -4348,7 +4345,7 @@ impl Interp {
     /// OrdinarySet. Returns the value back on miss so the caller runs the generic path.
     #[inline]
     pub(crate) fn fast_set_elem(&mut self, o: &Gc, n: f64, mut v: Value) -> Result<(), Value> {
-        if n.trunc() != n || !(0.0..u32::MAX as f64).contains(&n) {
+        if crate::eval::array_index(n).is_none() {
             return Err(v);
         }
         if !o.borrow().ic_plain.get() {
@@ -4414,6 +4411,54 @@ impl Interp {
             }
             Err(prop) => Err(prop.into_value()),
         }
+    }
+
+    /// The most common reads, inlined into the bytecode loop ahead of [`Interp::get_prop_ic`]:
+    /// a data property of a plain object found by the site's first way, either its own
+    /// (depth 0) or on its prototype (depth 1: methods). Exactly the conditions under which
+    /// `ic_shape_probe` answers such a data state (a getter state for the same shapes can only
+    /// exist when the slot holds an accessor, which falls back here too). `None` means "ask
+    /// `get_prop_ic`", never "absent". Without it every read paid the call into the large
+    /// general function (six saved registers, a 184-byte frame, the getter-way scan): a third
+    /// of a plain property-read loop without a JIT.
+    #[inline(always)]
+    pub(crate) fn ic_data_hit(
+        base: &Value,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Option<Value> {
+        let Value::Obj(o) = base else {
+            return None;
+        };
+        let st = cache.get();
+        // Depth 0 or 1 with no flag bits (`IC_GETTER`/`IC_ARR_KEYCHK` are bits 5 and 6;
+        // `IC_EMPTY`, `IC_ABSENT` and `IC_CREATE` are all >= 0x80).
+        if st.depth > 1 {
+            return None;
+        }
+        let b = o.borrow();
+        if !matches!(b.exotic, Exotic::None)
+            || !b.ic_plain.get()
+            || b.props.shape() != st.recv_shape
+        {
+            return None;
+        }
+        if st.depth == 0 {
+            let p = b.props.entry_at(st.slot as usize)?;
+            return (!p.accessor()).then(|| p.value());
+        }
+        let hp = Gc::as_ptr(b.proto.as_ref()?);
+        drop(b);
+        // SAFETY: the receiver (alive through `base`) keeps its prototype alive, and no code
+        // runs during the read; `ic_shape_probe` walks the chain the same way.
+        let hb = unsafe { (*hp).borrow() };
+        if !matches!(hb.exotic, Exotic::None)
+            || !hb.ic_plain.get()
+            || hb.props.shape() != st.holder_shape
+        {
+            return None;
+        }
+        let p = hb.props.entry_at(st.slot as usize)?;
+        (!p.accessor()).then(|| p.value())
     }
 
     /// `obj.name` read with a per-site inline cache (bytecode `GetProp`/`GetMethod`). The cache
@@ -6369,6 +6414,22 @@ impl Interp {
 
     /// Array length for an operation that will iterate/allocate proportional to it. Errors with a
     /// RangeError past [`MAX_ARRAY_OP_LEN`] so a huge `.length` cannot exhaust memory.
+    /// An empty list with room for `len` values, for a length a script controls (an
+    /// array-like's `length`). Throws a RangeError when the reservation exceeds the heap limit
+    /// or the allocator refuses it: `Vec::with_capacity` aborts the whole process on failure,
+    /// and `MAX_ARRAY_OP_LEN` values (2 GiB) exceed a 32-bit address space.
+    pub(crate) fn value_list_with_capacity(&mut self, len: usize) -> Result<Vec<Value>, Abrupt> {
+        let Some(bytes) = len.checked_mul(std::mem::size_of::<Value>()) else {
+            return Err(self.throw("RangeError", "array length exceeds engine limit"));
+        };
+        self.check_heap(bytes)?;
+        let mut list = Vec::new();
+        if list.try_reserve_exact(len).is_err() {
+            return Err(self.throw("RangeError", "array length exceeds available memory"));
+        }
+        Ok(list)
+    }
+
     pub(crate) fn checked_array_len(&mut self, obj: &Gc) -> Result<usize, Abrupt> {
         let len = self.to_length(obj)?;
         if len > MAX_ARRAY_OP_LEN {

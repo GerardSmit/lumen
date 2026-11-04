@@ -32,7 +32,7 @@ pub(super) fn collection_for_each(
     let cb_this = arg(a, 1);
     // Iterate the LIVE backing list by index (positions are stable — deletes leave tombstones), so
     // entries appended during the callback are visited and deleted entries are skipped.
-    let mut idx = 0usize;
+    let mut idx = 0u64;
     let mut f = crate::bytecode::PreparedCall::new(i, cb, cb_this);
     loop {
         let entry = i
@@ -133,7 +133,7 @@ pub(crate) fn map_set_iter_drain(i: &mut Interp, obj: &Gc) -> Vec<Value> {
                 b.props.get("__ci_done").map(|p| p.value()),
                 Some(Value::Bool(true))
             ),
-            num("__ci_index") as usize,
+            num("__ci_index") as u64,
             num("__ci_kind") as u8,
         )
     };
@@ -176,7 +176,7 @@ pub(crate) fn map_set_iter_step(i: &mut Interp, obj: &Gc) -> Option<Value> {
             let get = |s: usize| b.props.entry_at(s).map(|p| p.value());
             match (get(cs), get(is), get(ks)) {
                 (Some(Value::Obj(c)), Some(Value::Num(idx)), Some(Value::Num(kind))) => {
-                    Some((c, idx as usize, kind as u8))
+                    Some((c, idx as u64, kind as u8))
                 }
                 _ => None,
             }
@@ -202,7 +202,7 @@ pub(crate) fn map_set_iter_try_step(i: &mut Interp, obj: &Gc) -> Option<Option<V
             let get = |s: usize| b.props.entry_at(s).map(|p| p.value());
             match (get(cs), get(is), get(ks)) {
                 (Some(Value::Obj(c)), Some(Value::Num(idx)), Some(Value::Num(kind))) => {
-                    Some((c, idx as usize, kind as u8))
+                    Some((c, idx as u64, kind as u8))
                 }
                 _ => None,
             }
@@ -221,7 +221,7 @@ fn step_at(
     i: &mut Interp,
     obj: &Gc,
     coll: Gc,
-    mut idx: usize,
+    mut idx: u64,
     kind: u8,
     is: usize,
 ) -> Option<Value> {
@@ -234,7 +234,7 @@ fn step_at(
             2 => (k.unpack(), Some(v.unpack())),
             _ => (v.unpack(), None),
         });
-    let set_idx = |idx: usize| {
+    let set_idx = |idx: u64| {
         if let Some(p) = obj.borrow_mut().props.entry_at_mut(is) {
             p.set_value(Value::Num(idx as f64));
         }
@@ -293,7 +293,7 @@ fn map_set_iter_step_slow(i: &mut Interp, obj: &Gc) -> Option<Value> {
                 b.props.get("__ci_done").map(|p| p.value()),
                 Some(Value::Bool(true))
             ),
-            num("__ci_index") as usize,
+            num("__ci_index") as u64,
             num("__ci_kind") as u8,
         )
     };
@@ -341,7 +341,7 @@ pub(crate) fn map_set_iter_preview(i: &Interp, obj: &Gc) -> Option<(Vec<Value>, 
                 b.props.get("__ci_done").map(|p| p.value()),
                 Some(Value::Bool(true))
             ),
-            num("__ci_index") as usize,
+            num("__ci_index") as u64,
             num("__ci_kind") as u8,
         )
     };

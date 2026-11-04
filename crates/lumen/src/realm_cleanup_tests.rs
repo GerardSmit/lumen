@@ -10,7 +10,11 @@ fn quiescent_worker_cleanup_preserves_a_live_parent_realm() {
         for _ in 0..3 {
             let mut worker = Engine::new();
             worker.eval("function hot(x){return x*3+1;} hot.self=hot;var sum=0;for(var i=0;i<2048;i++)sum+=hot(i);", false).unwrap();
-            assert!(worker.jit_stats().executed_entries > 0);
+            // Native entries exist only where there is a JIT backend; elsewhere this checks
+            // the bytecode-only cleanup.
+            if cfg!(any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")))) {
+                assert!(worker.jit_stats().executed_entries > 0);
+            }
             drop(worker);
             crate::collect_quiescent_realms();
             assert_eq!(crate::value::live_objects(), baseline);

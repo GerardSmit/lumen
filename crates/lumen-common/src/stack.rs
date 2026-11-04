@@ -10,7 +10,22 @@ use std::cell::Cell;
 
 /// Native stack size for threads that run an engine (workers, agents, coroutines, host pool
 /// threads): room for `MAX_EVAL_DEPTH` interpreter frames, as the CLI's main thread has.
+///
+/// 32-bit targets (Raspberry Pi 1, 32-bit Android) get a quarter: a 32-bit process has 2-3 GiB of
+/// address space, and every engine thread reserves this much of it. The byte guard below turns a
+/// deeper recursion into a RangeError, and the bytecode VM runs JS-to-JS calls without native
+/// recursion, so the smaller stack only lowers the depth of native recursion (the tree-walker,
+/// regex backtracking, JSON and structured-clone walks).
+#[cfg(target_pointer_width = "64")]
 pub const THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "64"))]
+pub const THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Native stack for a thread that runs a whole program (the CLI's main thread, a child realm):
+/// four times [`THREAD_STACK_SIZE`]. The reservation is virtual; pages are committed as touched.
+/// On 32-bit targets 16 child realms of 256 MiB each would need more address space than the
+/// process has, hence the smaller size there.
+pub const MAIN_THREAD_STACK_SIZE: usize = 4 * THREAD_STACK_SIZE;
 
 /// Bytes kept free below the limit for code that runs between checks (natives, host calls, the
 /// unchecked tail of a recursion). Debug builds have far larger frames.

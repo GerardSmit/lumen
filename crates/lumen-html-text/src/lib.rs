@@ -49,12 +49,12 @@ const MAX_SHAPE_FONT_SIZE: f32 = 16384.0;
 /// Coverage bitmaps grow with the square of the size; larger glyphs are not rasterized.
 const MAX_RASTER_FONT_SIZE: f32 = 2048.0;
 const RUN_CACHE_SLOTS: usize = 16384;
-const MAX_RUN_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RUN_CACHE_BYTES: usize = lumen_common::budget::retained(8 * 1024 * 1024);
 /// A font set's own shaped runs hold whole-paragraph segments with cluster
 /// advances. A long article needs about 15 MiB of them; a smaller bound makes
 /// every relayout reshape most paragraphs.
 const FONT_SET_RUN_CACHE_SLOTS: usize = 32768;
-const MAX_FONT_SET_RUN_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FONT_SET_RUN_CACHE_BYTES: usize = lumen_common::budget::retained(32 * 1024 * 1024);
 const MAX_CACHED_TEXT_BYTES: usize = 256;
 const MAX_REGISTERED_FONTS: usize = 64;
 const MAX_REQUESTED_FAMILIES: usize = 64;

@@ -511,15 +511,15 @@ mod tests {
             Err(CastError::SizeMismatch)
         );
         assert_eq!(
-            v.cast(None, 1, ByteOrder::Little, Some(vec![1 << 62, 4])),
+            v.cast(None, 1, ByteOrder::Little, Some(vec![(usize::MAX / 4 + 1), 4])),
             Err(CastError::TooLarge)
         );
         assert_eq!(
-            v.cast(None, 8, ByteOrder::Little, Some(vec![1 << 61, 4])),
+            v.cast(None, 8, ByteOrder::Little, Some(vec![(usize::MAX / 8 + 1), 4])),
             Err(CastError::TooLarge)
         );
         assert_eq!(
-            v.cast(None, 1 << 62, ByteOrder::Little, Some(vec![1 << 61])),
+            v.cast(None, (usize::MAX / 4 + 1), ByteOrder::Little, Some(vec![(usize::MAX / 8 + 1)])),
             Err(CastError::SizeMismatch)
         );
         let strided = v.slice(0, 0, 2, 4);
@@ -539,9 +539,9 @@ mod tests {
         let e = ViewDesc::bytes(3, 0, false);
         assert_eq!(e.extent(), Some((3, 3)));
         e.for_each_offset(|_| panic!("empty view has no elements"));
-        let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![1 << 62, 4, 0], false);
+        let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![(usize::MAX / 4 + 1), 4, 0], false);
         assert_eq!((huge.nitems(), huge.extent()), (0, Some((0, 0))));
-        let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![1 << 62, 4], false);
+        let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![(usize::MAX / 4 + 1), 4], false);
         assert_eq!(
             (huge.checked_nitems(), huge.nbytes(), huge.extent()),
             (None, usize::MAX, None)

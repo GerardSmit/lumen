@@ -96,7 +96,7 @@ impl CollectionData {
     /// The next live entry at or after `cursor`, advancing it. Cursors are opaque positions
     /// that stay valid across every mutation of the collection; an iteration starts at 0.
     #[inline]
-    pub(crate) fn next(&self, cursor: &mut usize) -> Option<(&PackedValue, &PackedValue)> {
+    pub(crate) fn next(&self, cursor: &mut u64) -> Option<(&PackedValue, &PackedValue)> {
         table!(&self.store, t => t.next(cursor))
     }
 
@@ -148,7 +148,7 @@ impl CollectionData {
     }
 
     #[cfg(test)]
-    fn next_owned(&self, cursor: &mut usize) -> Option<(Value, Value)> {
+    fn next_owned(&self, cursor: &mut u64) -> Option<(Value, Value)> {
         self.next(cursor).map(|(k, v)| (k.unpack(), v.unpack()))
     }
 

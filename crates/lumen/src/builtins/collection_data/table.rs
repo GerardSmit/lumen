@@ -369,10 +369,10 @@ impl<E: Entry> Table<E> {
     }
 
     #[inline]
-    pub(super) fn next(&self, cursor: &mut usize) -> Option<(&PackedValue, &PackedValue)> {
-        let start = self.position(*cursor as u64);
+    pub(super) fn next(&self, cursor: &mut u64) -> Option<(&PackedValue, &PackedValue)> {
+        let start = self.position(*cursor);
         let Some(found) = self.entries[start..].iter().position(Entry::is_live) else {
-            *cursor = (*cursor).max(self.next_seq as usize);
+            *cursor = (*cursor).max(self.next_seq);
             return None;
         };
         let slot = start + found;
@@ -383,7 +383,7 @@ impl<E: Entry> Table<E> {
             self.hint.set((next, slot + 1));
             next
         };
-        *cursor = next as usize;
+        *cursor = next;
         let entry = &self.entries[slot];
         Some((entry.key(), entry.value()))
     }
@@ -418,7 +418,7 @@ impl<'a, E: Entry> Iterator for Iter<'a, E> {
 mod tests {
     use super::*;
 
-    fn drain(table: &Table<PairEntry>, cursor: &mut usize) -> Vec<f64> {
+    fn drain(table: &Table<PairEntry>, cursor: &mut u64) -> Vec<f64> {
         std::iter::from_fn(|| table.next(cursor))
             .map(|(_, value)| match value.unpack() {
                 Value::Num(n) => n,

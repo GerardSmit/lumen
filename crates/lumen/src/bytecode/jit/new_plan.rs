@@ -158,7 +158,11 @@ impl Tr<'_, '_> {
         let x = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
         let b = self.fb.load(MemKind::I32U8, p, VALUE_BOOL);
         let numw = layout::num_word(&mut self.fb, x);
-        let t = self.fb.convert(lumen_codegen::ConvOp::Uext, PTR, tag);
+        let t = if PTR == Type::I64 {
+            self.fb.convert(lumen_codegen::ConvOp::Uext, PTR, tag)
+        } else {
+            tag
+        };
         let eight = self.ptrc(8);
         let at = self.fb.binary(BinaryOp::Imul, t, eight);
         let tab = self.ptrc(PACK_BY_TAG.as_ptr() as usize as i64);

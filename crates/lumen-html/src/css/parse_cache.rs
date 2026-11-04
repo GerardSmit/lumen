@@ -13,7 +13,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::cell::RefCell;
 
 const MAX_ENTRIES: usize = 256;
-const MAX_BYTES: usize = 32 << 20;
+const MAX_BYTES: usize = lumen_common::budget::retained(32 << 20);
 const RULE_HEAP_ESTIMATE: usize = core::mem::size_of::<Selector>() + 16 + 64;
 
 enum Key {

@@ -127,9 +127,7 @@ pub(super) enum Adaptor {
 
 /// `f` is the native function `nf`.
 fn is_native(f: &Value, nf: crate::value::NativeFn) -> bool {
-    let Value::Obj(o) = f else { return false };
-    let Ok(b) = o.try_borrow() else { return false };
-    matches!(&b.call, crate::value::Callable::Native(fp) if *fp as usize == nf as usize)
+    crate::bytecode::is_native_fn(f, nf)
 }
 
 /// A bound function without bound arguments: its target and bound `this`.

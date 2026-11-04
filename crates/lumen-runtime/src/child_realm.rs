@@ -28,7 +28,7 @@ use lumen_host::{
 use crate::{Embedding, RealmExit, Runtime, SharedWriter, Terminator};
 
 /// The same stack the standalone binary gives its main thread: the engine recurses natively.
-const CHILD_REALM_STACK_BYTES: usize = 256 * 1024 * 1024;
+const CHILD_REALM_STACK_BYTES: usize = lumen::MAIN_THREAD_STACK_SIZE;
 
 /// Live children one realm may have at a time.
 pub(crate) const MAX_CHILDREN_PER_REALM: usize = 8;

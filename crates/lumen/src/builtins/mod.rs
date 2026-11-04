@@ -82,12 +82,18 @@ pub(crate) fn nf_function_apply(
 ) -> Result<Value, Value> {
     crate::bytecode::reflect::native_transparent(i);
     let this_arg = arg(args, 0);
-    let list = match arg(args, 1) {
+    let list = apply_arg_list(i, arg(args, 1))?;
+    ab(i.call(this, this_arg, &list))
+}
+
+/// The argument list `Function.prototype.apply` passes for its `argArray` (CreateListFromArrayLike,
+/// with `undefined`/`null` as no arguments). Shared with the bytecode VM's inline `f.apply(..)`.
+pub(crate) fn apply_arg_list(i: &mut Interp, list: Value) -> Result<Vec<Value>, Value> {
+    Ok(match list {
         Value::Undefined | Value::Null => Vec::new(),
         Value::Obj(o) => {
             let len = ab(i.checked_array_len(&o))?;
-            ab(i.check_heap(len * std::mem::size_of::<Value>()))?;
-            let mut v = Vec::with_capacity(len);
+            let mut v = ab(i.value_list_with_capacity(len))?;
             let direct_dense = i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Gc::as_ptr(&o) as usize));
             for k in 0..len {
@@ -113,8 +119,7 @@ pub(crate) fn nf_function_apply(
             v
         }
         _ => return Err(i.make_error("TypeError", "apply: argument list must be array-like")),
-    };
-    ab(i.call(this, this_arg, &list))
+    })
 }
 
 fn this_obj(this: &Value) -> Option<Gc> {
@@ -5079,7 +5084,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
         // Elements are read from the end down (from = len - k - 1) into ascending targets.
-        let mut items = Vec::with_capacity(len);
+        let mut items = ab(i.value_list_with_capacity(len))?;
         for k in 0..len {
             items.push(ab(i.get_member(&ov, &(len - k - 1).to_string()))?);
         }
@@ -5094,7 +5099,7 @@ fn install_array_rest(it: &mut Interp, ap: &Gc) {
         let o = arr_to_object(i, &this)?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
-        let mut items = Vec::with_capacity(len);
+        let mut items = ab(i.value_list_with_capacity(len))?;
         for k in 0..len {
             items.push(ab(i.get_member(&ov, &k.to_string()))?);
         }

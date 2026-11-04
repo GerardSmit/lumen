@@ -26,7 +26,7 @@ impl DomStringSet {
     }
     pub fn remove(&mut self,key:String)->bool {self.data.remove(&Value::from_string(key))}
     pub fn clear(&mut self){self.data.clear();}
-    pub fn next(&self,cursor:&mut usize)->Option<Value>{self.data.next(cursor).map(|(key,_)|key.unpack())}
+    pub fn next(&self,cursor:&mut u64)->Option<Value>{self.data.next(cursor).map(|(key,_)|key.unpack())}
 }
 
 /// What an object is, for `StructuredSerializeInternal`.

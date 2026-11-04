@@ -357,10 +357,7 @@ mod tests {
     }
 
     fn dump(parsed: &ParsedStylesheets) -> String {
-        format!(
-            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
-            parsed.rules, parsed.font_faces, parsed.family_display, parsed.keyframes, parsed.layers
-        )
+        super::super::dump_parsed(parsed)
     }
 
     fn filler(prefix: &str, count: usize) -> String {

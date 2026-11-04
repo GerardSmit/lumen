@@ -102,12 +102,19 @@ pub fn cpu_features() -> u64 {
             detect!("sse4.1", SSE41);
             features
         }
-        #[cfg(not(all(
-            any(target_arch = "aarch64", target_arch = "x86_64"),
-            not(target_os = "none")
-        )))]
+        // Bare metal has no OS feature probe; CPUID needs none.
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        {
+            lumen_common::target::x64::detect()
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             0
+        }
+        // Bare metal runs at EL1, where the ID registers are readable.
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        {
+            lumen_common::target::aarch64::detect_from_id_registers()
         }
     })
 }

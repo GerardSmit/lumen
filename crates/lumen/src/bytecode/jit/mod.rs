@@ -206,6 +206,12 @@ pub(crate) const FRAME_TA_LEN: i32 = std::mem::offset_of!(JitFrame, ta_len) as i
 pub(crate) const PTR: lumen_codegen::Type = lumen_codegen::Type::I64;
 #[cfg(target_pointer_width = "32")]
 pub(crate) const PTR: lumen_codegen::Type = lumen_codegen::Type::I32;
+/// A handle payload loaded zero-extended to I64 (on 32-bit hosts bytes 12..16 of a handle
+/// `Value` are padding; see `Value`).
+#[cfg(target_pointer_width = "64")]
+pub(crate) const HANDLE_AS_I64: lumen_codegen::MemKind = lumen_codegen::MemKind::I64;
+#[cfg(target_pointer_width = "32")]
+pub(crate) const HANDLE_AS_I64: lumen_codegen::MemKind = lumen_codegen::MemKind::I64U32;
 /// The memory access loading or storing a pointer.
 #[cfg(target_pointer_width = "64")]
 pub(crate) const PTR_MEM: lumen_codegen::MemKind = lumen_codegen::MemKind::I64;
@@ -229,8 +235,12 @@ const _: () = assert!(std::mem::size_of::<Value>() == VALUE_SIZE as usize);
 
 /// `size_of::<Value>()`.
 pub(crate) const VALUE_SIZE: i32 = 16;
-/// Offset of the `Bool` byte in a `Value`.
+/// Offset of the `Bool` byte in a `Value`: byte 1 under 64-bit hosts' `repr(u8)`, the payload
+/// byte under 32-bit hosts' `repr(C, u8)` (see `Value`).
+#[cfg(target_pointer_width = "64")]
 pub(crate) const VALUE_BOOL: i32 = 1;
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const VALUE_BOOL: i32 = 8;
 /// Offset of the f64 / pointer payload in a `Value`.
 pub(crate) const VALUE_PAYLOAD: i32 = 8;
 
@@ -784,35 +794,39 @@ fn new_shadow(bytes: usize) -> Box<Shadow> {
     })
 }
 
-#[cfg(test)]
+// These assert native code was compiled: only on targets with a JIT backend (as
+// `jit_enabled` decides).
+#[cfg(all(test, target_arch = "arm"))]
+mod arm32_tests;
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod background_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod evict_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod inline_elem_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod inline_general_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod int32_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod intrinsic_guard_tests;
 #[cfg(test)]
 mod leak_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod new_tests;
 #[cfg(test)]
 mod shadow_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod str_key_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod str_static_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod switch_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod ta_key_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod ta_store_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", all(target_arch = "aarch64", not(target_os = "ios")), all(target_arch = "arm", any(target_os = "linux", target_os = "android")))))]
 mod version_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
@@ -989,12 +1003,15 @@ fn jit_enabled(i: &Interp) -> bool {
         return false;
     }
     if cfg!(target_os = "none") {
-        return cfg!(target_arch = "aarch64") && lumen_os::jitmem::native_backend_available();
+        return cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
+            && lumen_os::jitmem::native_backend_available();
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let target = cfg!(target_arch = "x86_64")
             || cfg!(all(target_arch = "aarch64", not(target_os = "ios")))
+            // The ARM32 backend (ARMv6 or ARMv7) checks hard-float itself.
+            || cfg!(target_arch = "arm")
             || (cfg!(target_arch = "wasm32") && crate::WASM_JIT_HOST.get().is_some());
         // wasm32 has no process environment worth reading (`var_os` is always `None` there).
         target && std::env::var_os("LUMEN_NO_JIT").is_none()
@@ -1395,7 +1412,8 @@ struct Job {
 
 #[cfg(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", not(target_os = "ios"))
+    all(target_arch = "aarch64", not(target_os = "ios")),
+    all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
 ))]
 const _: fn() = || {
     fn send<T: Send>() {}
@@ -1498,7 +1516,8 @@ fn install_pending(
 #[cfg(all(
     any(
         target_arch = "x86_64",
-        all(target_arch = "aarch64", not(target_os = "ios"))
+        all(target_arch = "aarch64", not(target_os = "ios")),
+        all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
     ),
     not(target_os = "none")
 ))]
@@ -1544,7 +1563,8 @@ mod worker {
 #[cfg(not(all(
     any(
         target_arch = "x86_64",
-        all(target_arch = "aarch64", not(target_os = "ios"))
+        all(target_arch = "aarch64", not(target_os = "ios")),
+        all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
     ),
     not(target_os = "none")
 )))]
@@ -1565,7 +1585,8 @@ mod worker {
     not(any(
         target_arch = "x86_64",
         target_arch = "wasm32",
-        all(target_arch = "aarch64", not(target_os = "ios"))
+        all(target_arch = "aarch64", not(target_os = "ios")),
+        all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
     )),
     allow(dead_code)
 )]
@@ -1580,16 +1601,19 @@ fn import_address(externs: &[u64], id: u32) -> Option<u64> {
     }
 }
 
-/// x86-64 and AArch64: machine code in executable memory. iOS forbids runtime code generation,
+/// x86-64, AArch64 and 32-bit ARM Linux: machine code in executable memory. iOS forbids runtime code generation,
 /// so it keeps the interpreter (and later, ahead-of-time code in `.text`).
 #[cfg(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", not(target_os = "ios"))
+    all(target_arch = "aarch64", not(target_os = "ios")),
+    all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
 ))]
 mod backend {
     use super::*;
     #[cfg(target_arch = "aarch64")]
     use lumen_codegen::aarch64 as native;
+    #[cfg(target_arch = "arm")]
+    use lumen_codegen::arm32 as native;
     #[cfg(target_arch = "x86_64")]
     use lumen_codegen::x64 as native;
 
@@ -1618,7 +1642,7 @@ mod backend {
     pub(super) fn generate(func: lumen_codegen::Function, cfg: &Config) -> Result<Payload, String> {
         #[cfg(target_arch = "aarch64")]
         let loop_alignment = if cfg.alignment == 64 { 64 } else { 4 };
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "arm"))]
         let loop_alignment = if cfg.alignment == 64 { 64 } else { 1 };
         native::compile_owned_aligned(func, &cfg.native, loop_alignment)
     }
@@ -1714,7 +1738,8 @@ mod backend {
 #[cfg(not(any(
     target_arch = "x86_64",
     target_arch = "wasm32",
-    all(target_arch = "aarch64", not(target_os = "ios"))
+    all(target_arch = "aarch64", not(target_os = "ios")),
+    all(target_arch = "arm", any(target_os = "linux", target_os = "android"))
 )))]
 mod backend {
     use super::*;

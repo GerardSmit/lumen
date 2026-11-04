@@ -245,25 +245,11 @@ mod sys {
 
 #[cfg(unix)]
 mod sys {
-    extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-        fn munmap(addr: *mut u8, len: usize) -> i32;
-    }
-    const PROT_NONE: i32 = 0;
-    const PROT_RW: i32 = 1 | 2;
-    const MAP_PRIVATE: i32 = 0x02;
-    #[cfg(target_os = "macos")]
-    const MAP_ANON: i32 = 0x1000;
-    #[cfg(not(target_os = "macos"))]
-    const MAP_ANON: i32 = 0x20;
-    #[cfg(target_os = "macos")]
-    const MAP_NORESERVE: i32 = 0x40;
-    #[cfg(not(target_os = "macos"))]
-    const MAP_NORESERVE: i32 = 0x4000;
+    // The `libc` prototypes: `off_t` is 32-bit on 32-bit glibc and 64-bit on musl.
+    use libc::{MAP_ANON, MAP_NORESERVE, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
 
     pub unsafe fn reserve(len: usize) -> *mut u8 {
-        let p = mmap(
+        let p = libc::mmap(
             std::ptr::null_mut(),
             len,
             PROT_NONE,
@@ -271,17 +257,17 @@ mod sys {
             -1,
             0,
         );
-        if p as isize == -1 {
+        if p == libc::MAP_FAILED {
             std::ptr::null_mut()
         } else {
-            p
+            p.cast()
         }
     }
     pub unsafe fn commit(at: *mut u8, len: usize) -> bool {
-        mprotect(at, len, PROT_RW) == 0
+        libc::mprotect(at.cast(), len, PROT_READ | PROT_WRITE) == 0
     }
     pub unsafe fn release(at: *mut u8, len: usize) {
-        munmap(at, len);
+        libc::munmap(at.cast(), len);
     }
 
     #[cfg(any(

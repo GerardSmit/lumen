@@ -1,0 +1,12 @@
+# LeakSanitizer suppressions for the fuzz and ASan jobs (.github/workflows/fuzz.yml), passed with
+# LSAN_OPTIONS=suppressions=<path to this file>.
+#
+# Property slots and array elements hold values NaN-boxed (`PackedValue` in
+# crates/lumen/src/value.rs): a string, symbol or BigInt handle is stored with a tag in the top
+# 16 bits. LeakSanitizer only recognises plain addresses, so a handle referenced only from a
+# packed slot looks unreachable and is reported as a direct leak while the engine still holds it.
+# Objects live in GC chunks that stay reachable, so these three allocators are the only ones
+# affected. Rc-cycle leaks of objects are counted by the realm-cleanup tests instead.
+leak:lumen::lstr::LStr
+leak:lumen::value::SymbolData
+leak:lumen_common::bigint::BigIntData

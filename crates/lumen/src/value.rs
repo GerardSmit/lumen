@@ -549,17 +549,17 @@ pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 /// an N-API C callback together with its `void*` and module handle.
 pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
-/// A `Value` from its two words: the tag byte (plus a `Bool`'s byte 1) and the payload.
+/// A `Value` from its two words: the tag byte (plus a `Bool`'s value in byte 1) and the
+/// payload (a handle's pointer zero-extended, or a `Num`'s bits).
 ///
 /// # Safety
 /// `tag`/`payload` must spell a valid `Value` whose payload handle (if any) the caller owns.
 #[inline(always)]
 pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
     const { assert!(cfg!(target_endian = "little") && std::mem::size_of::<Value>() == 16) };
-    // With 4-byte pointers a handle variant keeps its pointer at byte 4, its own alignment;
-    // only `Num`'s `f64` sits at byte 8.
+    // 32-bit hosts keep a `Bool` at byte 8 with every other payload (see `Value`).
     #[cfg(target_pointer_width = "32")]
-    let tag = if matches!(tag & 0xff, 5..=8) { tag & 0xffff_ffff | payload << 32 } else { tag };
+    let (tag, payload) = if tag & 0xff == 3 { (3, (tag >> 8) & 1) } else { (tag, payload) };
     std::mem::transmute::<[u64; 2], Value>([tag, payload])
 }
 
@@ -571,19 +571,14 @@ pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
 /// `p` must point to a valid, owned `Value`.
 #[inline(always)]
 pub(crate) unsafe fn take_value_words(p: *mut Value) -> Value {
-    #[cfg(target_pointer_width = "32")]
-    {
-        let value = std::ptr::read(p);
-        std::ptr::write(p as *mut u64, 0);
-        return value;
-    }
     let w = p as *mut u64;
     let (tag, payload) = (
         std::ptr::read_volatile(w),
         std::ptr::read_volatile(w.add(1)),
     );
     std::ptr::write_volatile(w, 0);
-    value_from_words(tag, payload)
+    // Raw words, not `value_from_words`: on 32-bit hosts a `Bool` is already at byte 8.
+    std::mem::transmute::<[u64; 2], Value>([tag, payload])
 }
 
 /// `out.push(v)` as one full-width store. `Vec::push` keeps the value in a stack temporary
@@ -613,11 +608,18 @@ fn grow_values(out: &mut Vec<Value>) {
     out.reserve(1);
 }
 
-/// The engine value. `repr(u8)` with fixed discriminants gives it a *defined* layout — tag byte
-/// at offset 0, payload at offset 8. Tags 0..=4 are the trivially-copyable variants (no
-/// refcount).
+/// The engine value. A primitive representation with fixed discriminants gives it a *defined*
+/// layout: tag byte at offset 0, payload at offset 8. Tags 0..=4 are the trivially-copyable
+/// variants (no refcount).
+///
+/// 64-bit hosts use `repr(u8)`, which puts a `Bool` at byte 1. 32-bit hosts use `repr(C, u8)`,
+/// whose payload union is aligned like `f64` (8), so 4-byte handles also sit at byte 8 (and a
+/// `Bool` with them) instead of at their own alignment, byte 4. JIT code then addresses every
+/// payload at `VALUE_PAYLOAD` on both widths. Bytes 12..16 of a handle are padding: read a
+/// handle pointer-wide.
 #[derive(Default)]
-#[repr(u8)]
+#[cfg_attr(target_pointer_width = "64", repr(u8))]
+#[cfg_attr(not(target_pointer_width = "64"), repr(C, u8))]
 pub enum Value {
     #[default]
     Undefined = 0,

@@ -7085,6 +7085,9 @@ fn super_property_context() {
     });
 }
 
+// Generic Array methods carry lengths as `usize`, so on 32-bit targets array-like lengths
+// saturate at 2^32 - 1 instead of 2^53 - 1 (a known limitation there).
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn array_like_near_integer_limit() {
     // Generic Array methods on an array-like with a huge `length` operate on the bounded working
@@ -12301,4 +12304,87 @@ fn compound_string_append_of_a_call_result_is_amortized_and_ordered() {
         run_bytecode("function g() { try { s += String(1); } catch (e) { return e.name; } let s = ''; } g()"),
         "ReferenceError"
     );
+}
+
+/// `f.call(thisArg, ...)` runs `f` as an inline VM frame (see `Op::CallWithThis`); the
+/// rewritten call keeps every observable of Function.prototype.call.
+#[test]
+fn function_call_inline_frames_keep_call_semantics() {
+    let cases = [
+        // Receiver and arguments, including none at all.
+        ("function f(a, b) { return [this.k, a, b, arguments.length].join(); } \
+          var o = {k: 'K'}; [f.call(o, 1, 2), f.call(o), f.call()].join('|')",
+         "K,1,2,2|K,,,0|,,,0"),
+        // Sloppy functions box primitives and map null/undefined to the global object;
+        // strict functions see the receiver as is.
+        ("function s() { return typeof this + (this === globalThis); } \
+          function t() { 'use strict'; return String(this); } \
+          [s.call(1), s.call(null), t.call(1), t.call(null), t.call(undefined)].join()",
+         "objectfalse,objecttrue,1,null,undefined"),
+        // Old-style inheritance through `Super.call(this, ...)`.
+        ("function A(x) { this.x = x; } function B(x, y) { A.call(this, x); this.y = y; } \
+          var b = new B(1, 2); b.x + b.y",
+         "3"),
+        // Exceptions propagate, and recursion through `.call` returns through each frame.
+        ("function boom() { throw new RangeError('r'); } \
+          var m; try { boom.call(null); } catch (e) { m = e.name; } \
+          function fib(n) { return n < 2 ? n : fib.call(null, n - 1) + fib.call(null, n - 2); } \
+          m + fib.call(null, 15)",
+         "RangeError610"),
+        // `apply`: arrays, arguments objects, array-likes, holes, no list, and a list whose
+        // getter throws before the callee runs.
+        ("function f() { return [this.k].concat([].slice.call(arguments)).join(); } \
+          function g() { return f.apply(this, arguments); } var o = {k: 'K'}; \
+          [f.apply(o, [1, 2]), g.call(o, 3, 4), f.apply(o, {length: 2, 0: 'a', 1: 'b'}), \
+           f.apply(o, [5, , 6]), f.apply(o), f.apply(o, null)].join('|')",
+         "K,1,2|K,3,4|K,a,b|K,5,,6|K|K"),
+        ("function A(x) { this.x = x; } function B() { A.apply(this, arguments); } \
+          var ran = false; function h() { ran = true; } var m; \
+          try { h.apply(null, {get length() { throw new TypeError('len'); }}); } \
+          catch (e) { m = e.message; } new B(7).x + m + ran",
+         "7lenfalse"),
+        // `call` on a non-inlinable callee (a native, an async function) still works.
+        ("Math.max.call(null, 3, 9, 4) + ':' + typeof (async function () {}).call(null)",
+         "9:object"),
+    ];
+    for (src, expected) in cases {
+        assert_eq!(run_bytecode(src), expected, "{src}");
+        assert_eq!(run(src), expected, "{src}");
+    }
+}
+
+/// The inlined data read (`Interp::ic_data_hit`) answers only what the general IC
+/// would; every change the cache must notice still reaches `get_prop_ic`.
+#[test]
+fn own_data_read_fast_path_falls_back_on_changes() {
+    let src = "function rd(o) { return o.x; } var out = []; \
+        var o = {x: 1}; for (var k = 0; k < 3; k++) rd(o); \
+        Object.defineProperty(o, 'x', {get() { return 'getter'; }, configurable: true}); \
+        out.push(rd(o)); \
+        delete o.x; out.push(rd(o)); \
+        o.x = 'again'; out.push(rd(o)); \
+        var f = Object.freeze({x: 'frozen'}); out.push(rd(f)); \
+        var p = Object.create({x: 'proto'}); out.push(rd(p)); \
+        var a = [1, 2]; a.x = 'array'; out.push(rd(a)); \
+        out.push(rd('str'), rd(5)); \
+        out.join()";
+    let expected = "getter,,again,frozen,proto,array,,";
+    assert_eq!(run_bytecode(src), expected);
+    assert_eq!(run(src), expected);
+    // Prototype (method) reads: replaced, shadowed, turned into a getter, a swapped prototype
+    // of the same shape, and one of a different shape.
+    let src = "function C() {} C.prototype.m = function () { return 'm1'; }; \
+        function call(o) { return o.m(); } var c = new C(), out = []; \
+        for (var k = 0; k < 3; k++) call(c); \
+        C.prototype.m = function () { return 'm2'; }; out.push(call(c)); \
+        c.m = function () { return 'own'; }; out.push(call(c)); delete c.m; \
+        Object.defineProperty(C.prototype, 'm', {get() { return function () { return 'got'; }; }}); \
+        out.push(call(c)); \
+        var same = {m: function () { return 'same-shape'; }}; Object.setPrototypeOf(c, same); \
+        out.push(call(c)); \
+        Object.setPrototypeOf(c, {z: 1, m: function () { return 'other'; }}); out.push(call(c)); \
+        out.join()";
+    let expected = "m2,own,got,same-shape,other";
+    assert_eq!(run_bytecode(src), expected);
+    assert_eq!(run(src), expected);
 }

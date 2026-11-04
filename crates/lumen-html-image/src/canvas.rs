@@ -2790,7 +2790,7 @@ struct PremultipliedEntry {
     tick: u64,
 }
 
-const PREMULTIPLIED_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const PREMULTIPLIED_CACHE_BYTES: usize = lumen_common::budget::retained(16 * 1024 * 1024);
 const PREMULTIPLIED_CACHE_ENTRIES: usize = 64;
 
 #[derive(Default)]

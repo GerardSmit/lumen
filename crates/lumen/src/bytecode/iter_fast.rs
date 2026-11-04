@@ -577,7 +577,7 @@ fn step_encoded(i: &Interp, target: &Gc, idx: f64, kind: u8) -> Option<Option<(V
         return Some(Some((v, idx + 1.0)));
     }
     let data = i.map_data.get(&(Gc::as_ptr(target) as usize))?;
-    let mut cur = idx as usize;
+    let mut cur = idx as u64;
     match data.next(&mut cur) {
         Some((k, v)) => {
             let v = match kind {

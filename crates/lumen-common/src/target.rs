@@ -11,6 +11,43 @@ pub mod aarch64 {
     pub const FP16: u64 = 1 << 6;
     pub const DOTPROD: u64 = 1 << 7;
     pub const ALL: u64 = (1 << 8) - 1;
+
+    /// The features above from the ID registers, for kernels without an OS feature probe
+    /// (bare metal). The registers are readable at EL1; Linux also emulates the reads at
+    /// EL0 (`HWCAP_CPUID`), other user-mode OSes may trap them.
+    #[cfg(target_arch = "aarch64")]
+    pub fn detect_from_id_registers() -> u64 {
+        let (isar0, isar1, pfr0): (u64, u64, u64);
+        // SAFETY: reads of read-only ID registers.
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ID_AA64ISAR0_EL1",
+                "mrs {1}, ID_AA64ISAR1_EL1",
+                "mrs {2}, ID_AA64PFR0_EL1",
+                out(reg) isar0, out(reg) isar1, out(reg) pfr0,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        from_id_registers(isar0, isar1, pfr0)
+    }
+
+    /// Decode `ID_AA64ISAR0_EL1`, `ID_AA64ISAR1_EL1` and `ID_AA64PFR0_EL1`.
+    pub fn from_id_registers(isar0: u64, isar1: u64, pfr0: u64) -> u64 {
+        let field = |register: u64, shift: u32| (register >> shift) & 0xf;
+        let at_least = |register: u64, shift: u32, min: u64, feature: u64| {
+            if field(register, shift) >= min { feature } else { 0 }
+        };
+        // FP and AdvSIMD are signed fields: 0xf means absent, 1 adds half precision.
+        let fp16 = if field(pfr0, 16) == 1 && field(pfr0, 20) == 1 { FP16 } else { 0 };
+        at_least(isar0, 4, 1, AES)
+            | at_least(isar0, 12, 1, SHA2)
+            | at_least(isar0, 16, 1, CRC32)
+            | at_least(isar0, 20, 2, LSE)
+            | at_least(isar0, 44, 1, DOTPROD)
+            | at_least(isar1, 12, 1, JSCVT)
+            | at_least(isar1, 20, 1, RCPC)
+            | fp16
+    }
 }
 
 /// Stable x86-64 extensions above the architectural SSE2 baseline.
@@ -22,6 +59,25 @@ pub mod x64 {
     pub const POPCNT: u64 = 1 << 3;
     pub const SSE41: u64 = 1 << 4;
     pub const ALL: u64 = (1 << 5) - 1;
+
+    /// The extensions above that this CPU has, from CPUID alone. They need no
+    /// OS-managed state, so this serves where there is no OS feature probe (bare metal).
+    #[cfg(target_arch = "x86_64")]
+    pub fn detect() -> u64 {
+        use core::arch::x86_64::__cpuid_count;
+        // SAFETY: CPUID exists on every x86_64 CPU; leaves above the reported maximum are
+        // not read.
+        let (max, max_ext) = unsafe { (__cpuid_count(0, 0).eax, __cpuid_count(0x8000_0000, 0).eax) };
+        let leaf1 = unsafe { __cpuid_count(1, 0) }.ecx;
+        let leaf7 = if max >= 7 { unsafe { __cpuid_count(7, 0) }.ebx } else { 0 };
+        let ext1 = if max_ext >= 0x8000_0001 { unsafe { __cpuid_count(0x8000_0001, 0) }.ecx } else { 0 };
+        let bit = |word: u32, index: u32, feature: u64| if word & (1 << index) != 0 { feature } else { 0 };
+        bit(ext1, 5, LZCNT)
+            | bit(leaf7, 3, BMI1)
+            | bit(leaf7, 8, BMI2)
+            | bit(leaf1, 23, POPCNT)
+            | bit(leaf1, 19, SSE41)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +300,37 @@ impl TargetSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aarch64_id_registers_decode() {
+        use aarch64::*;
+        assert_eq!(aarch64::from_id_registers(0, 0, 0), 0);
+        // Cortex-A55: AES+PMULL, SHA2, CRC32, LSE, DotProd; RCpc; FP16.
+        let isar0 = (1 << 44) | (2 << 20) | (1 << 16) | (1 << 12) | (2 << 4);
+        let isar1 = (1 << 20) | (1 << 12);
+        let pfr0 = (1 << 20) | (1 << 16);
+        assert_eq!(aarch64::from_id_registers(isar0, isar1, pfr0), ALL);
+        // Cortex-A72 without crypto (Raspberry Pi 4): CRC32 only; LSE needs Atomic >= 2.
+        assert_eq!(aarch64::from_id_registers((1 << 16) | (1 << 20), 0, 0), CRC32);
+        // FP absent (0xf) is not half precision.
+        assert_eq!(aarch64::from_id_registers(0, 0, (0xf << 20) | (0xf << 16)), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_detection_matches_the_os_probe() {
+        let os = [
+            ("lzcnt", std::arch::is_x86_feature_detected!("lzcnt"), x64::LZCNT),
+            ("bmi1", std::arch::is_x86_feature_detected!("bmi1"), x64::BMI1),
+            ("bmi2", std::arch::is_x86_feature_detected!("bmi2"), x64::BMI2),
+            ("popcnt", std::arch::is_x86_feature_detected!("popcnt"), x64::POPCNT),
+            ("sse4.1", std::arch::is_x86_feature_detected!("sse4.1"), x64::SSE41),
+        ];
+        let detected = x64::detect();
+        for (name, present, bit) in os {
+            assert_eq!(detected & bit != 0, present, "{name}");
+        }
+    }
+
     use super::*;
 
     fn spec() -> TargetSpec {

@@ -1003,7 +1003,7 @@ impl DomCustomStateSet {
 pub(crate) struct DomCustomStateIterator {
     pub(crate) owner:Value,
     pub(crate) data:Rc<RefCell<lumen::embed::DomStringSet>>,
-    pub(crate) cursor:Cell<usize>,
+    pub(crate) cursor:Cell<u64>,
     pub(crate) done:Cell<bool>,
     pub(crate) entries:bool,
 }

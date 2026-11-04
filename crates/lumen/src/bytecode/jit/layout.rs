@@ -1432,10 +1432,16 @@ pub(crate) fn prop_create(
         let ok2 = fb.icmp(IntCC::Eq, ce, epoch);
         let ok = fb.binary(BinaryOp::Band, ok, ok2);
         guard(fb, ok, miss);
-        let lo = fb.load_with(MemKind::I64U32, c, o(offset_of!(IcState, slot)), super::mem::ics());
-        let hi = fb.load_with(MemKind::I64U32, c, o(offset_of!(IcState, mid2_shape)), super::mem::ics());
-        let hi = bin_imm(fb, BinaryOp::Ishl, Type::I64, hi, 32);
-        let pp = fb.binary(BinaryOp::Bor, hi, lo);
+        // The prototype pointer, split into `slot` (low half) and `mid2_shape` (high half,
+        // 0 with 4-byte pointers): compared at pointer width.
+        let pp = if PTR == Type::I64 {
+            let lo = fb.load_with(MemKind::I64U32, c, o(offset_of!(IcState, slot)), super::mem::ics());
+            let hi = fb.load_with(MemKind::I64U32, c, o(offset_of!(IcState, mid2_shape)), super::mem::ics());
+            let hi = bin_imm(fb, BinaryOp::Ishl, Type::I64, hi, 32);
+            fb.binary(BinaryOp::Bor, hi, lo)
+        } else {
+            fb.load_with(MemKind::I32, c, o(offset_of!(IcState, slot)), super::mem::ics())
+        };
         let ok = fb.icmp(IntCC::Eq, pp, proto);
         guard(fb, ok, miss);
         // No element entries after the named prefix, and room for one more.

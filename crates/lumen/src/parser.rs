@@ -6326,6 +6326,29 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
 }
 
 #[cfg(test)]
+mod preparse_tests {
+    use super::*;
+
+    /// A function body that fails the syntax-only pass inside a loop body must not leave the
+    /// pass's loop depth reset (it underflowed: `attempt to subtract with overflow`).
+    #[test]
+    fn failed_nested_body_inside_loop_does_not_underflow_loop_depth() {
+        let sources = [
+            "function f() { while (0) (() => { let a; let a; }); }",
+            "function f() { do (() => { let a; let a; }); while (0) }",
+            "function f() { for (;;) (function () { let a; let a; }); }",
+            // The fuzz input that found it (js_parse).
+            "t(uY=>{{{{(t(uI=>{{t(uY=>{{\u{c}\u{c}\u{c}\u{c}\u{c}-\u{c}f\u{c}\u{c}\u{c}\u{c}}do{{(t(uY=>{{Y>=\u{c}\u{c}}}}}}}}\u{c}\u{c}\u{c}\u{c}\u{c}\u{c}\u{c}-\u{c}f\u{c}\u{c}\u{c}\u{c}}dor(;MiY=t(uu",
+        ];
+        for src in sources {
+            assert!(parse_script(src, false).is_err(), "{src}");
+            assert!(parse_script(src, true).is_err(), "{src}");
+            assert!(parse_script_lazy(src).is_err(), "{src}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod src_map_tests {
     use super::*;
 

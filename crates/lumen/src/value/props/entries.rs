@@ -565,7 +565,9 @@ mod tests {
 
     #[test]
     fn layout_is_sixteen_bytes() {
-        assert_eq!(std::mem::size_of::<EntryVec>(), 16);
+        // 12 bytes with 4-byte pointers (32-bit ARM).
+        let expected = if cfg!(target_pointer_width = "64") { 16 } else { 12 };
+        assert_eq!(std::mem::size_of::<EntryVec>(), expected);
     }
 
     #[test]
@@ -619,7 +621,8 @@ mod tests {
         assert!(c.is_empty() && !c.is_shared());
     }
 }
-#[cfg(test)]
+// 64-bit malloc-class budget; 32-bit layouts are smaller (`Props` is 28 bytes there).
+#[cfg(all(test, target_pointer_width = "64"))]
 mod object_layout {
     #[test]
     fn object_header_fits_the_96_byte_malloc_class() {

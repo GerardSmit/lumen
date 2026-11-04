@@ -39,7 +39,7 @@ const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 // A viewport-sized layer rotated by 45 degrees, plus blur padding, fits.
 const MAX_LAYER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GPUI_PRIMITIVE_BYTES: usize = 64 * 1024 * 1024;
-const ASSET_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const ASSET_CACHE_BYTES: usize = lumen_common::budget::retained(16 * 1024 * 1024);
 const MAX_PNG_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 static STRICT_SVG_IMAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
