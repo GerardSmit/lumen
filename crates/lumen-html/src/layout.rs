@@ -19586,7 +19586,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut text_row = 0;
         let mut text_cell = 0;
         let mut text_cell_count = 0;
+        // A measurement layout keeps only the table's size and baselines, which
+        // the row-sizing pass above already settled. Laying the cells out again
+        // here would repeat every nested table once per enclosing table level.
+        let measures_only = self.cull == MEASUREMENT_CULL && self.geometry.is_none();
         for ((index, cell),assigned) in cells.iter().enumerate().zip(assigned_cells) {
+            if measures_only { break; }
             if collect_table_text && (index == 0 || cell.row != text_row) {
                 text_row = cell.row;
                 text_cell = 0;
@@ -62903,6 +62908,35 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                 counts.push(measured);
             }
             assert!(counts[1] <= counts[0] * 3, "doubling the depth multiplied measurements: {counts:?}");
+        }).unwrap().join().unwrap();
+    }
+
+    fn nested_table_page(depth: usize) -> String {
+        let mut open = String::new();
+        let mut close = String::new();
+        for level in 0..depth {
+            open.push_str(&alloc::format!("<table><tr><th>group {level}</th><td><div>"));
+            close.push_str("</div></td></tr></table>");
+        }
+        alloc::format!("<!doctype html>{open}<ul><li>alpha</li><li>beta gamma</li></ul>{close}")
+    }
+
+    #[test]
+    fn nested_table_layout_does_not_double_per_level() {
+        extern crate std;
+        // Unoptimized frames of nested table layout exceed the test thread's stack.
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut counts = Vec::new();
+            for depth in [4usize, 8] {
+                let document = crate::html::parse(&nested_table_page(depth), 4096).unwrap();
+                PARAGRAPH_MEASUREMENTS.with(|runs| runs.set(0));
+                fresh_frame(&document);
+                counts.push(PARAGRAPH_MEASUREMENTS.with(core::cell::Cell::get));
+            }
+            // Each level's text is laid out once per enclosing level, so twice
+            // the depth costs about four times as much. Before measurement
+            // layouts skipped the final cell pass, it cost about twenty times.
+            assert!(counts[1] <= counts[0] * 5, "doubling the depth multiplied layouts: {counts:?}");
         }).unwrap().join().unwrap();
     }
 
