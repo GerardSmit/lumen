@@ -28437,6 +28437,23 @@ struct ParentKey {
 }
 
 impl ParentKey {
+    /// A 64-bit summary of every field, for `StyleCache::parent_index`.
+    fn digest(&self) -> u64 {
+        let rgba = |c: Rgba| u32::from_le_bytes([c.r, c.g, c.b, c.a]) as u64;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for word in [
+            self.extras as u64,
+            self.custom as u64,
+            self.display as u64,
+            rgba(self.color) | rgba(self.background) << 32,
+            self.font_size as u64 | (self.opacity as u64) << 32,
+            self.gap as u64,
+        ] {
+            hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+        }
+        hash
+    }
+
     fn same_shape(&self, other: &Self) -> bool {
         Self { extras: 0, custom: 0, ..*self } == Self { extras: 0, custom: 0, ..*other }
     }
@@ -28505,6 +28522,9 @@ pub(crate) struct StyleCache {
     parents: Vec<Arc<Style>>,
     /// `parents[n]`'s cheap identity; see `ParentKey`.
     parent_keys: Vec<ParentKey>,
+    /// Positions in `parents` by `ParentKey::digest`, so an equal parent seen
+    /// any time this frame is found again instead of taking a new token.
+    parent_index: alloc::collections::BTreeMap<u64, Vec<u32>>,
     last_parent: usize,
     shared: Vec<SharedStyle>,
     next_shared: usize,
@@ -28857,10 +28877,9 @@ impl StyleCache {
         }
     }
 
-    /// Drops parent styles no entry refers to any more. Token lookup only
-    /// scans recent parents, so without this every frame that asks with
-    /// parent styles seen longer ago adds tokens until `MAX_PARENT_STYLES`
-    /// stops caching altogether.
+    /// Drops parent styles no entry refers to any more, so the distinct used
+    /// parent styles layout passes over many frames do not accumulate until
+    /// `MAX_PARENT_STYLES` stops caching altogether.
     fn compact_parents(&mut self) {
         if self.selected.is_some() { return; }
         let mut tokens = vec![0u32; self.parents.len() + 1];
@@ -28883,6 +28902,10 @@ impl StyleCache {
         for entry in self.pseudos.iter_mut().flatten() { remap(&mut entry.origin_token); }
         for entry in &mut self.shared { remap(&mut entry.parent_token); }
         self.compacted_parents = kept.len();
+        self.parent_index.clear();
+        for (position, key) in kept_keys.iter().enumerate() {
+            self.parent_index.entry(key.digest()).or_default().push(position as u32);
+        }
         self.parents = kept;
         self.parent_keys = kept_keys;
         self.last_parent = 0;
@@ -28902,10 +28925,11 @@ impl StyleCache {
         if self.last_parent < self.parents.len() && same(&self.parents, &self.parent_keys, self.last_parent) {
             return Some(self.last_parent as u32 + 1);
         }
-        let found = (0..self.parents.len())
-            .rev()
-            .take(PARENT_STYLES_RECENT)
-            .find(|&position| same(&self.parents, &self.parent_keys, position));
+        let digest = key.digest();
+        let found = self.parent_index.get(&digest).and_then(|positions| {
+            positions.iter().rev().map(|&position| position as usize)
+                .find(|&position| same(&self.parents, &self.parent_keys, position))
+        });
         let position = match found {
             Some(position) => position,
             None if self.parents.len() < MAX_PARENT_STYLES => {
@@ -28920,6 +28944,7 @@ impl StyleCache {
                     .unwrap_or_else(|| Arc::new(parent.clone()));
                 self.parent_keys.push(ParentKey::of(&shared));
                 self.parents.push(shared);
+                self.parent_index.entry(digest).or_default().push(self.parents.len() as u32 - 1);
                 self.parents.len() - 1
             }
             None => return None,
@@ -28928,8 +28953,8 @@ impl StyleCache {
         Some(position as u32 + 1)
     }
 
-    /// Token lookup only scans recent parents, so an equal parent style seen
-    /// earlier can come back under a second token.
+    /// Whether two tokens name the same parent style: equal tokens, or equal
+    /// styles behind two tokens.
     fn same_parent(&self, cached: u32, token: u32) -> bool {
         cached == token || (cached != 0 && token != 0
             && self.parents.get(cached as usize - 1).zip(self.parents.get(token as usize - 1))
@@ -45273,5 +45298,33 @@ mod matched_cache_hits {
         assert!(style_of(&document, &shared, node) == expected);
         assert!(shared.matched_hits.load(core::sync::atomic::Ordering::Relaxed) > hits);
         assert!(stored(&shared, "body"));
+    }
+}
+
+#[cfg(test)]
+mod parent_token_tests {
+    use super::*;
+
+    /// A large page asks for many distinct parent styles per frame. An equal parent style seen
+    /// any time before (not only among the most recent) keeps its token, so the table does not
+    /// fill with duplicates and stop caching.
+    #[test]
+    fn parent_styles_seen_long_ago_keep_their_token() {
+        let mut cache = StyleCache::default();
+        let styles: Vec<Style> = (0..4 * PARENT_STYLES_RECENT)
+            .map(|i| Style { font_size: 10.0 + i as f32, ..Style::initial() })
+            .collect();
+        let first: Vec<u32> = styles.iter().map(|style| cache.parent_token(Some(style)).unwrap()).collect();
+        for _ in 0..3 {
+            let again: Vec<u32> =
+                styles.iter().map(|style| cache.parent_token(Some(&style.clone())).unwrap()).collect();
+            assert_eq!(again, first);
+        }
+        assert_eq!(cache.parents.len(), styles.len());
+        cache.compact_parents();
+        assert!(cache.parents.is_empty(), "no entry refers to them");
+        let renewed = cache.parent_token(Some(&styles[7])).unwrap();
+        assert_eq!(cache.parent_token(Some(&styles[7])), Some(renewed));
+        assert_eq!(cache.parents.len(), 1);
     }
 }
