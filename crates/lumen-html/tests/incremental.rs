@@ -1814,4 +1814,12 @@ fn pulsing_pseudo_element_animation_does_not_lay_out() {
     fresh.set_pseudo_effect_declarations(node, Some(lumen_html::css::PseudoElement::Before), lumen_html::css::EffectOrigin::Animation,
         vec![("opacity".to_string(), format!("{}", 1.0 - 0.9 * 0.9)), ("transform".to_string(), "scale(1.9)".to_string())]).unwrap();
     assert_same("pulsing", "patched", &last.unwrap(), render(&mut fresh));
+    // The dot overflows its box, so a geometry query lays out again and reads
+    // the overflow of the current sample.
+    let dot = q(&session, "#d");
+    session.with_forced_layout(|session| { render(session); });
+    assert_eq!(session.invalidation_stats().layout_passes, passes + 1, "a geometry query refreshes the overflow areas");
+    let dot_fresh = q(&fresh, "#d");
+    fresh.with_forced_layout(|session| { render(session); });
+    assert_eq!(session.scroll_extent(dot), fresh.scroll_extent(dot_fresh));
 }

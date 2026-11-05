@@ -13598,7 +13598,9 @@ impl Style {
             extras.relative_expressions = mine.relative_expressions.clone();
             extras.source_colors = mine.source_colors.clone();
         }
-        extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(self, "backdrop-filter"));
+        if extra_props::keyword(self, "backdrop-filter") != extra_props::keyword(other, "backdrop-filter") {
+            extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(self, "backdrop-filter"));
+        }
         probe == *self
     }
 }
@@ -29448,7 +29450,8 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
     }
     // A transform or backdrop filter that starts or stops changes stacking
     // and containing blocks; one that changes value moves only paint.
-    if old.has_transform() == new.has_transform() {
+    if old.has_transform() == new.has_transform()
+        && (old.transforms != new.transforms || old.individual_transforms != new.individual_transforms) {
         let unpainted = |values: &[RelativeExpression]| values.iter().filter(|value| !paint_only_slot(value.slot)).cloned().collect::<Vec<_>>();
         let extras = &mut *probe;
         extras.transforms = new.transforms.clone();
@@ -29458,7 +29461,7 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
         }
     }
     let backdrop = |style: &Style| extra_props::keyword(style, "backdrop-filter").is_some_and(|value| value != "none");
-    if backdrop(old) == backdrop(new) {
+    if backdrop(old) == backdrop(new) && extra_props::keyword(old, "backdrop-filter") != extra_props::keyword(new, "backdrop-filter") {
         extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(new, "backdrop-filter"));
     }
     if probe == *new { StyleDamage::Paint } else { StyleDamage::Layout }

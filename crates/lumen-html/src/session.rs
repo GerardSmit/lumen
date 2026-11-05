@@ -697,6 +697,8 @@ fn patch_command_damage(list: &[Command], index: usize, command: &Command, rects
 struct TransformPlan {
     entries: Vec<(usize, crate::paint::Affine)>,
     commands: Vec<((crate::paint::Affine, crate::paint::Affine), Vec<usize>)>,
+    /// Overflow areas recorded for `scrollWidth`/`scrollHeight` may change.
+    overflow_stale: bool,
 }
 
 /// Applies `plan` to `frame`; the damage it causes, `None` when unbounded.
@@ -1043,6 +1045,9 @@ pub struct RenderSession {
     timeline_transform_values:Option<Arc<crate::animation::progress_timelines::TransformTimelineValues>>,
     forced_layout:bool,
     timeline_layout_stale:bool,
+    /// A patched frame's recorded overflow areas may be out of date: it still
+    /// paints, but a forced layout (a geometry query) lays it out again.
+    overflow_areas_stale: bool,
     // Only deterministic provenance-budget rejection is memoized. The rare
     // record has no DOM roots and includes actual font and paint inputs.
     rejected_transition_snapshot: Option<Box<(TransitionInputEpoch, Option<u64>, u64)>>,
@@ -1592,6 +1597,7 @@ impl RenderSession {
             timeline_transform_values:None,
             forced_layout:false,
             timeline_layout_stale:false,
+            overflow_areas_stale: false,
             rejected_transition_snapshot: None,
             rejected_snapshot_size: None,
             rejected_sparse_epoch: None,
@@ -3489,6 +3495,7 @@ impl RenderSession {
             frame.list.0[index] = command;
         }
         if let Some(plan) = transforms {
+            self.overflow_areas_stale |= plan.overflow_stale;
             let moved_damage = apply_transform_plan(frame, plan);
             damage = match (damage, moved_damage) {
                 (Some(mut all), Some(rects)) => { all.extend(rects); Some(all) }
@@ -3601,6 +3608,7 @@ impl RenderSession {
             return None;
         }
         let mut patches: Vec<(crate::paint::Affine, crate::paint::Affine, usize)> = Vec::new();
+        let mut overflow_stale = false;
         for change in moved {
             let (node, pseudo, old, new) = (change.node, change.pseudo, &change.old, &change.new);
             // A transform that starts or stops changes stacking and containing blocks.
@@ -3636,14 +3644,15 @@ impl RenderSession {
                 (Some(from), Some(to)) => [from.0 != to.0, from.1 != to.1],
                 _ => [true, true],
             };
-            let hits = transform.hits.clone();
+            let bounds = Self::transformed_bounds(frame, index, transform.hits.clone(), [from, to]);
             if !self.transform_clipped_in_place(node, pseudo.is_some(), axes)
-                && !self.transform_stays_inside(frame, node, pseudo.is_some(), index, hits, [from, to]) {
+                && !self.transform_stays_inside(frame, node, pseudo.is_some(), bounds) {
                 return None;
             }
+            overflow_stale |= self.transform_changes_overflow_areas(frame, node, pseudo.is_some(), bounds);
             patches.push((from, to, index));
         }
-        let mut plan = TransformPlan { entries: patches.iter().map(|(_, new, index)| (*index, *new)).collect(), commands: Vec::new() };
+        let mut plan = TransformPlan { entries: patches.iter().map(|(_, new, index)| (*index, *new)).collect(), commands: Vec::new(), overflow_stale };
         for (old, new, _) in &patches {
             if plan.commands.iter().any(|(done, _)| affine_close(done.0, *old) && affine_close(done.1, *new)) {
                 continue;
@@ -3683,25 +3692,27 @@ impl RenderSession {
         }
     }
 
-    /// Whether the transformed box of transform `index` (owning `hits`) stays,
-    /// before and after `matrices`, inside the padding box of every ancestor
-    /// that records an overflow area and inside the unscrolled viewport, with
-    /// no scroll container, fixed box or other transform around it: then the
-    /// scrollable overflow it adds to does not change.
-    fn transform_stays_inside(&mut self, frame: &CachedFrame, node: NodeId, include_self: bool, index: usize, hits: core::ops::Range<usize>,
-        matrices: [crate::paint::Affine; 2]) -> bool {
+    /// The bounds of the boxes in `hits` under each of `matrices`; `None`
+    /// when another transform reaches them, so they are not known here.
+    fn transformed_bounds(frame: &CachedFrame, index: usize, hits: core::ops::Range<usize>,
+        matrices: [crate::paint::Affine; 2]) -> Option<[Rect; 2]> {
         let geometry = &frame.geometry;
-        if hits.len() > MAX_PAINT_RESTYLE_NODES
-            || geometry.root_scroll_region.as_ref().is_some_and(|region| region.placed != (0.0, 0.0))
-            || geometry.transforms.iter().enumerate().any(|(other, transform)| other != index
-                && transform.hits.start < hits.end && hits.start < transform.hits.end) {
+        if hits.len() > MAX_PAINT_RESTYLE_NODES || geometry.transforms.iter().enumerate().any(|(other, transform)| other != index
+            && transform.hits.start < hits.end && hits.start < transform.hits.end) {
+            return None;
+        }
+        let untransformed = geometry.hits.get(hits)?.iter().map(|hit| hit.rect).reduce(Rect::union)?;
+        Some(matrices.map(|matrix| matrix.bounds(untransformed)))
+    }
+
+    /// Whether the transformed box (with `bounds` before and after) stays in
+    /// the unscrolled viewport with no scroll container or fixed box around
+    /// it: then the scrollable range of the document does not change.
+    fn transform_stays_inside(&mut self, frame: &CachedFrame, node: NodeId, include_self: bool, bounds: Option<[Rect; 2]>) -> bool {
+        let Some(bounds) = bounds else { return false };
+        if frame.geometry.root_scroll_region.as_ref().is_some_and(|region| region.placed != (0.0, 0.0)) {
             return false;
         }
-        let Some(untransformed) = geometry.hits.get(hits.clone()).and_then(|boxes| boxes.iter().map(|hit| hit.rect)
-            .reduce(Rect::union)) else { return false };
-        let bounds = matrices.map(|matrix| matrix.bounds(untransformed));
-        let inside = |outer: Rect, inner: Rect| inner.x >= outer.x - 0.01 && inner.y >= outer.y - 0.01
-            && inner.x + inner.width <= outer.x + outer.width + 0.01 && inner.y + inner.height <= outer.y + outer.height + 0.01;
         // Overflow past the start edges of the viewport cannot be scrolled to.
         if !bounds.iter().all(|rect| rect.x + rect.width <= frame.width as f32 && rect.y + rect.height <= frame.height as f32) {
             return false;
@@ -3714,18 +3725,38 @@ impl RenderSession {
                 || style.position == css::Position::Fixed {
                 return false;
             }
-            if !own && geometry.scroll_extents.iter().any(|extent| extent.node == current) {
-                let Some(border) = geometry.hits.iter().find(|hit| hit.node == current && hit.pseudo.is_none()).map(|hit| hit.rect) else { return false };
-                let [top, right, bottom, left] = style.used_border_widths();
-                let padding = Rect { x: border.x + left, y: border.y + top,
-                    width: border.width - left - right, height: border.height - top - bottom };
-                if !bounds.iter().all(|rect| inside(padding, *rect)) { return false; }
-            }
             match self.document.parent(current) {
                 Ok(Some(parent)) if matches!(self.document.kind(parent), Ok(NodeKind::Element { .. })) => current = parent,
                 _ => return true,
             }
         }
+    }
+
+    /// Whether moving the transformed box (with `bounds` before and after)
+    /// may change the overflow area an ancestor records for
+    /// `scrollWidth`/`scrollHeight`: it leaves the ancestor's padding box.
+    fn transform_changes_overflow_areas(&mut self, frame: &CachedFrame, node: NodeId, include_self: bool, bounds: Option<[Rect; 2]>) -> bool {
+        let geometry = &frame.geometry;
+        if geometry.scroll_extents.is_empty() { return false; }
+        let Some(bounds) = bounds else { return true };
+        let inside = |outer: Rect, inner: Rect| inner.x >= outer.x - 0.01 && inner.y >= outer.y - 0.01
+            && inner.x + inner.width <= outer.x + outer.width + 0.01 && inner.y + inner.height <= outer.y + outer.height + 0.01;
+        let mut current = node;
+        for _ in 0..=512 {
+            if (current != node || include_self) && geometry.scroll_extents.iter().any(|extent| extent.node == current) {
+                let Ok(style) = self.computed_style(current) else { return true };
+                let Some(border) = geometry.hits.iter().find(|hit| hit.node == current && hit.pseudo.is_none()).map(|hit| hit.rect) else { return true };
+                let [top, right, bottom, left] = style.used_border_widths();
+                let padding = Rect { x: border.x + left, y: border.y + top,
+                    width: border.width - left - right, height: border.height - top - bottom };
+                if !bounds.iter().all(|rect| inside(padding, *rect)) { return true; }
+            }
+            match self.document.parent(current) {
+                Ok(Some(parent)) if matches!(self.document.kind(parent), Ok(NodeKind::Element { .. })) => current = parent,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Capture the declaring tree for a non-CSS font-family reference such as
@@ -6686,7 +6717,7 @@ impl RenderSession {
         }) {
             self.images_pending = false;
         }
-        let fresh = !self.layout_stale&&(self.forced_layout||!self.timeline_layout_stale)&&!unversioned_pending&&self.cached.as_ref().is_some_and(|cached| {
+        let fresh = !self.layout_stale&&(self.forced_layout||!self.timeline_layout_stale)&&!(self.forced_layout&&self.overflow_areas_stale)&&!unversioned_pending&&self.cached.as_ref().is_some_and(|cached| {
             cached.document_version == version
                 && cached.width == width
                 && cached.height == height
@@ -7124,6 +7155,7 @@ impl RenderSession {
         // that operation stale until the next rendering opportunity,
         // without sampling it a second time in this frame.
         self.timeline_layout_stale=geometry.transform_timeline_values.is_some()&&(self.forced_layout||timeline_corrected);
+        self.overflow_areas_stale = false;
         self.frame_id += 1;
         let damage = self
             .cached
