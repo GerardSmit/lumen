@@ -272,6 +272,12 @@ struct AnimationHub {
     css_cancellations: Tracked<Vec<Weak<CssCancellation>>>,
     /// The state after the last `flush_css_transitions_for_property`.
     flush_memo: Option<FlushMemo>,
+    /// Set while a style change event (a script's style or geometry read) samples effects.
+    /// Progress timelines then keep their last sampled progress over a stale layout instead
+    /// of forcing one; the next frame's update samples them again.
+    holding_progress: bool,
+    /// Records whose progress timeline has been sampled at least once.
+    progress_sampled: Tracked<FastSet<u32>>,
 }
 
 impl Default for AnimationHub {
@@ -305,6 +311,8 @@ impl Default for AnimationHub {
             css_cancellations:Tracked(Vec::new()),
             default_realm: Weak::new(),
             flush_memo: None,
+            holding_progress: false,
+            progress_sampled: Tracked(FastSet::default()),
         }
     }
 }
@@ -2098,6 +2106,7 @@ pub(crate) fn flush_css_transitions_for_property(ctx:&mut Ctx,realm:&Rc<DomRealm
         _=>false,
     };
     hub.borrow_mut().refreshing_transitions=true;
+    hub.borrow_mut().holding_progress=true;
     let mut whole_realm=false;
     let result=(||{
         let now=realm.timeline_sample.get();
@@ -2108,6 +2117,7 @@ pub(crate) fn flush_css_transitions_for_property(ctx:&mut Ctx,realm:&Rc<DomRealm
         apply_realm_in_phase_with_demand(&hub,realm,now,EffectStylePhase::Current,&demand)
     })();
     hub.borrow_mut().refreshing_transitions=false;
+    hub.borrow_mut().holding_progress=false;
     // A scoped flush leaves other targets' publications in place, so what an
     // unchanged state already covered stays covered.
     let after=if result.is_ok() {key(&hub)?} else {None};
@@ -3119,14 +3129,28 @@ fn sample_realm_in_phase(hub:&Rc<RefCell<AnimationHub>>,realm:&Rc<DomRealm>,now:
     // independently of whether its target paint/style is demanded.
     let has_progress=hub.borrow().records.values().any(|record|record.progress_timeline.is_some()
         && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && !record.cancelled);
-    if has_progress {
+    // Scroll-driven animations take their progress from a layout snapshot. A style
+    // change event between frames keeps the previous samples instead of forcing a new
+    // layout, unless the layout is current anyway or a timeline was never sampled.
+    let held=has_progress && {
+        let state=hub.borrow();
+        state.holding_progress && realm.session.borrow().completed_geometry_is_stale()
+            && state.records.values().filter(|record|!record.cancelled && record.progress_timeline.is_some()
+                && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)))
+                .all(|record|state.progress_sampled.contains(&record.id))
+    };
+    if has_progress && !held {
         realm.flush_layout()?;
         let samples=hub.borrow().records.values().filter(|record|!record.cancelled
             && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)))
             .filter_map(|record|record.progress_timeline.as_ref().map(|binding|(record.id,progress_time(realm,binding))))
             .collect::<Vec<_>>();
+        let mut state=hub.borrow_mut();
+        let state=&mut *state;
+        state.progress_sampled.retain(|id|state.records.contains_key(id));
         for (id,time) in samples {
-            if let Some(binding)=hub.borrow_mut().records.get_mut(&id).and_then(|record|record.progress_timeline.as_mut()) {binding.sampled_time=time;}
+            if let Some(binding)=state.records.get_mut(&id).and_then(|record|record.progress_timeline.as_mut()) {binding.sampled_time=time;}
+            state.progress_sampled.insert(id);
         }
     }
     let key = Rc::as_ptr(realm) as usize;
@@ -6988,6 +7012,25 @@ fn specification_css_transition_all_and_logical_lists_create_one_physical_effect
         advance(engine.ctx(),32.0).unwrap();
         assert!(matches!(eval_ok(&mut engine,"original===target.getAnimations()[0] && !original.pending"),Value::Bool(true)));
         assert!((progress_translation(&realm)-100.0).abs()<0.01);
+    }
+
+    #[test]
+    fn a_style_read_between_frames_keeps_the_view_timeline_sample_without_layout() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<style>@keyframes anim{from{transform:translateX(100px)}to{transform:translateX(0px)}}#scroller{border:1px solid black;overflow:hidden;width:300px;height:200px}#target{margin-top:700px;margin-bottom:800px;width:100px;height:200px;animation:anim auto both linear;animation-timeline:--timeline;view-timeline:--timeline;animation-range:exit}#target.update{height:100px;margin-top:800px}</style><div id='scroller'><div id='target'></div></div><p id='other' style='color:green'>x</p>",128).unwrap();
+        let layouts=Rc::new(std::cell::Cell::new(0usize));
+        let font=Rc::new(lumen_html_text::FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap());
+        let counter=layouts.clone();
+        realm.set_layout_flusher(Rc::new(move|session|{counter.set(counter.get()+1);session.display_list(800,600,font.as_ref()).map(|_|()).map_err(|error|format!("{error:?}"))}));
+        eval_ok(&mut engine,"globalThis.scroller=document.getElementById('scroller');globalThis.target=document.getElementById('target');scroller.scrollTop=800");
+        advance(engine.ctx(),0.0).unwrap();
+        advance(engine.ctx(),16.0).unwrap();
+        assert!((progress_translation(&realm)-50.0).abs()<0.01);
+        let before=layouts.get();
+        eval_ok(&mut engine,"target.classList.add('update');getComputedStyle(document.getElementById('other')).color");
+        assert_eq!(layouts.get(),before,"a computed style read between frames lays nothing out for the view timeline");
+        advance(engine.ctx(),32.0).unwrap();
+        assert!((progress_translation(&realm)-100.0).abs()<0.01,"the next frame samples the new subject bounds");
     }
 
     #[test]

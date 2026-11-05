@@ -5717,6 +5717,10 @@ impl RenderSession {
         frame.geometry.transform_timeline_values.as_deref()?.get_value(node,pseudo,source).map(|value|value.used.clone())
     }
 
+    /// True when the document changed since the last completed layout, so geometry
+    /// reads would have to lay it out again.
+    pub fn completed_geometry_is_stale(&self)->bool {self.completed_geometry().is_none()}
+
     pub(crate) fn completed_geometry(&self)->Option<&layout::LayoutGeometry>{
         self.cached.as_ref().filter(|frame|frame.document_version==self.document.version()).map(|frame|&frame.geometry)
     }
