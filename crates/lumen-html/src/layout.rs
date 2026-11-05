@@ -14150,7 +14150,9 @@ fn generated_image_command(image:&GeneratedImage,rect:Rect,style:&Style,images:O
     let scheme=style.used_color_scheme(environment).scheme;
     let paint=images.and_then(|images|viewport_background_paint(&image.source,&image.paint,images,rect.width,rect.height,scheme,0)).unwrap_or_else(||image.paint.clone());
     match paint {
-        BackgroundPaint::Image(image)=>Command::Image{rect,image},
+        // A pending or failed url() keeps its 0x0 placeholder, which only
+        // a background fill accepts; it paints nothing either way.
+        BackgroundPaint::Image(image) if image.is_valid()=>Command::Image{rect,image},
         paint=>Command::FillBackground(Box::new(crate::paint::BackgroundFill{corners:None,rect,radius:0.0,positioning_rect:rect,image_rect:rect,repeat:[BackgroundRepeat::NoRepeat;2],image:computed_procedural_paint(&paint,style,rect,rect.width,rect.height,0)})),
     }
 }
