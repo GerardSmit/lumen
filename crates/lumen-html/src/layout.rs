@@ -1366,7 +1366,9 @@ fn parse_svg_stop_offset(input: &str) -> Option<f32> {
     value.is_finite().then_some(value)
 }
 
-const MAX_DISPLAY_COMMANDS: usize = 16 * 1024;
+// Large front pages (news sites) emit tens of thousands of commands; the
+// display list stays bounded by MAX_DISPLAY_LIST_BYTES.
+const MAX_DISPLAY_COMMANDS: usize = 128 * 1024;
 const MAX_TEXT_PATH_GLYPHS: usize = 4096;
 /// Screens of content emitted beyond the viewport, on each side, across the
 /// document's block axis when its root scroll moves the retained frame. The
@@ -1374,7 +1376,10 @@ const MAX_TEXT_PATH_GLYPHS: usize = 4096;
 pub(crate) const ROOT_SCROLL_WINDOW_SCREENS: f32 = 4.0;
 // Chromium's LayoutUnit granularity: absolute f32 coordinates must not push an exactly fitting word onto the next line.
 const INLINE_FIT_TOLERANCE: f64 = 1.0 / 64.0;
-const MAX_DISPLAY_LIST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DISPLAY_LIST_BYTES: usize = 64 * 1024 * 1024;
+/// The whole document's rendered text (innerText, selection, find). One
+/// paragraph stays within the bidi limit; a long page holds far more.
+const MAX_RENDERED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// Largest charge for one retained fragment.
 const MAX_RETAINED_FRAGMENT_BYTES: usize = 1 * 1024 * 1024;
 const DEFAULT_RETAINED_ENTRIES: usize = 16384;
@@ -20036,7 +20041,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let Some(geometry) = self.geometry.as_deref_mut().filter(|geometry| geometry.collect_rendered_text) else { return Ok(()); };
         if geometry.rendered_table_members.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
         let bytes = geometry.rendered_text_bytes.checked_add(core::mem::size_of::<RenderedTableMember>())
-            .filter(|bytes| *bytes <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::CommandLimit)?;
+            .filter(|bytes| *bytes <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::CommandLimit)?;
         geometry.rendered_table_members.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
         geometry.rendered_table_members.push(member);
         geometry.rendered_text_bytes = bytes;
@@ -29945,7 +29950,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let geometry = self.geometry.as_deref_mut().ok_or(LayoutError::InvalidTree)?;
         if shared.is_none() {
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(paragraph.text.len())
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             *shared = Some(Arc::from(paragraph.text.as_str()));
         }
         let text = shared.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -29967,7 +29972,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if start >= stop && !hard_break_after { continue; }
             if geometry.rendered_text_boxes.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(core::mem::size_of::<RenderedTextBox>())
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             geometry.rendered_text_boxes.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
             let order = geometry.rendered_text_boxes.len();
             geometry.rendered_text_boxes.push(RenderedTextBox { node: source.node, text: text.clone(), range: start.min(stop)..stop, order, hard_break_after, table_context: self.rendered_table_context });
@@ -29979,7 +29984,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         if !visible || text.is_empty() || !self.collects_rendered_text() { return Ok(()); }
         let geometry = self.geometry.as_deref_mut().ok_or(LayoutError::InvalidTree)?;
         geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(text.len()).and_then(|bytes| bytes.checked_add(core::mem::size_of::<RenderedTextBox>()))
-            .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+            .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
         if geometry.rendered_text_boxes.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
         geometry.rendered_text_boxes.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
         let order = geometry.rendered_text_boxes.len();
@@ -38378,7 +38383,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 return Err(LayoutError::CommandLimit);
             }
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(fragment.rendered_text_bytes)
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             geometry.rendered_text_boxes.try_reserve(boxes.len()).map_err(|_| LayoutError::CommandLimit)?;
             for value in boxes.iter() {
                 let mut value = value.clone();

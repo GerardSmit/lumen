@@ -10455,15 +10455,21 @@ mod tests {
         fn line_height(&self, _: f32) -> f32 { 1.0 }
     }
 
+    /// Rows past the display command limit (128 Ki), split over sibling
+    /// blocks so no paragraph passes the bidi text limit.
+    const DENSE_ROWS: usize = 144_000;
+    const DENSE_WINDOW: u32 = 27_200;
+
     fn dense_rows(rows: usize) -> RenderSession {
-        let source = alloc::format!("<!doctype html><style>html,body{{margin:0}}div{{width:1px;font:1px/1px sans-serif}}</style><body><div>{}</div>", "w ".repeat(rows));
-        RenderSession::new(crate::html::parse(&source, 64).unwrap())
+        let block = alloc::format!("<p>{}</p>", "w ".repeat(1000));
+        let source = alloc::format!("<!doctype html><style>html,body,p{{margin:0}}div,p{{width:1px;font:1px/1px sans-serif}}</style><body><div>{}</div>", block.repeat(rows.div_ceil(1000)));
+        RenderSession::new(crate::html::parse(&source, 1024).unwrap())
     }
 
     #[test]
     fn a_window_too_dense_for_the_command_limit_is_halved_and_a_new_document_starts_again() {
-        let mut session = dense_rows(18_000);
-        session.display_list(100, 3400, &Mono).unwrap();
+        let mut session = dense_rows(DENSE_ROWS);
+        session.display_list(100, DENSE_WINDOW, &Mono).unwrap();
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0));
         assert!(session.cached.as_ref().unwrap().geometry.root_scroll_region.is_some());
         session.set_document_base_url(Some("https://example.test/next".into()));
@@ -10472,30 +10478,30 @@ mod tests {
 
     #[test]
     fn the_full_window_is_tried_again_when_the_document_changes() {
-        let mut session = dense_rows(18_000);
-        session.display_list(100, 3400, &Mono).unwrap();
+        let mut session = dense_rows(DENSE_ROWS);
+        session.display_list(100, DENSE_WINDOW, &Mono).unwrap();
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0));
         assert!(session.window_reduced.is_some());
         let rows = crate::selector::query_selector(session.document(), session.document().root(), "div").unwrap().unwrap();
         session.document_mut().set_attribute(rows, "style", "width:2px").unwrap();
-        session.display_list(100, 3400, &Mono).unwrap();
+        session.display_list(100, DENSE_WINDOW, &Mono).unwrap();
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0), "still too dense");
         assert_eq!(session.window_reduced.map(|(_, gap)| gap), Some(2), "so the next attempt waits longer");
         session.document_mut().set_attribute(rows, "style", "display:none").unwrap();
-        session.display_list(100, 3400, &Mono).unwrap();
+        session.display_list(100, DENSE_WINDOW, &Mono).unwrap();
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0), "the retry is not due yet");
         // Changing a hidden element lays out nothing; a visible change does.
         let body = crate::selector::query_selector(session.document(), session.document().root(), "body").unwrap().unwrap();
         session.document_mut().set_attribute(body, "style", "margin:1px").unwrap();
-        session.display_list(100, 3400, &Mono).unwrap();
+        session.display_list(100, DENSE_WINDOW, &Mono).unwrap();
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS));
         assert_eq!(session.window_reduced, None);
     }
 
     #[test]
     fn a_viewport_too_dense_for_the_command_limit_keeps_the_window() {
-        let mut session = dense_rows(18_000);
-        assert!(matches!(session.display_list(100, 17_000, &Mono), Err(LayoutError::CommandLimit)));
+        let mut session = dense_rows(DENSE_ROWS);
+        assert!(matches!(session.display_list(100, 136_000, &Mono), Err(LayoutError::CommandLimit)));
         assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS), "the window was not the cause");
     }
 
