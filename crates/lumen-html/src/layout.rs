@@ -629,6 +629,16 @@ fn svg_element_with_id(document: &Document, id: &str) -> Result<Option<NodeId>, 
     if id.is_empty() || id.len() > 1024 {
         return Ok(None);
     }
+    // The document's id index names the first element with this id in tree order.
+    // If it is an SVG element it is also the first SVG one; if no element has the
+    // id, none does. Otherwise a non-SVG element shadows it and the walk decides.
+    match document.indexed_element_by_id(id) {
+        Some(None) => return Ok(None),
+        Some(Some(node)) if matches!(document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Svg, .. })) => {
+            return Ok(Some(node));
+        }
+        _ => {}
+    }
     let mut pending = Vec::new();
     let mut child = document
         .first_child(document.root())
