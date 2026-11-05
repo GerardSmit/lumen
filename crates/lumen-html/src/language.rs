@@ -77,9 +77,15 @@ pub(crate) fn protocol_candidate(headers: &[(String, String)]) -> Option<&str> {
 }
 
 pub(crate) fn declared(document: &Document, node: NodeId) -> Result<Option<&str>, Error> {
-    let NodeKind::Element { namespace, .. } = document.kind(node)? else {
+    let NodeKind::Element { namespace, attributes, .. } = document.kind(node)? else {
         return Ok(None);
     };
+    // `:lang()` walks every ancestor; most declare no language. Both `lang`
+    // and `xml:lang` have a qualified name ending in "lang", so this cheap
+    // scan skips the namespace-aware lookups for every other element.
+    if !attributes.iter().any(|(name, _)| name.as_str().ends_with("lang")) {
+        return Ok(None);
+    }
     if let Some(value) =
         document.get_attribute_ns_ref(node, Some("http://www.w3.org/XML/1998/namespace"), "lang")?
     {
