@@ -32707,7 +32707,8 @@ fn compute_for_named_registered_inner(
     }
     // The UA's list-item increment is the initial declaration for every
     // list-item box. An authored counter-increment (including `none`) replaces
-    // it through the ordinary cascade.
+    // it through the ordinary cascade; counting still increments `list-item`
+    // unless the authored value names it (`apply_counter_operations`).
     if style.is_list_item() && winner_orders[161] == 0 {
         style.counter_increment = Some(Arc::from([CounterDirective {
             name: Arc::from("list-item"),

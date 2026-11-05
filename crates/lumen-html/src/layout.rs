@@ -10002,6 +10002,18 @@ fn apply_counter_operations(
             reversed.record(counter.instance, CounterEvent::Increment { amount, tick })?;
         }
     }
+    // CSS Lists 3 §4.5: a list item increments `list-item` by one unless its
+    // `counter-increment` names that counter itself; an authored increment of
+    // other counters (or `none`) keeps it.
+    if style.is_list_item() && !style.counter_increment.as_deref().is_some_and(|increments|
+        increments.iter().any(|increment| &*increment.name == "list-item")) {
+        let index = ensure_counter(&Arc::from("list-item"), scope, active, mutation_floor)?;
+        let counter = active.get_mut(index).ok_or(LayoutError::InvalidTree)?;
+        let amount = if counter.reversed { -1 } else { 1 };
+        counter.value = clamp_counter(counter.value.saturating_add(amount));
+        let tick = reversed.tick;
+        reversed.record(counter.instance, CounterEvent::Increment { amount, tick })?;
+    }
     if let Some(sets) = style.counter_set.as_deref() {
         for set in sets {
             let index = ensure_counter(&set.name, scope, active, mutation_floor)?;
@@ -60160,6 +60172,16 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let mut runs: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| !run.is_empty()).collect();
         runs.sort_unstable();
         assert_eq!(runs, ["1", "2", "x"], "{shaped:?}");
+    }
+
+    #[test]
+    fn list_items_count_with_authored_increments_of_other_counters() {
+        // Wikipedia's references: `ol.references > li { counter-increment: mw-references 1 }`.
+        let shaped = painted_text_runs(
+            "<style>body,ol{margin:0}ol{padding-left:24px;counter-reset:refs 0 list-item 0}li{counter-increment:refs 1}.none{counter-increment:none}.own{counter-increment:list-item 5}</style>\
+             <ol><li>a</li><li class=none>b</li><li>c</li><li class=own>d</li></ol>");
+        let markers: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| run.ends_with('.')).collect();
+        assert_eq!(markers, ["1.", "2.", "3.", "8."], "{shaped:?}");
     }
 
     #[test]
