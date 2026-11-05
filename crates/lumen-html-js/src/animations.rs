@@ -180,39 +180,98 @@ struct TransitionRecord {
     endpoint_styles:Option<(Arc<lumen_html::css::Style>,Arc<lumen_html::css::Style>)>,
 }
 
+
+thread_local! {
+    /// Counts mutable accesses to any animation hub's state.
+    static HUB_MUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn hub_mutations() -> u64 {
+    HUB_MUTATIONS.with(std::cell::Cell::get)
+}
+
+/// Hub state whose every mutable access is counted, so a flush can tell that
+/// nothing changed since the previous one.
+#[derive(Default)]
+struct Tracked<T>(T);
+
+impl<T> core::ops::Deref for Tracked<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.0 }
+}
+
+impl<T> core::ops::DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        HUB_MUTATIONS.with(|count| count.set(count.get().wrapping_add(1)));
+        &mut self.0
+    }
+}
+
+/// What a geometry or computed-style read already flushed. Every input of the
+/// flush (hub state, style-change inputs, timeline time) is in `key`; while it
+/// holds, flushing a target again publishes exactly what it published before.
+struct FlushMemo {
+    key: FlushKey,
+    /// Targets flushed for every property (`None`), or for one property.
+    flushed: Vec<(Option<NodeId>, Option<Box<str>>)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct FlushKey {
+    realm: usize,
+    mutations: u64,
+    now: u64,
+    epoch: lumen_html::session::TransitionInputEpoch,
+}
+
+impl FlushMemo {
+    fn covers(&self, target: Option<NodeId>, property: Option<&str>) -> bool {
+        self.flushed.iter().any(|(node, name)| (node.is_none() || *node == target)
+            && (name.is_none() || name.as_deref() == property))
+    }
+}
+
 struct AnimationHub {
     default_realm: Weak<DomRealm>,
+
     next_id: u32,
+
     next_effect_id: u32,
+
     next_timeline_id: u32,
-    records: BTreeMap<u32, Record>,
-    effect_records: FastMap<u32, EffectRecord>,
-    wrappers: FastMap<u32, WeakValue>,
-    finished: FastMap<u32, FinishedPromise>,
-    ready: FastMap<u32, ReadyPromise>,
-    effects: FastMap<u32, WeakValue>,
-    timelines: FastMap<usize, WeakValue>,
-    default_timeline_ids: FastMap<usize, u32>,
-    timeline_values: FastMap<u32, WeakValue>,
-    overlaid_nodes: FastMap<usize, FastSet<(NodeId,Option<lumen_html::css::PseudoElement>,bool)>>,
-    css_records: FastMap<(usize, NodeId, Option<lumen_html::css::PseudoElement>, usize), (String, String, u32)>,
-    css_generations: FastMap<usize, (Weak<DomRealm>, u64)>,
-    css_events: FastMap<u32, CssEventState>,
-    transitions:FastMap<u32,TransitionRecord>,
-    running_transitions:FastMap<TransitionTarget,u32>,
-    completed_transitions:FastMap<TransitionTarget,String>,
-    transition_snapshots:FastMap<usize,(Weak<DomRealm>,Arc<lumen_html::session::TransitionSnapshot>)>,
-    after_effect_bases:FastMap<usize,AfterEffectBasis>,
-    transition_over_budget:FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
-    transition_budget_reported:FastSet<usize>,
-    animation_over_budget:FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
-    animation_budget_reported:FastSet<usize>,
-    transition_mutation_realms:Vec<Weak<DomRealm>>,
+
+    records: Tracked<BTreeMap<u32, Record>>,
+    effect_records: Tracked<FastMap<u32, EffectRecord>>,
+    wrappers: Tracked<FastMap<u32, WeakValue>>,
+    finished: Tracked<FastMap<u32, FinishedPromise>>,
+    ready: Tracked<FastMap<u32, ReadyPromise>>,
+    effects: Tracked<FastMap<u32, WeakValue>>,
+    timelines: Tracked<FastMap<usize, WeakValue>>,
+    default_timeline_ids: Tracked<FastMap<usize, u32>>,
+    timeline_values: Tracked<FastMap<u32, WeakValue>>,
+    overlaid_nodes: Tracked<FastMap<usize, FastSet<(NodeId,Option<lumen_html::css::PseudoElement>,bool)>>>,
+    css_records: Tracked<FastMap<(usize, NodeId, Option<lumen_html::css::PseudoElement>, usize), (String, String, u32)>>,
+    css_generations: Tracked<FastMap<usize, (Weak<DomRealm>, u64)>>,
+    css_events: Tracked<FastMap<u32, CssEventState>>,
+    transitions: Tracked<FastMap<u32,TransitionRecord>>,
+    running_transitions: Tracked<FastMap<TransitionTarget,u32>>,
+    completed_transitions: Tracked<FastMap<TransitionTarget,String>>,
+    transition_snapshots: Tracked<FastMap<usize,(Weak<DomRealm>,Arc<lumen_html::session::TransitionSnapshot>)>>,
+    after_effect_bases: Tracked<FastMap<usize,AfterEffectBasis>>,
+    transition_over_budget: Tracked<FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>>,
+    transition_budget_reported: Tracked<FastSet<usize>>,
+    animation_over_budget: Tracked<FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>>,
+    animation_budget_reported: Tracked<FastSet<usize>>,
+    transition_mutation_realms: Tracked<Vec<Weak<DomRealm>>>,
     transition_generation:u64,
+
     refreshing_transitions:bool,
-    rendered_revisions: FastMap<usize, (Weak<DomRealm>, u64, u64)>,
-    dispatching_css: FastMap<u32, usize>,
-    css_cancellations: Vec<Weak<CssCancellation>>,
+
+    rendered_revisions: Tracked<FastMap<usize, (Weak<DomRealm>, u64, u64)>>,
+    dispatching_css: Tracked<FastMap<u32, usize>>,
+    css_cancellations: Tracked<Vec<Weak<CssCancellation>>>,
+    /// The state after the last `flush_css_transitions_for_property`.
+    flush_memo: Option<FlushMemo>,
 }
 
 impl Default for AnimationHub {
@@ -221,30 +280,31 @@ impl Default for AnimationHub {
             next_id: 0,
             next_effect_id: 0,
             next_timeline_id: 0,
-            records: BTreeMap::new(),
-            effect_records: FastMap::default(),
-            wrappers: FastMap::default(),
-            finished: FastMap::default(),
-            ready: FastMap::default(),
-            effects: FastMap::default(),
-            timelines: FastMap::default(),
-            default_timeline_ids: FastMap::default(),
-            timeline_values: FastMap::default(),
-            overlaid_nodes: FastMap::default(),
-            css_records: FastMap::default(),
-            css_generations: FastMap::default(),
-            css_events: FastMap::default(),
-            transitions:FastMap::default(),running_transitions:FastMap::default(),
-            completed_transitions:FastMap::default(),transition_snapshots:FastMap::default(),
-            after_effect_bases:FastMap::default(),
-            transition_over_budget:FastMap::default(),transition_budget_reported:FastSet::default(),
-            animation_over_budget:FastMap::default(),animation_budget_reported:FastSet::default(),
-            transition_mutation_realms:Vec::new(),
+            records:Tracked(BTreeMap::new()),
+            effect_records:Tracked(FastMap::default()),
+            wrappers:Tracked(FastMap::default()),
+            finished:Tracked(FastMap::default()),
+            ready:Tracked(FastMap::default()),
+            effects:Tracked(FastMap::default()),
+            timelines:Tracked(FastMap::default()),
+            default_timeline_ids:Tracked(FastMap::default()),
+            timeline_values:Tracked(FastMap::default()),
+            overlaid_nodes:Tracked(FastMap::default()),
+            css_records:Tracked(FastMap::default()),
+            css_generations:Tracked(FastMap::default()),
+            css_events:Tracked(FastMap::default()),
+            transitions:Tracked(FastMap::default()),running_transitions:Tracked(FastMap::default()),
+            completed_transitions:Tracked(FastMap::default()),transition_snapshots:Tracked(FastMap::default()),
+            after_effect_bases:Tracked(FastMap::default()),
+            transition_over_budget:Tracked(FastMap::default()),transition_budget_reported:Tracked(FastSet::default()),
+            animation_over_budget:Tracked(FastMap::default()),animation_budget_reported:Tracked(FastSet::default()),
+            transition_mutation_realms:Tracked(Vec::new()),
             transition_generation:0,refreshing_transitions:false,
-            rendered_revisions: FastMap::default(),
-            dispatching_css: FastMap::default(),
-            css_cancellations: Vec::new(),
+            rendered_revisions:Tracked(FastMap::default()),
+            dispatching_css:Tracked(FastMap::default()),
+            css_cancellations:Tracked(Vec::new()),
             default_realm: Weak::new(),
+            flush_memo: None,
         }
     }
 }
@@ -2015,15 +2075,51 @@ pub(crate) fn flush_css_transitions_for_property(ctx:&mut Ctx,realm:&Rc<DomRealm
     let Some(hub)=RealmServices::<RefCell<AnimationHub>>::current(ctx) else{return Ok(());};
     if hub.borrow().refreshing_transitions {return Ok(());}
     if let Some(target)=target {realm.session.borrow_mut().watch_transition_target(target);}
+    // Scripts read geometry or computed style in loops. With every input of
+    // the flush unchanged since the last one, flushing a target it already
+    // covered would publish the same styles again.
+    let key=|hub:&Rc<RefCell<AnimationHub>>|->OpResult<Option<FlushKey>> {
+        let state=hub.borrow();
+        // Progress timelines sample layout (scroll), which no key input covers.
+        if state.records.values().any(|record|record.progress_timeline.is_some()) {return Ok(None);}
+        let epoch=realm.session.borrow_mut().transition_input_epoch().map_err(|error|OpError::new("InvalidStateError",format!("{error:?}")))?;
+        Ok(Some(FlushKey{realm:Rc::as_ptr(realm) as usize,
+            mutations:hub_mutations()^(u64::from(state.next_id)<<32)^state.transition_generation.rotate_left(16),
+            now:realm.timeline_sample.get().to_bits(),epoch}))
+    };
+    let before=key(&hub)?;
+    let carried=match (&hub.borrow().flush_memo,before) {
+        (Some(memo),Some(before)) if memo.key==before => {
+            // A whole-realm demand covers connected elements only.
+            let connected=target.is_none_or(|node|realm.session.borrow().document().is_connected_element(node));
+            if connected && memo.covers(target,property) {return Ok(());}
+            true
+        }
+        _=>false,
+    };
     hub.borrow_mut().refreshing_transitions=true;
+    let mut whole_realm=false;
     let result=(||{
         let now=realm.timeline_sample.get();
         refresh_css_transitions(ctx,&hub,realm,now)?;
         refresh_css_animations(ctx,&hub,realm,now)?;
         let demand=match property{Some(property)=>EffectDemand::for_property(&hub,realm,target,property)?,None=>EffectDemand::new(realm,target)?};
+        whole_realm=demand.is_whole_realm();
         apply_realm_in_phase_with_demand(&hub,realm,now,EffectStylePhase::Current,&demand)
     })();
     hub.borrow_mut().refreshing_transitions=false;
+    // A scoped flush leaves other targets' publications in place, so what an
+    // unchanged state already covered stays covered.
+    let after=if result.is_ok() {key(&hub)?} else {None};
+    let mut state=hub.borrow_mut();
+    let mut flushed=if carried {state.flush_memo.take().map(|memo|memo.flushed).unwrap_or_default()} else {Vec::new()};
+    state.flush_memo=after.and_then(|key|{
+        if flushed.len()>=256 {flushed.clear();}
+        // An unscoped demand without detached ancestry samples every effect.
+        if whole_realm {flushed.clear();flushed.push((None,None));}
+        else {flushed.push((target,property.map(Box::from)));}
+        Some(FlushMemo{key,flushed})
+    });
     result
 }
 
@@ -2793,6 +2889,8 @@ fn apply_realm_with_underlying(hub:&Rc<RefCell<AnimationHub>>,realm:&Rc<DomRealm
 #[derive(Default)]
 struct EffectDemand { detached: Vec<u128>, scoped_connected:bool }
 impl EffectDemand {
+    /// Every effect of the realm is demanded.
+    fn is_whole_realm(&self)->bool {!self.scoped_connected && self.detached.is_empty()}
     fn new(realm:&DomRealm,target:Option<NodeId>)->OpResult<Self> {Self::new_with_scope(realm,target,false)}
     fn new_with_scope(realm:&DomRealm,target:Option<NodeId>,scoped_connected:bool)->OpResult<Self> {
         let mut result=Self{scoped_connected,..Self::default()};
@@ -4167,7 +4265,7 @@ fn css_tree_order<'a>(owners: impl Iterator<Item = &'a Rc<DomRealm>>) -> OpResul
 }
 
 fn dispatch_css_cancellations(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>) -> OpResult<()> {
-    let mut snapshots = std::mem::take(&mut hub.borrow_mut().css_cancellations)
+    let mut snapshots = std::mem::take(&mut *hub.borrow_mut().css_cancellations)
         .into_iter().filter_map(|entry| entry.upgrade()).collect::<Vec<_>>();
     let tree_order = css_tree_order(snapshots.iter().map(|entry| &entry.owner))?;
     snapshots.sort_by_key(|entry| {
@@ -5720,6 +5818,28 @@ fn specification_animation_context_computed_endpoints_follow_sampled_font_and_li
         if(getComputedStyle(target).width!=='20px')throw Error('computed variable endpoints '+getComputedStyle(target).width);
         target.style.setProperty('--length','20px');
         if(getComputedStyle(target).width!=='40px')throw Error('live variable endpoints '+getComputedStyle(target).width);
+    "#);
+}
+
+#[test]
+fn repeated_geometry_reads_see_every_effect_change(){
+    let mut engine=Engine::new();
+    let realm=crate::install(engine.ctx(),"<div id=one style='width:10px;height:10px'></div><div id=two style='width:10px;height:10px'></div>",128).unwrap();
+    progress_layout(&realm);
+    // Reads in an unchanged state reuse the previous flush; any change to an
+    // effect, the document or the timeline time must be seen by the next read.
+    eval_ok(&mut engine,r#"const one=document.getElementById('one'),two=document.getElementById('two');
+        const motion=one.animate({width:['0px','100px']},{duration:1000,fill:'both'});motion.pause();motion.currentTime=250;
+        for(let i=0;i<3;i++){if(one.offsetWidth!==25||two.offsetWidth!==10)throw Error('first reads '+one.offsetWidth+' '+two.offsetWidth);}
+        motion.currentTime=500;
+        if(one.offsetWidth!==50||two.offsetWidth!==10)throw Error('seek '+one.offsetWidth);
+        const other=two.animate({width:['0px','40px']},{duration:1000,fill:'both'});other.pause();other.currentTime=500;
+        if(two.offsetWidth!==20||one.offsetWidth!==50)throw Error('new effect '+two.offsetWidth);
+        other.cancel();
+        if(two.offsetWidth!==10)throw Error('cancel '+two.offsetWidth);
+        two.style.width='30px';
+        if(two.offsetWidth!==30||one.offsetWidth!==50)throw Error('style write '+two.offsetWidth);
+        if(getComputedStyle(one).width!=='50px')throw Error('computed read '+getComputedStyle(one).width);
     "#);
 }
 
