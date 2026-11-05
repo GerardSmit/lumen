@@ -13566,27 +13566,65 @@ const ALL_PROPERTY_IDS: [usize; ALL_PROPERTY_COUNT] = {
     ids
 };
 
+/// Property slots of the paint-only properties (`paint_only_property`).
+fn paint_only_slot(slot: usize) -> bool {
+    PAINT_ONLY.iter().any(|name| slots(name).contains(&slot))
+}
+
+impl Style {
+    /// Whether this style and `other` differ only in the computed values of
+    /// paint-only properties: their boxes lay out identically.
+    pub(crate) fn differs_only_in_paint(&self, other: &Style) -> bool {
+        if self == other { return true; }
+        let (mine, theirs) = (&**self, &**other);
+        let unpainted = |values: &[RelativeExpression]| values.iter().filter(|value| !paint_only_slot(value.slot)).cloned().collect::<Vec<_>>();
+        if unpainted(&mine.relative_expressions) != unpainted(&theirs.relative_expressions) { return false; }
+        let unpainted_colors = |values: Option<&Arc<[(usize, SourceColor)]>>| values.map_or_else(Vec::new,
+            |values| values.iter().filter(|(slot, _)| !paint_only_slot(*slot)).cloned().collect::<Vec<_>>());
+        if unpainted_colors(mine.source_colors.as_ref()) != unpainted_colors(theirs.source_colors.as_ref()) { return false; }
+        let mut probe = other.clone();
+        probe.opacity = self.opacity;
+        probe.color = self.color;
+        probe.background = self.background;
+        probe.border_color = self.border_color;
+        {
+            let extras = &mut *probe;
+            extras.logical_border_color = mine.logical_border_color;
+            extras.border_color_sides = mine.border_color_sides;
+            extras.outline = mine.outline;
+            extras.text_decoration_color = mine.text_decoration_color;
+            extras.transforms = mine.transforms.clone();
+            extras.individual_transforms = mine.individual_transforms.clone();
+            extras.relative_expressions = mine.relative_expressions.clone();
+            extras.source_colors = mine.source_colors.clone();
+        }
+        extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(self, "backdrop-filter"));
+        probe == *self
+    }
+}
+
+const PAINT_ONLY: &[&str] = &[
+    "opacity",
+    "transform",
+    "color",
+    "background-color",
+    "border-color",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "outline",
+    "outline-color",
+    "outline-style",
+    "outline-width",
+    "outline-offset",
+    "text-decoration-color",
+    "backdrop-filter",
+];
+
 /// Registered properties whose computed value only changes painted output,
 /// never box geometry. Unregistered, custom and unlisted names are not.
 pub(crate) fn paint_only_property(name: &str) -> bool {
-    const PAINT_ONLY: &[&str] = &[
-        "opacity",
-        "transform",
-        "color",
-        "background-color",
-        "border-color",
-        "border-top-color",
-        "border-right-color",
-        "border-bottom-color",
-        "border-left-color",
-        "outline",
-        "outline-color",
-        "outline-style",
-        "outline-width",
-        "outline-offset",
-        "text-decoration-color",
-        "backdrop-filter",
-    ];
     let name = name.trim().to_ascii_lowercase();
     PAINT_ONLY.contains(&name.as_str()) && !slots(&name).is_empty()
 }
@@ -28618,6 +28656,12 @@ impl StyleCache {
             && entry.box_parent==box_parent && self.same_parent(entry.origin_token,token))
             .map(|entry|entry.generated.clone())
     }
+    /// The pseudo-element style last computed for `origin`: `Some(None)` when it
+    /// generates no box, `None` when it has not been computed.
+    pub(crate) fn latest_pseudo_style(&self, origin: NodeId, pseudo: PseudoElement) -> Option<Option<GeneratedStyle>> {
+        if self.selected.is_some() { return None; }
+        self.pseudos.get(origin.index())?.iter().rev().find(|entry| entry.origin == origin && entry.pseudo == pseudo).map(|entry| entry.generated.clone())
+    }
     #[cfg(test)]
     pub(crate) fn pseudo_style(&self, origin: NodeId, pseudo: PseudoElement) -> Option<&Option<GeneratedStyle>> {
         self.pseudos.get(origin.index())?.iter().rev().find(|entry| entry.origin == origin && entry.pseudo == pseudo).map(|entry| &entry.generated)
@@ -29402,6 +29446,21 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
     if old.filters.is_some() == new.filters.is_some() {
         paint_fields!(filters);
     }
+    // A transform or backdrop filter that starts or stops changes stacking
+    // and containing blocks; one that changes value moves only paint.
+    if old.has_transform() == new.has_transform() {
+        let unpainted = |values: &[RelativeExpression]| values.iter().filter(|value| !paint_only_slot(value.slot)).cloned().collect::<Vec<_>>();
+        let extras = &mut *probe;
+        extras.transforms = new.transforms.clone();
+        extras.individual_transforms = new.individual_transforms.clone();
+        if unpainted(&old.relative_expressions) == unpainted(&new.relative_expressions) {
+            extras.relative_expressions = new.relative_expressions.clone();
+        }
+    }
+    let backdrop = |style: &Style| extra_props::keyword(style, "backdrop-filter").is_some_and(|value| value != "none");
+    if backdrop(old) == backdrop(new) {
+        extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(new, "backdrop-filter"));
+    }
     if probe == *new { StyleDamage::Paint } else { StyleDamage::Layout }
 }
 
@@ -29683,6 +29742,7 @@ fn restyle_one(
     text: &dyn TextShaper,
     node: NodeId,
     forced_parent: Option<&Arc<Style>>,
+    paint: Option<&mut Vec<RestyledPaint>>,
 ) -> Result<(StyleDamage, Option<Arc<Style>>, Option<Arc<Style>>), CssError> {
     let old = cache.node_entry(node).cloned();
     let old_pseudos: Vec<(PseudoElement, Option<GeneratedStyle>)> = if cache.selected.is_some() { Vec::new() } else {
@@ -29718,10 +29778,16 @@ fn restyle_one(
     let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| generated.style.sibling_position_dependent
         || matches!(&generated.content,
         GeneratedContent::Items(items) if items.iter().any(|item| matches!(item, GeneratedContentItem::Attribute { .. }))));
+    let mut pseudo_pairs: Vec<(PseudoElement, GeneratedStyle, GeneratedStyle)> = Vec::new();
     for (position, (pseudo, generated)) in old_pseudos.iter().enumerate() {
         if old_pseudos[..position].iter().any(|(earlier, _)| earlier == pseudo) { continue; }
         if reads_attributes(generated) { damage = StyleDamage::Layout; break; }
         let current = index.compute_pseudo_cached(document, node, &style, *pseudo, Some(text), cache)?;
+        if paint.is_some() {
+            if let (Some(old), Some(new)) = (generated, &current) {
+                if old.style != new.style { pseudo_pairs.push((*pseudo, old.clone(), new.clone())); }
+            }
+        }
         let mut changed = StyleDamage::Layout;
         for (_, old) in old_pseudos.iter().filter(|(kind, _)| kind == pseudo) {
             changed = changed.min(pseudo_damage(index, &mut cache.custom_rebases, old, &current));
@@ -29740,7 +29806,26 @@ fn restyle_one(
         damage = StyleDamage::Layout;
     }
     let new_style = (damage != StyleDamage::None && style != *old_style).then(|| Arc::new(style));
+    if let Some(paint) = paint.filter(|_| damage == StyleDamage::Paint) {
+        if let Some(new) = &new_style {
+            paint.push(RestyledPaint { node, pseudo: None, old: old_style.clone(), new: new.clone(), content: None });
+        }
+        for (pseudo, old, new) in pseudo_pairs {
+            paint.push(RestyledPaint { node, pseudo: Some(pseudo), old: Arc::new(old.style), new: Arc::new(new.style),
+                content: Some((old.content, new.content)) });
+        }
+    }
     Ok((damage, new_style, Some(old_style)))
+}
+
+/// A box whose style a restyle changed with paint damage only: its style
+/// before and after, and for a pseudo-element its content before and after.
+pub(crate) struct RestyledPaint {
+    pub node: NodeId,
+    pub pseudo: Option<PseudoElement>,
+    pub old: Arc<Style>,
+    pub new: Arc<Style>,
+    pub content: Option<(GeneratedContent, GeneratedContent)>,
 }
 
 /// Recompute the retained styles of `nodes`, which a mutation may have
@@ -29752,13 +29837,15 @@ fn restyle_one(
 /// had no retained style to compare with, with the damage the change causes;
 /// nodes whose damage is `None` are omitted and the styles of all others are
 /// kept as they were. Fails when the work exceeds a bound that makes a full
-/// restyle cheaper.
+/// restyle cheaper. With `paint`, also collects the styles before and after
+/// of every box restyled with paint damage only.
 pub(crate) fn restyle_nodes(
     document: &Document,
     index: &StyleIndex,
     cache: &mut StyleCache,
     text: &dyn TextShaper,
     nodes: &[NodeId],
+    mut paint: Option<&mut Vec<RestyledPaint>>,
 ) -> Result<Vec<(NodeId, StyleDamage)>, CssError> {
     let mut order: Vec<(usize, NodeId)> = nodes.iter()
         .filter(|node| document.kind(**node).is_ok())
@@ -29784,7 +29871,7 @@ pub(crate) fn restyle_nodes(
             continue;
         }
         done.insert(node.key());
-        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None)?;
+        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None, paint.as_deref_mut())?;
         record(&mut damage, node, level);
         if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
             pending.push((node, new_style, old_style));
@@ -29836,7 +29923,7 @@ pub(crate) fn restyle_nodes(
                 }
                 budget -= 1;
                 done.insert(child.key());
-                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent))?;
+                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent), paint.as_deref_mut())?;
                 record(&mut damage, child, level);
                 if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
                     pending.push((child, new_style, old_style));
@@ -43978,7 +44065,7 @@ mod incremental_style_tests {
 
     fn restyle(document: &Document, index: &StyleIndex, cache: &mut StyleCache) -> (Vec<NodeId>, Vec<(NodeId, StyleDamage)>) {
         let targets = index.mutation_restyle_targets(document, document.mutations()).unwrap();
-        let damage = restyle_nodes(document, index, cache, &TestText, &targets).unwrap();
+        let damage = restyle_nodes(document, index, cache, &TestText, &targets, None).unwrap();
         (targets, damage)
     }
 
@@ -44262,7 +44349,7 @@ mod incremental_style_tests {
         let wrap = elements(&document, "div")[0];
         document.set_attribute(wrap, "class", "wrap big").unwrap();
         let targets = index.mutation_restyle_targets(&document, document.mutations()).unwrap();
-        assert!(restyle_nodes(&document, &index, &mut cache, &TestText, &targets).is_err());
+        assert!(restyle_nodes(&document, &index, &mut cache, &TestText, &targets, None).is_err());
     }
 
     #[test]
@@ -44459,7 +44546,7 @@ mod incremental_style_tests {
         let subjects = extended.appended_rule_subjects(&appended, &document, &cache).expect("bounded");
         assert_eq!(subjects.len(), elements(&document, "").len());
         let targets: Vec<NodeId> = subjects.iter().map(|&(node, _)| node).collect();
-        restyle_nodes(&document, &extended, &mut cache, &TestText, &targets).unwrap();
+        restyle_nodes(&document, &extended, &mut cache, &TestText, &targets, None).unwrap();
         assert_matches_full_restyle(&document, &extended, &cache);
     }
 
@@ -44505,7 +44592,7 @@ mod incremental_style_tests {
         let subjects = extended.appended_rule_subjects(&appended, &document, &cache).expect("bounded");
         let nodes: Vec<NodeId> = subjects.iter().map(|&(node, _)| node).collect();
         assert_eq!(nodes.len(), 2);
-        restyle_nodes(&document, &extended, &mut cache, &TestText, &nodes).unwrap();
+        restyle_nodes(&document, &extended, &mut cache, &TestText, &nodes, None).unwrap();
         assert_matches_full_restyle(&document, &extended, &cache);
     }
 

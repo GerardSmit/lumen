@@ -1676,3 +1676,142 @@ diff!(
         |s| { animate(s, "#a", &[("transform", "translateX(-33.25px)")]); animate(s, "#b", &[("transform", "translateX(-33.25px)")]); },
     ]
 );
+
+/// Every paint-only property with two values to animate between.
+const PAINT_ONLY_SAMPLES: &[(&str, &str, &str)] = &[
+    ("opacity", "0.5", "0.25"),
+    ("transform", "translateX(5px) scale(1.5)", "translateX(9px) scale(0.5)"),
+    ("color", "red", "blue"),
+    ("background-color", "#123456", "#654321"),
+    ("border-color", "red", "blue"),
+    ("border-top-color", "red", "blue"),
+    ("border-right-color", "red", "blue"),
+    ("border-bottom-color", "red", "blue"),
+    ("border-left-color", "red", "blue"),
+    ("outline", "2px solid red", "4px dashed blue"),
+    ("outline-color", "red", "blue"),
+    ("outline-style", "dotted", "double"),
+    ("outline-width", "3px", "6px"),
+    ("outline-offset", "2px", "5px"),
+    ("text-decoration-color", "red", "blue"),
+    ("backdrop-filter", "blur(2px)", "blur(4px)"),
+];
+
+const PAINT_PAGE: &str = "<style>body{margin:0}#clip{overflow:hidden;width:400px;height:300px}\
+     .b{width:120px;height:40px;border:3px solid black;outline:1px solid green;background:#eee;text-decoration:underline}\
+     .b::before{content:'gen';border:2px solid black;outline:1px solid green;background:yellow;text-decoration:underline}\
+     .b span{border:1px solid black;outline:1px solid green;background:#ddd}#k::before{display:block;width:30px}\
+     #u{margin:20px}</style>\
+     <div id=clip><div class=b id=t>text <span id=s>inline</span></div><div class=b id=k>x</div></div>\
+     <div class=b id=u>free</div><p>after</p>";
+
+#[derive(Clone, Copy, Debug)]
+enum PaintTarget {
+    Element(&'static str),
+    Before(&'static str),
+}
+
+/// How a sample reaches the style.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PaintChannel {
+    Animation,
+    StyleAttribute,
+    Class,
+}
+
+fn paint_page(target: PaintTarget, name: &str, first: &str, second: &str) -> String {
+    let rules = match target {
+        PaintTarget::Element(sel) => format!("{sel}.pa{{{name}:{first}}}{sel}.pb{{{name}:{second}}}"),
+        PaintTarget::Before(sel) => format!("{sel}.pa::before{{{name}:{first}}}{sel}.pb::before{{{name}:{second}}}"),
+    };
+    format!("{PAINT_PAGE}<style>{rules}</style>")
+}
+
+fn set_paint(s: &mut RenderSession, channel: PaintChannel, target: PaintTarget, name: &str, value: &str, sample: usize) {
+    let (sel, pseudo) = match target {
+        PaintTarget::Element(sel) => (sel, None),
+        PaintTarget::Before(sel) => (sel, Some(lumen_html::css::PseudoElement::Before)),
+    };
+    let node = q(s, sel);
+    match channel {
+        PaintChannel::Animation => {
+            let declarations = vec![(name.to_string(), value.to_string())];
+            s.set_pseudo_effect_declarations(node, pseudo, lumen_html::css::EffectOrigin::Animation, declarations).unwrap();
+        }
+        PaintChannel::StyleAttribute => s.document_mut().set_attribute(node, "style", &format!("{name}:{value}")).unwrap(),
+        PaintChannel::Class => {
+            let base = if sel == "#s" { "" } else { "b " };
+            let class = format!("{base}{}", ["pa", "pb"][sample]);
+            s.document_mut().set_attribute(node, "class", &class).unwrap();
+        }
+    }
+}
+
+/// Samples every paint-only property on every kind of box twice, through
+/// animations, inline styles and class changes; the second sample must
+/// rewrite the painted frame without a layout pass and match a fresh layout
+/// of the same state.
+#[test]
+fn paint_only_samples_patch_the_frame_without_layout() {
+    let targets = [PaintTarget::Element("#t"), PaintTarget::Element("#s"), PaintTarget::Before("#t"),
+        PaintTarget::Before("#k"), PaintTarget::Element("#u")];
+    let mut failures = Vec::new();
+    for channel in [PaintChannel::Animation, PaintChannel::StyleAttribute, PaintChannel::Class] {
+        for target in targets {
+            if channel == PaintChannel::StyleAttribute && matches!(target, PaintTarget::Before(_)) { continue; }
+            for (name, first, second) in PAINT_ONLY_SAMPLES {
+                let page = paint_page(target, name, first, second);
+                let mut session = RenderSession::new(html::parse(&page, MAX_NODES).unwrap());
+                session.set_verify_incremental(false);
+                render(&mut session);
+                set_paint(&mut session, channel, target, name, first, 0);
+                render(&mut session);
+                let passes = session.invalidation_stats().layout_passes;
+                set_paint(&mut session, channel, target, name, second, 1);
+                let actual = render(&mut session).clone();
+                let mut fresh = RenderSession::new(html::parse(&page, MAX_NODES).unwrap());
+                set_paint(&mut fresh, channel, target, name, second, 1);
+                let expected = render(&mut fresh).clone();
+                if !actual.approx_eq(&expected, 1e-3) {
+                    let index = actual.0.iter().zip(expected.0.iter()).position(|(a, b)| a != b).unwrap_or(actual.0.len().min(expected.0.len()));
+                    failures.push(format!("{channel:?} {target:?} {name}: patched frame differs from a fresh layout at {index}: {:?} vs {:?}",
+                        actual.0.get(index), expected.0.get(index)));
+                } else if session.invalidation_stats().layout_passes != passes {
+                    failures.push(format!("{channel:?} {target:?} {name}: laid out again"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "paint-only samples:\n{}", failures.join("\n"));
+}
+
+/// A pulsing dot: an endless opacity and scale animation on a positioned
+/// `::before` repaints the frame without laying it out.
+#[test]
+fn pulsing_pseudo_element_animation_does_not_lay_out() {
+    let page = "<style>body{margin:0}.dot{position:relative;display:inline-block;width:12px;height:12px}\
+        .dot::before{content:'';position:absolute;left:0;top:0;width:12px;height:12px;border-radius:50%;background:#36c}</style>\
+        <p>text <span class=dot id=d></span> more</p><p>after</p>";
+    let mut session = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    let node = q(&session, "#d");
+    let sample = |session: &mut RenderSession, step: u32| {
+        let t = step as f32 / 10.0;
+        let declarations = vec![("opacity".to_string(), format!("{}", 1.0 - t * 0.9)),
+            ("transform".to_string(), format!("scale({})", 1.0 + t))];
+        session.set_pseudo_effect_declarations(node, Some(lumen_html::css::PseudoElement::Before),
+            lumen_html::css::EffectOrigin::Animation, declarations).unwrap();
+        render(session).clone()
+    };
+    sample(&mut session, 1);
+    let passes = session.invalidation_stats().layout_passes;
+    let mut last = None;
+    for step in 2..10 { last = Some(sample(&mut session, step)); }
+    assert_eq!(session.invalidation_stats().layout_passes, passes, "pulsing samples lay out the page");
+    let mut fresh = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    let node = q(&fresh, "#d");
+    fresh.set_pseudo_effect_declarations(node, Some(lumen_html::css::PseudoElement::Before), lumen_html::css::EffectOrigin::Animation,
+        vec![("opacity".to_string(), format!("{}", 1.0 - 0.9 * 0.9)), ("transform".to_string(), "scale(1.9)".to_string())]).unwrap();
+    assert_same("pulsing", "patched", &last.unwrap(), render(&mut fresh));
+}

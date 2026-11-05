@@ -1578,6 +1578,7 @@ struct RetainedFragment {
     viewport_fixed_nodes: SharedSlice<NodeId>,
     scroll_regions: SharedSlice<ScrollRegion>,
     control_text_runs: SharedSlice<ControlTextRun>,
+    paint_sources: SharedSlice<PaintSource>,
     overflow_lines: Option<Arc<[OverflowLinePaint]>>,
     paint_phases: Option<Arc<RetainedPaintPhases>>,
     rendered_text_collected: bool,
@@ -4446,6 +4447,8 @@ struct Layout<'a> {
     float_floor: core::cell::Cell<f32>,
     float_frame: FloatFrame,
     active_box: Option<NodeId>,
+    /// The box whose own style the commands pushed now are drawn from.
+    paint_owner: Option<(NodeId, Option<css::PseudoElement>)>,
     canvas_root_box: Option<Rect>,
     initial_clearances: Vec<(NodeId, Option<css::PseudoElement>, f32)>,
     initial_margin_summaries: RefCell<BTreeMap<(u128, u8, u32, bool), (MarginStrut, Option<MarginStrut>, bool)>>,
@@ -4744,6 +4747,7 @@ impl<'a> Layout<'a> {
         viewport_overflow_source: None,
         viewport_scroll_axes: (true, true),
         active_box: None,
+        paint_owner: None,
         canvas_root_box: None,
         initial_clearances: Vec::new(),
         initial_margin_summaries: RefCell::new(BTreeMap::new()),
@@ -9343,6 +9347,10 @@ struct InlineFrame {
     line_background: Range<usize>,
 }
 
+impl InlineFrame {
+    fn paint_owner(&self) -> (NodeId, Option<css::PseudoElement>) { (self.node, self.virtual_pseudo) }
+}
+
 /// Sparse operation-local paint owners. Ordinary inline frames carry no
 /// layer or range vector; only an actual filter allocates this record.
 struct InlineFilterOwner {
@@ -10866,6 +10874,8 @@ fn is_word_separator(grapheme: &str) -> bool {
 
 #[derive(Clone, PartialEq)]
 struct TextDecoration {
+    /// The decorating box, which owns the lines drawn across its descendants.
+    owner: Option<(NodeId, Option<css::PseudoElement>)>,
     lines: u8,
     style: css::TextDecorationStyle,
     position: css::TextUnderlinePosition,
@@ -10878,7 +10888,7 @@ struct TextDecoration {
 
 impl TextDecoration {
     fn from_style(style: &Style) -> Self {
-        Self { lines: style.text_decoration, style: style.text_decoration_style,
+        Self { owner: None, lines: style.text_decoration, style: style.text_decoration_style,
             position: style.text_underline_position, source: style.clone(), under_edge: None, color: style.text_decoration_color.unwrap_or(style.color),
             size: style.font_size, font: style.font.clone() }
     }
@@ -11136,6 +11146,17 @@ pub(crate) fn transformed_bounds(
     })
 }
 
+/// The element (or pseudo-element) whose own style a paint command was drawn
+/// from: its opacity group, background, borders, outline, text or text
+/// decoration. Lets a paint-only style change rewrite the commands in place
+/// instead of laying the page out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaintSource {
+    pub(crate) command: usize,
+    pub(crate) node: NodeId,
+    pub(crate) pseudo: Option<css::PseudoElement>,
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutGeometry {
     pub transform_timeline_values:Option<alloc::boxed::Box<crate::animation::progress_timelines::TransformTimelineValues>>,
@@ -11175,6 +11196,8 @@ pub(crate) struct LayoutGeometry {
     /// laid out at its scroll offset.
     pub origin_layout_refused: bool,
     pub control_text_runs: Vec<ControlTextRun>,
+    /// Owners of the commands a paint-only style change can rewrite.
+    pub(crate) paint_sources: Vec<PaintSource>,
     /// Paint-only images which were still loading when this was laid out; see
     /// [`DeferredImage`].
     pub deferred_images: Vec<DeferredImage>,
@@ -14320,6 +14343,157 @@ fn border(rect: Rect, style: &Style) -> Command {
         style.border_style_sides[0].map_or(style.border_pattern, css::BorderStyle::pattern),
     )
 }
+/// Moves paint sources to the commands' new positions (`usize::MAX` for a
+/// removed command) and gives each reopened copy of a source scope its own.
+fn remap_paint_sources(sources:&mut Vec<PaintSource>,index:impl Fn(usize)->usize,reopened:&[(usize,usize)]) {
+    let mut copies=Vec::new();
+    for &(original,copy) in reopened {
+        if let Some(source)=sources.iter().find(|source|source.command==original) {
+            if copies.try_reserve(1).is_err(){sources.clear();return;}
+            copies.push(PaintSource{command:copy,..*source});
+        }
+    }
+    for source in sources.iter_mut() { source.command=index(source.command); }
+    if sources.try_reserve(copies.len()).is_err(){sources.clear();return;}
+    sources.extend(copies);
+    sources.retain(|source|source.command!=usize::MAX);
+}
+
+/// A box whose computed style changed only in paint values
+/// (`Style::differs_only_in_paint`).
+pub(crate) struct PaintChange<'a> {
+    pub(crate) node: NodeId,
+    pub(crate) pseudo: Option<css::PseudoElement>,
+    pub(crate) old: &'a Style,
+    pub(crate) new: &'a Style,
+    /// The box draws text of its own (decorations: text anywhere inside it).
+    pub(crate) has_text: bool,
+    /// The box was drawn: it has a hit region or owns commands.
+    pub(crate) rendered: bool,
+}
+
+fn side_colors(style: &Style) -> [Rgba; 4] {
+    core::array::from_fn(|side| style.border_color_sides[side].unwrap_or(style.border_color))
+}
+
+fn decoration_color(style: &Style) -> Rgba { style.text_decoration_color.unwrap_or(style.color) }
+
+fn outline_drawn(style: &Style) -> bool { outline_command(Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }, style).is_some() }
+
+/// Whether two commands are equal but for rounding of their numbers.
+fn commands_close(a: &Command, b: &Command) -> bool {
+    a == b || DisplayList(alloc::vec![a.clone()]).approx_eq(&DisplayList(alloc::vec![b.clone()]), 1e-3)
+}
+
+/// The replacements of the commands drawn from the paint values of `changes`,
+/// or `None` when a change reaches paint that cannot be rewritten in place
+/// (a command appears or disappears, or its value has another origin) and the
+/// frame must be laid out again. `sources` are sorted by command.
+pub(crate) fn patch_paint_commands(list: &[Command], sources: &[PaintSource], changes: &[PaintChange<'_>])
+    -> Option<Vec<(usize, Command)>> {
+    let owner_key = |node: NodeId, pseudo: Option<css::PseudoElement>| (node.key(), pseudo.map_or(0, |pseudo| pseudo as u8 + 1));
+    let mut by_owner: BTreeMap<(u128, u8), Vec<usize>> = BTreeMap::new();
+    for source in sources { by_owner.entry(owner_key(source.node, source.pseudo)).or_default().push(source.command); }
+    let mut replacements: Vec<(usize, Command)> = Vec::new();
+    for change in changes {
+        let (old, new) = (change.old, change.new);
+        if !old.visibility_visible && !new.visibility_visible { continue; }
+        let color_changed = old.color != new.color;
+        let background_changed = old.background != new.background;
+        let borders_changed = side_colors(old) != side_colors(new);
+        let outline_changed = old.outline != new.outline || (outline_drawn(old) && old.outline.color.is_none() && color_changed);
+        let decoration_changed = old.text_decoration != 0 && decoration_color(old) != decoration_color(new);
+        let opacity_changed = old.opacity != new.opacity;
+        // Values painted through paths that are not rewritten here.
+        if color_changed && (old.background_images.is_some() || old.border_image.is_some() || old.mask_images.is_some()
+            || old.text_shadows.is_some() || old.shadows.is_some() || old.filters.is_some() || css::columns::active(old)
+            || old.appearance != css::Appearance::None) { return None; }
+        if (background_changed || borders_changed) && (old.border_image.is_some() || old.background_images.is_some() || old.shadows.is_some()) { return None; }
+        if decoration_changed && old.text_decoration_style == css::TextDecorationStyle::Wavy { return None; }
+        if opacity_changed && old.paints_as_group() != new.paints_as_group() { return None; }
+        if (old.background.a == 0) != (new.background.a == 0) { return None; }
+        if borders_changed && (has_nonuniform_border(old) != has_nonuniform_border(new)
+            || side_colors(old).iter().zip(side_colors(new)).any(|(a, b)| (a.a == 0) != (b.a == 0))) { return None; }
+        if outline_drawn(old) != outline_drawn(new) { return None; }
+        if !(color_changed || background_changed || borders_changed || outline_changed || decoration_changed || opacity_changed) { continue; }
+        let owned = by_owner.get(&owner_key(change.node, change.pseudo)).map_or(&[][..], Vec::as_slice);
+        let (mut text, mut background, mut border, mut outline, mut decoration, mut layer) = (false, false, false, false, false, false);
+        for &index in owned {
+            let current = replacements.iter().rev().find(|(at, _)| *at == index).map(|(_, command)| command)
+                .or_else(|| list.get(index))?;
+            let mut command = current.clone();
+            match &mut command {
+                Command::PushLayer { opacity, filters, clip: false, .. } if opacity_changed => {
+                    if !old.paints_as_group() || *filters != old.filters { continue; }
+                    if *opacity == old.opacity { *opacity = new.opacity; }
+                    else if *opacity == old.opacity.clamp(0.0, 1.0) { *opacity = new.opacity.clamp(0.0, 1.0); }
+                    else { continue; }
+                    layer = true;
+                }
+                Command::GlyphRun { color, .. } if color_changed => {
+                    if *color != old.color { return None; }
+                    *color = new.color;
+                    text = true;
+                }
+                Command::FillRect { color, .. } | Command::FillRoundedRect { color, .. } => {
+                    let mut candidates: Vec<(Rgba, Rgba, u8)> = alloc::vec![(old.background, new.background, 1)];
+                    let widths = border_widths(old);
+                    for (side, (a, b)) in side_colors(old).into_iter().zip(side_colors(new)).enumerate() {
+                        if widths[side] > 0.0 { candidates.push((a, b, 2)); }
+                    }
+                    if old.text_decoration != 0 { candidates.push((decoration_color(old), decoration_color(new), 4)); }
+                    let matching: Vec<&(Rgba, Rgba, u8)> = candidates.iter().filter(|(from, _, _)| *from == *color).collect();
+                    let Some(&&(_, to, _)) = matching.first() else { continue };
+                    if matching.iter().any(|(_, other, _)| *other != to) { return None; }
+                    if to == *color { continue; }
+                    for (_, _, kind) in &matching {
+                        match kind { 1 => background = true, 2 => border = true, _ => decoration = true }
+                    }
+                    *color = to;
+                }
+                Command::StrokeBorder { rect, .. } | Command::StrokePatternBorder { rect, .. } => {
+                    let expansion = old.outline.offset + old.outline.used_width();
+                    let inner = Rect { x: rect.x + expansion, y: rect.y + expansion,
+                        width: rect.width - 2.0 * expansion, height: rect.height - 2.0 * expansion };
+                    if outline_command(inner, old).is_some_and(|expected| commands_close(&expected, current)) {
+                        if !outline_changed { continue; }
+                        command = outline_command(inner, new)?;
+                        outline = true;
+                    } else if borders_changed {
+                        let (Command::StrokeBorder { color, .. } | Command::StrokePatternBorder { color, .. }) = &mut command else { continue };
+                        if *color != side_colors(old)[0] { continue; }
+                        *color = side_colors(new)[0];
+                        border = true;
+                    } else { continue; }
+                }
+                Command::StrokeBoxBorder(paint) if borders_changed => {
+                    if paint.colors != side_colors(old) { return None; }
+                    paint.colors = side_colors(new);
+                    border = true;
+                }
+                _ => continue,
+            }
+            replacements.push((index, command));
+        }
+        if !change.rendered { continue; }
+        let visible = old.visibility_visible;
+        if opacity_changed && old.paints_as_group() && !layer { return None; }
+        if visible && color_changed && change.has_text && !text { return None; }
+        if visible && background_changed && old.background.a != 0 && !background { return None; }
+        if visible && borders_changed && border_widths(old).iter().any(|width| *width > 0.0) && !border { return None; }
+        if visible && outline_changed && outline_drawn(old) && !outline { return None; }
+        if visible && decoration_changed && change.has_text && !decoration { return None; }
+    }
+    Some(replacements)
+}
+
+/// Commands whose values a paint-only style change of their box can rewrite.
+fn paint_source_command(command: &Command) -> bool {
+    matches!(command, Command::PushLayer { .. } | Command::FillRect { .. } | Command::FillRoundedRect { .. }
+        | Command::StrokeBorder { .. } | Command::StrokeBoxBorder(_) | Command::StrokePatternBorder { .. }
+        | Command::GlyphRun { .. })
+}
+
 fn outline_command(rect: Rect, style: &Style) -> Option<Command> {
     let outline = style.outline;
     let width = outline.used_width();
@@ -15527,7 +15701,9 @@ struct PaintScopeAdoption<'a> {
     pieces:&'a [Range<usize>],
 }
 
-struct PaintPermutation { segments: Vec<(core::ops::Range<usize>,usize)>, destinations: Vec<usize>, cycles: Vec<usize>, output_len:usize, scope_copies:Vec<(usize,usize)>, track_scope_copies:bool }
+struct PaintPermutation { segments: Vec<(core::ops::Range<usize>,usize)>, destinations: Vec<usize>, cycles: Vec<usize>, output_len:usize, scope_copies:Vec<(usize,usize)>, track_scope_copies:bool,
+    /// `(original, copy)` of every scope push reopened by the permutation.
+    reopened:Vec<(usize,usize)> }
 struct PaintScopeIndex {tops:Vec<usize>,parents:Vec<usize>}
 impl PaintScopeIndex {
     fn new(commands:&[Command])->Result<Self,LayoutError> {
@@ -15616,7 +15792,7 @@ impl PaintPermutation {
         for (range,start) in &segments { for index in range.clone() { destinations[index]=start+index-range.start; } }
         let mut cycles=Vec::new();cycles.try_reserve_exact(total).map_err(|_|LayoutError::CommandLimit)?;
         cycles.extend_from_slice(&destinations);
-        Ok(Self{segments,destinations,cycles,output_len:total,scope_copies:Vec::new(),track_scope_copies:false})
+        Ok(Self{segments,destinations,cycles,output_len:total,scope_copies:Vec::new(),track_scope_copies:false,reopened:Vec::new()})
     }
     fn index(&self,index:usize)->usize { self.destinations.get(index).copied().unwrap_or(self.output_len) }
     fn scoped_commands(&mut self,commands:&mut Vec<Command>,owners:&mut BTreeMap<usize,(NodeId,Option<css::PseudoElement>)>)->Result<(),LayoutError> {
@@ -15704,11 +15880,11 @@ impl PaintPermutation {
             while old_path.last().is_some() && old_path.last()==new_path.last() {old_path.pop();new_path.pop();}
             for &scope in &old_path {
                 let pop=paint_scope_pop(&commands[scope])?;
-                if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((*destination,pop,None,None));
+                if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((*destination,pop,None,None,None));
             }
             for &scope in new_path.iter().rev() {
                 if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                transitions.push((*destination,commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope)));
+                transitions.push((*destination,commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope),Some(scope)));
             }
             current=tops[range.end];current_adoption=adoption;
         }
@@ -15721,23 +15897,24 @@ impl PaintPermutation {
         while old_path.last().is_some() && old_path.last()==new_path.last() {old_path.pop();new_path.pop();}
         for &scope in &old_path {
             let pop=paint_scope_pop(&commands[scope])?;
-            if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((commands.len(),pop,None,None));
+            if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((commands.len(),pop,None,None,None));
         }
         for &scope in new_path.iter().rev() {
             if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-            transitions.push((commands.len(),commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope)));
+            transitions.push((commands.len(),commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope),Some(scope)));
         }
         let size=commands.len().checked_add(transitions.len()).filter(|size|*size<=MAX_DISPLAY_COMMANDS).ok_or(LayoutError::CommandLimit)?;
         let mut output=Vec::new();output.try_reserve_exact(size).map_err(|_|LayoutError::CommandLimit)?;
         self.apply(commands)?;
         let mut transitions=transitions.into_iter().peekable();let mut extra=0;let mut segment=0;let mut new_owners=BTreeMap::new();
         for (index,command) in commands.drain(..).enumerate() {
-            while transitions.peek().is_some_and(|(at,..)|*at==index) {let (_,scope,owner,source)=transitions.next().ok_or(LayoutError::InvalidTree)?;if let Some(owner)=owner{new_owners.insert(output.len(),owner);}if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}output.push(scope);extra+=1;}
+            while transitions.peek().is_some_and(|(at,..)|*at==index) {let (_,scope,owner,source,original)=transitions.next().ok_or(LayoutError::InvalidTree)?;if let Some(owner)=owner{new_owners.insert(output.len(),owner);}if let Some(original)=original{self.reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.reopened.push((original,output.len()));}if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}output.push(scope);extra+=1;}
             output.push(command);
             // Segments remain affine between synthetic scope boundaries.
             if segment<order.len() && order[segment].1==index {order[segment].1+=extra;segment+=1;}
         }
-        for (_,scope,owner,source) in transitions {
+        for (_,scope,owner,source,original) in transitions {
+            if let Some(original)=original{self.reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.reopened.push((original,output.len()));}
             if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}
             if let Some(owner)=owner{new_owners.insert(output.len(),owner);}
             output.push(scope);
@@ -17045,6 +17222,14 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
 
     fn paint_decoration_line(
 &mut self, rect: Rect, source: &TextDecoration) -> Result<(), LayoutError> {
+        let saved_owner = self.paint_owner;
+        if source.owner.is_some() { self.paint_owner = source.owner; }
+        let painted = self.paint_decoration_line_owned(rect, source);
+        self.paint_owner = saved_owner;
+        painted
+    }
+
+    fn paint_decoration_line_owned(&mut self, rect: Rect, source: &TextDecoration) -> Result<(), LayoutError> {
         use css::TextDecorationStyle as Pattern;
         let thickness = rect.height;
         match source.style {
@@ -17160,6 +17345,10 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         self.begin_decoration_with_under(style, None)
     }
     fn begin_decoration_with_under(&mut self, style: &Style, under_edge: Option<f32>) -> Result<(), LayoutError> {
+        self.begin_decoration_owned(style, under_edge, self.paint_owner)
+    }
+    fn begin_decoration_owned(&mut self, style: &Style, under_edge: Option<f32>,
+        owner: Option<(NodeId, Option<css::PseudoElement>)>) -> Result<(), LayoutError> {
         if style.text_decoration != 0 && style.has_principal_box() {
             if self.decorations.len() >= 512 {
                 return Err(LayoutError::DepthLimit);
@@ -17169,6 +17358,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 .map_err(|_| LayoutError::CommandLimit)?;
             let mut decoration = TextDecoration::from_style(style);
             decoration.under_edge = under_edge;
+            decoration.owner = owner;
             self.decorations.push(decoration);
         }
         Ok(())
@@ -19211,6 +19401,9 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 self.push_background(rect, style)?;
             }
         }
+        // Rows, column groups and cells are painted here from their own
+        // styles; the table owns none of those commands.
+        let table_owner = self.paint_owner.take();
         let mut xs = [0f32; 257];
         let mut original_xs = [0f32; 257];
         for col in 0..columns {
@@ -19445,6 +19638,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             if clipped {self.push_command(Command::PopClip)?;}
         }
         if !style.border_collapse && style.visibility_visible {
+            self.paint_owner = table_owner;
             if has_nonuniform_border(style) {
                 for command in side_border_commands(rect, style,self.images) {
                     self.push_command(command)?;
@@ -19452,6 +19646,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             } else if style.border_solid && style.border_width > 0.0 {
                 self.push_command(border(rect, style))?;
             }
+            self.paint_owner = None;
         }
         if !style.border_collapse {
             for paint in &assigned_cells {
@@ -19745,6 +19940,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if table_real {self.stacking_roots.pop();}
             self.surface_roots.pop();
         }
+        self.paint_owner = table_owner;
         self.paint_outline(rect, style)?;
         self.flow_baselines = enclosing_baselines;
         if visible_rows > 0
@@ -33423,6 +33619,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                         hit_start: hit.unwrap_or(0), hit_end: hit.map_or(0, |hit|hit+1),
                     },false)?; }
                 let frame_paint_start = self.commands.len();
+                let saved_owner = self.paint_owner.replace(paragraph.frames[index].paint_owner());
                 let frame_style = &paragraph.frames[index].style;
                 let (start, end) = if bounds[index].present { (bounds[index].start, bounds[index].end) } else { (x, x) };
                 let rect = self.inline_fragment_border_rect(frame_style, start, end-start,
@@ -33440,6 +33637,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 }
                 self.finish_hit(hit, rect);
                 self.paint_outline(rect, frame_style)?;
+                self.paint_owner = saved_owner;
                 Self::record_inline_filter_piece(paragraph, owners, Some(index), FlowContentRanges {
                     command_start: frame_paint_start, command_end: self.commands.len(),
                     hit_start: 0, hit_end: 0,
@@ -33833,12 +34031,14 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         frame_edges[frame]|=if token.advance_opening!=rtl {1}else{2};
                     }}
                 }
+                let saved_owner = self.paint_owner;
                 for (index, bounds) in frame_line.iter().enumerate() {
                     paragraph.frames[index].line_background =
                         self.commands.len()..self.commands.len();
                     let Some((start_x, end_x)) = bounds else {
                         continue;
                     };
+                    self.paint_owner = Some(paragraph.frames[index].paint_owner());
                     let background_start = self.commands.len();
                     let frame_style = &paragraph.frames[index].style;
                     if paragraph.frames[index].virtual_pseudo == Some(css::PseudoElement::FirstLetter) {
@@ -33896,6 +34096,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         hit_start: 0, hit_end: 0,
                     },true)?;
                 }
+                self.paint_owner = saved_owner;
                 let first_command = line.command;
                 let first_line_hit = self
                     .geometry
@@ -33922,7 +34123,9 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         if paragraph.frames[index].style.opacity < 1.0 { self.push_command(Command::PopLayer)?; }
                     }
                     letter_groups.truncate(common);
+                    let saved_owner = self.paint_owner;
                     for &index in &desired_groups[common..] {
+                        self.paint_owner = Some(paragraph.frames[index].paint_owner());
                         let frame_style = &paragraph.frames[index].style;
                         let first=visual_fragments.partition_point(|fragment|fragment.frame<index);
                         let last=visual_fragments.partition_point(|fragment|fragment.frame<=index);
@@ -33946,6 +34149,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         letter_groups.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
                         letter_groups.push(index);
                     }
+                    self.paint_owner = saved_owner;
                     let hit_start = self
                         .geometry
                         .as_ref()
@@ -34004,7 +34208,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 .map_or(0, |geometry| geometry.hits.len());
                             let decoration_depth = self.decorations.len();
                             for frame in &token.frames {
-                                self.begin_decoration_with_under(&paragraph.frames[*frame].style, frame_under.get(*frame).copied())?;
+                                self.begin_decoration_owned(&paragraph.frames[*frame].style, frame_under.get(*frame).copied(), Some(paragraph.frames[*frame].paint_owner()))?;
                             }
                             let previous_baselines = if has_atomic {
                                 self.flow_baselines.take()
@@ -34108,7 +34312,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 || self.source_capture_depth != 0 || Self::inline_filter_captures_source(paragraph,owners,token.frames.last().copied()) || style.text_shadows.is_some() || self.collects_text_runs() || token.x < self.paint_cull_right() && *cursor < self.paint_cull_bottom())
                         {
                             let decoration_depth = self.decorations.len();
-                            for frame in &token.frames { self.begin_decoration_with_under(&paragraph.frames[*frame].style, frame_under.get(*frame).copied())?; }
+                            for frame in &token.frames { self.begin_decoration_owned(&paragraph.frames[*frame].style, frame_under.get(*frame).copied(), Some(paragraph.frames[*frame].paint_owner()))?; }
                             let text_ink=self.begin_text_ink(style)?;
                             let decoration_start = self.commands.len();
                             self.decorate_text(token.x, *cursor + self.baseline(block_style), token.width, block_style, 3, line_under)?;
@@ -34136,10 +34340,14 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                         self.push_command(Command::PushClip(Rect{x:token.x+left,y:*cursor+self.baseline(style)+bounds.y,width:right-left,height:bounds.height}))?;
                                     }
                                     let command=self.commands.len();
-                                    self.push_command(Command::GlyphRun {
+                                    let saved_owner=self.paint_owner;
+                                    if let Some(&frame)=token.frames.last() {self.paint_owner=Some(paragraph.frames[frame].paint_owner());}
+                                    let pushed=self.push_command(Command::GlyphRun {
                                         origin_x:token.x,baseline_y:*cursor+self.baseline(style),size:style.font_size,color:style.color,
                                         glyphs:if first==0&&end==shaped.glyphs.len(){shaped.glyphs.clone()}else{Arc::from(glyphs)},
-                                    })?;
+                                    });
+                                    self.paint_owner=saved_owner;
+                                    pushed?;
                                     if token.command.is_none(){token.command=Some(command);}
                                     if strip.is_some(){self.push_command(Command::PopClip)?;}
                                     first=end;
@@ -34174,7 +34382,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 path[count] = index; count += 1;
                                 parent = paragraph.frames[index].parent;
                             }
-                            for index in path[..count].iter().rev() { self.begin_decoration_with_under(&paragraph.frames[*index].style, frame_under.get(*index).copied())?; }
+                            for index in path[..count].iter().rev() { self.begin_decoration_owned(&paragraph.frames[*index].style, frame_under.get(*index).copied(), Some(paragraph.frames[*index].paint_owner()))?; }
                             if !self.decorations.is_empty() {
                                 let decoration_start = self.commands.len();
                                 self.decorate_text(token.x, *cursor + self.baseline(block_style), token.width, block_style, 7, line_under)?;
@@ -34543,7 +34751,12 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                 x: left + *advance, y: *cursor, width: 0.0, height: 0.0,
             }));
             let start = self.commands.len();
-            if let Some(rect) = frame.bounds { self.paint_outline(rect, &frame.style)?; }
+            if let Some(rect) = frame.bounds {
+                let saved_owner = self.paint_owner.replace(frame.paint_owner());
+                let painted = self.paint_outline(rect, &frame.style);
+                self.paint_owner = saved_owner;
+                painted?;
+            }
             Self::record_inline_filter_piece(paragraph, owners, Some(index), FlowContentRanges {
                 command_start: start, command_end: self.commands.len(), hit_start: 0, hit_end: 0,
             },false)?;
@@ -35068,7 +35281,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         self.commands.push(command);
         self.command_bytes = bytes;
+        self.note_paint_source(self.commands.len() - 1);
         Ok(())
+    }
+
+    /// Records the box the command at `index` is drawn from, when a paint-only
+    /// style change of that box can rewrite it.
+    fn note_paint_source(&mut self, index: usize) {
+        let Some((node, pseudo)) = self.paint_owner else { return };
+        if self.svg_geometry_operation.is_some() { return; }
+        let Some(geometry) = self.geometry.as_deref_mut() else { return };
+        if !self.commands.get(index).is_some_and(paint_source_command) { return; }
+        if geometry.paint_sources.last().is_some_and(|last| last.command == index) { return; }
+        if geometry.paint_sources.len() >= MAX_DISPLAY_COMMANDS || geometry.paint_sources.try_reserve(1).is_err() { return; }
+        geometry.paint_sources.push(PaintSource { command: index, node, pseudo });
     }
 
     fn replace_command(&mut self, index: usize, command: Command) -> Result<(), LayoutError> {
@@ -35084,6 +35310,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         replace_command_bytes(current, &mut self.command_bytes, command)?;
         if let Some(operation)=self.svg_geometry_operation.as_mut(){operation.charge_commands(self.command_bytes,command_capacity,0)?;}
+        if self.geometry.as_deref().is_some_and(|geometry| !geometry.paint_sources.iter().rev().take(64).any(|source| source.command == index)) {
+            self.note_paint_source(index);
+        }
         Ok(())
     }
 
@@ -35277,10 +35506,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // for a pop, which carries no geometry.
         let mut sources=Vec::new();
         if tracked {sources.try_reserve_exact(actions.len()).map_err(|_|LayoutError::CommandLimit)?;}
+        let mut reopened=Vec::new();
         for action in actions{
             match action{
                 PositionedClipAction::Original(index)=>{indices[index]=output.len();output.push(core::mem::replace(&mut self.commands[index],Command::PopClip));if tracked{sources.push(index);}},
-                PositionedClipAction::Push(scope)=>{output.push(self.commands[scope].clone());if tracked{sources.push(scope);}},
+                PositionedClipAction::Push(scope)=>{reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;reopened.push((scope,output.len()));output.push(self.commands[scope].clone());if tracked{sources.push(scope);}},
                 PositionedClipAction::Pop(scope)=>{let _=close_indices.get(&scope).ok_or(LayoutError::InvalidTree)?;output.push(paint_scope_pop(&self.commands[scope])?);if tracked{sources.push(usize::MAX);}}
             }
         }
@@ -35309,7 +35539,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.commands=output;
         // Scope owners/policies are no longer consulted after this final pass.
         self.overflow_clip_commands.clear();
+        let copies:Vec<PaintSource>=self.geometry.as_ref().map(|geometry|reopened.iter().filter_map(|&(scope,copy)|
+            geometry.paint_sources.iter().find(|source|source.command==scope).map(|source|PaintSource{command:copy,..*source})).collect()).unwrap_or_default();
         self.remap_overflow_commands(&indices,&boundaries)?;
+        if let Some(geometry)=self.geometry.as_mut(){geometry.paint_sources.try_reserve(copies.len()).map_err(|_|LayoutError::CommandLimit)?;geometry.paint_sources.extend(copies);}
         }
         // One temporary interval index avoids scanning every positioned
         // sibling for every clip. Queries visit only overlapping hit sources.
@@ -35410,6 +35643,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             for region in &mut geometry.scroll_regions { range(&mut region.commands)?; }
             if let Some(region) = geometry.root_scroll_region.as_mut() { range(&mut region.commands)?; }
+            remap_paint_sources(&mut geometry.paint_sources,|index|indices.get(index).copied().unwrap_or(usize::MAX),&[]);
         }
         Ok(())
     }
@@ -35671,6 +35905,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.elide_overflow_paint()?;
         self.correct_positioned_clip_scopes()?;
         self.commands.shrink_to_fit();
+        if let Some(geometry) = self.geometry.as_deref_mut() {
+            let commands = &self.commands;
+            geometry.paint_sources.retain(|source| commands.get(source.command).is_some_and(paint_source_command));
+            geometry.paint_sources.sort_by_key(|source| (source.command, source.node.key()));
+            geometry.paint_sources.dedup();
+            geometry.paint_sources.shrink_to_fit();
+        }
         let list = DisplayList(core::mem::take(&mut self.commands));
         let timeline_bytes=self.geometry.as_deref().and_then(|geometry|geometry.transform_timeline_values.as_deref()).map_or(Some(0),|values|values.checked_retained_bytes()).ok_or(LayoutError::CommandLimit)?;
         let reference_bytes=self.geometry.as_deref().and_then(|geometry|geometry.transform_reference_boxes.as_deref())
@@ -36678,6 +36919,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let inline_paint = computed.as_ref().filter(|style| style.display == Display::Inline
             && style.paints_as_group() && self.measurement_glyphs.is_none())
             .map(|_| (self.commands.len(), self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len()), self.next_paint_order()));
+        let saved_owner = self.paint_owner;
+        if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) { self.paint_owner = Some((id, None)); }
         let layer = self.begin_opacity(computed.as_ref().filter(|style| {
             !matches!(
                 style.display,
@@ -36687,7 +36930,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     | Display::Flex
                     | Display::Grid
             )
-        }))?;
+        }));
+        self.paint_owner = saved_owner;
+        let layer = layer?;
         let spatial = computed.as_ref().is_some_and(Style::has_spatial_filters);
         let mask_binding = computed.as_ref().filter(|_| layer.is_some()).and_then(MaskBinding::from_style);
         let result = self.with_spatial_source_capture(spatial, |layout| layout.inline_content(
@@ -36718,6 +36963,25 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn inline_content(
+        &mut self,
+        id: NodeId,
+        parent_style: &Style,
+        computed: Option<Style>,
+        x: f32,
+        y: f32,
+        available: f32,
+        depth: usize,
+    ) -> Result<(f32, f32), LayoutError> {
+        if !matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+            return self.inline_content_owned(id, parent_style, computed, x, y, available, depth);
+        }
+        let saved_owner = self.paint_owner.replace((id, None));
+        let result = self.inline_content_owned(id, parent_style, computed, x, y, available, depth);
+        self.paint_owner = saved_owner;
+        result
+    }
+
+    fn inline_content_owned(
         &mut self,
         id: NodeId,
         parent_style: &Style,
@@ -36989,6 +37253,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     fn bind_css_mask(&mut self,layer:usize,binding:MaskBinding,border:Rect)->Result<(),LayoutError> {
         let saved=core::mem::take(&mut self.commands);
         let saved_bytes=core::mem::replace(&mut self.command_bytes,0);
+        // Mask layers paint into their own lists, which own no paint sources.
+        let saved_owner=self.paint_owner.take();
         let mut layers=Vec::new();
         let mut painted=Ok(());
         if let Some(paint_layers)=background_layers(&binding.layers) {
@@ -37003,6 +37269,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         self.commands=saved;
         self.command_bytes=saved_bytes;
+        self.paint_owner=saved_owner;
         painted?;
         let mut command=self.commands.get(layer).cloned().ok_or(LayoutError::InvalidTree)?;
         let Command::PushLayer{svg_clip,..}=&mut command else{return Err(LayoutError::InvalidTree);};
@@ -37251,6 +37518,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 for run in &mut geometry.control_text_runs {
                     if let Some(index) = run.hit_index.as_mut() { remap_index(index); }
                     if let Some(index)=run.command_index.as_mut(){let mut range=*index..*index+1;raise_range(&mut range,commands.start,commands.end,command_end);*index=range.start;}
+                }
+                for source in &mut geometry.paint_sources {
+                    let mut range=source.command..source.command+1;raise_range(&mut range,commands.start,commands.end,command_end);source.command=range.start;
                 }
                 for fragment in &mut geometry.hit_fragments { remap_index(&mut fragment.hit); }
                 geometry.hit_fragments.sort_unstable_by_key(|fragment| fragment.hit);
@@ -37956,6 +38226,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 if let Some(index)=value.hit_index.as_mut(){*index=hit_map.index(*index);}
                 if let Some(index)=value.command_index.as_mut(){*index=command_map.index(*index);}
             }
+            remap_paint_sources(&mut geometry.paint_sources,|index|command_map.index(index),&command_map.reopened);
             for entry in &mut geometry.hit_fragments {entry.hit=hit_map.index(entry.hit);}
             geometry.hit_fragments.sort_unstable_by_key(|entry|entry.hit);
             if let Some(entries)=geometry.transform_reference_boxes.as_mut(){
@@ -38263,6 +38534,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 .transpose()?;
             geometry.control_text_runs.push(run);
         }
+        geometry.paint_sources.try_reserve(fragment.paint_sources.len()).map_err(|_| LayoutError::CommandLimit)?;
+        for source in fragment.paint_sources.iter() {
+            geometry.paint_sources.push(PaintSource { command: command_base.checked_add(source.command).ok_or(LayoutError::InvalidTree)?, ..*source });
+        }
         if self.active_box == Some(fragment.key.node)
             && self.document.parent(fragment.key.node).ok().flatten() == Some(self.document.root()) {
             self.canvas_root_box = fragment.hits.first().filter(|hit| hit.node == fragment.key.node)
@@ -38346,6 +38621,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         overflow: OverflowMetrics,
         has_text: bool,
         paint_starts:(usize,usize,usize,usize,u64),
+        paint_source_start: usize,
     ) -> Option<RetainedFragment> {
         let geometry = self.geometry.as_deref()?;
         let (
@@ -38393,6 +38669,19 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             SharedSlice::from(clone_vec(geometry.viewport_fixed_nodes.get(viewport_fixed_start..)?)?);
         let mut scroll_regions = clone_vec(geometry.scroll_regions.get(region_start..)?)?;
         let mut control_text_runs = clone_vec(geometry.control_text_runs.get(run_start..)?)?;
+        let mut paint_sources = Vec::new();
+        // Reorders inside the box may have dropped earlier records; the box's
+        // own are those at or after its start pointing into its commands.
+        let mut first = paint_source_start.min(geometry.paint_sources.len());
+        while first > 0 && geometry.paint_sources[first - 1].command >= command_start { first -= 1; }
+        for source in &geometry.paint_sources[first..] {
+            if source.command >= command_start && source.command < self.commands.len() {
+                paint_sources.try_reserve(1).ok()?;
+                paint_sources.push(PaintSource { command: source.command - command_start, ..*source });
+            }
+        }
+        let paint_source_bytes = paint_sources.len().checked_mul(core::mem::size_of::<PaintSource>())?;
+        let paint_sources = SharedSlice::from(paint_sources);
         let rendered_text_boxes = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_text_boxes.get(rendered_box_start..)?)?) } else { None };
         let rendered_table_members = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_table_members.get(rendered_member_start..)?)?) } else { None };
         let typographic_origins = if self.rules.has_typographic_content() {
@@ -38478,7 +38767,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             contexts:contexts.into(),completed:completed.into(),escapes:escapes.into(),surfaces:surfaces.into(),order_advance:self.next_paint_order-order_start,
         }));
         let bytes=bytes.checked_add(if paint_phases.is_some(){phase_bytes.checked_add(core::mem::size_of::<usize>()*10)?}else{0})?;
-        let bytes = bytes.checked_add(overflow_bytes)?;
+        let bytes = bytes.checked_add(overflow_bytes)?.checked_add(paint_source_bytes)?;
         let bytes = bytes.checked_add(typographic_origins.as_ref().map_or(0, |origins| origins.len() * core::mem::size_of::<NodeId>()))?;
         let bytes=hit_fragments.iter().try_fold(bytes,|bytes,entry|bytes.checked_add(core::mem::size_of::<HitFragments>())?.checked_add(entry.rects.len().checked_mul(core::mem::size_of::<Rect>())?))?;
         let bytes=bytes.checked_add(transform_reference_boxes.as_ref().map_or(0,|entries:&Arc<[(usize,TransformReferenceBox)]>|entries.len()*core::mem::size_of::<(usize,TransformReferenceBox)>()))?;
@@ -38534,6 +38823,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             viewport_fixed_nodes,
             scroll_regions,
             control_text_runs,
+            paint_sources,
             overflow_lines,
             paint_phases,
             rendered_text_collected: geometry.collect_rendered_text,
@@ -38852,6 +39142,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }else{(x,y)};
         let saved_column_flow=if shared_column_owner {None}else{self.paragraph_column_flow.take()};
         let saved_active_box = self.active_box.replace(id);
+        let owner_pseudo = child_override.as_ref().and_then(|child| child.generated.as_ref()).map(|generated| generated.pseudo);
+        let saved_paint_owner = self.paint_owner.replace((id, owner_pseudo));
         let saved_computed_parent = computed_parent.map(|parent| self.computed_parent.replace(parent));
         // CSS Align 3 §9.1: inline-block baseline discovery skips block
         // table contributions. Table cells still discover a nested table's
@@ -38872,6 +39164,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.export_block_table_baselines = saved_table_baselines;
         if let Some(saved) = saved_computed_parent { self.computed_parent = saved; }
         self.active_box = saved_active_box;
+        self.paint_owner = saved_paint_owner;
         if shared_column_owner {
             if let Some(flow)=self.paragraph_column_flow.as_mut(){flow.wrappers.truncate(column_wrapper_depth);}
         } else {self.paragraph_column_flow=saved_column_flow;}
@@ -39043,6 +39336,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let deferred_mark = self.geometry.as_deref().map_or(0, |geometry| geometry.deferred_images.len());
         let timeline_source_uses_before=self.timeline_source_uses;
         let filter_source_uses_before=self.filter_source_uses;
+        let paint_source_start = self.geometry.as_deref().map_or(0, |geometry| geometry.paint_sources.len());
         let geometry_start = self.geometry.as_deref().map(|geometry| {
             (
                 geometry.hits.len(),
@@ -39191,6 +39485,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     overflow,
                     self.text_uses.get() != text_uses_before,
                     paint_starts,
+                    paint_source_start,
                 ) {
                     if fragment.key.floats_above {
                         fragment.float_floor = box_float_floor;
