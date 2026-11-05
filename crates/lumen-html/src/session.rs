@@ -6629,6 +6629,8 @@ impl RenderSession {
                 }
                 self.paint_revision = self.paint_revision.wrapping_add(1);
                 self.invalidation_stats.paint_patches += 1;
+                // The document changed, so this is a new frame of it.
+                self.frame_id += 1;
             }
         } else if !self.layout_stale {
             if let Some(cached) = self.cached.as_mut() {
