@@ -2448,17 +2448,19 @@ fn blur_resource_image(input:Rgba8Image,input_region:FilterPixelRegion,target:Fi
     let occupied=bytes.checked_add(output.pixels.len()).ok_or(ImageError::TooLarge)?;
     let pixels=(expanded.width as usize).checked_mul(expanded.height as usize).ok_or(ImageError::TooLarge)?;
     let sizes=parameters.kernel_sizes();
-    // Maintained gray backend: input/output u8 planes, two f32 planes,
-    // convolution f32 transient plus both vertical padding arenas, row arena,
-    // original/scanned/symmetric kernels and borrowed column-row references.
-    let scratch=pixels.checked_mul(18).and_then(|bytes|bytes.checked_add((expanded.width as usize).checked_mul(4)?))
-        .and_then(|bytes|bytes.checked_add((sizes[0] as usize).checked_add(sizes[1] as usize)?.checked_mul(64)?)).ok_or(ImageError::TooLarge)?;
-    occupied.checked_add(scratch).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
-    let left=usize::try_from(target.left.checked_sub(expanded.left).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
-    let top=usize::try_from(target.top.checked_sub(expanded.top).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
     // A true Gaussian costs O(sigma) per pixel; from 2 device pixels on, three box
     // passes per axis approximate it within the error Filter Effects allows.
     let operating=sigma.map(|sigma|sigma*scale);let boxed=operating.iter().all(|sigma|*sigma>=2.0);
+    // Box passes: the channel plane and one scratch plane (the ring is a few KiB).
+    // Maintained gray backend: input/output u8 planes, two f32 planes,
+    // convolution f32 transient plus both vertical padding arenas, row arena,
+    // original/scanned/symmetric kernels and borrowed column-row references.
+    let scratch=if boxed{pixels.checked_mul(2).and_then(|bytes|bytes.checked_add(64*1024))}else{
+        pixels.checked_mul(18).and_then(|bytes|bytes.checked_add((expanded.width as usize).checked_mul(4)?))
+        .and_then(|bytes|bytes.checked_add((sizes[0] as usize).checked_add(sizes[1] as usize)?.checked_mul(64)?))}.ok_or(ImageError::TooLarge)?;
+    occupied.checked_add(scratch).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    let left=usize::try_from(target.left.checked_sub(expanded.left).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
+    let top=usize::try_from(target.top.checked_sub(expanded.top).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
     for channel in 0..4{
         let mut plane=Vec::new();plane.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
         occupied.checked_add(scratch).and_then(|bytes|bytes.checked_add(plane.capacity().saturating_sub(pixels))).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
@@ -3551,7 +3553,11 @@ fn resolve_layer_region_tiles(source:&[Command],filters:Option<&[lumen_common::f
     graph.source_index=Some(std::collections::BTreeMap::new());
     let first_pending=graph.nodes.len();
     let mut output=DisplayList::default();
-    let count=(region.height as usize).checked_add(31).ok_or(ImageError::TooLarge)?/32;
+    // Each band re-evaluates its inputs with the filters' full reach, so thin
+    // bands under a large blur repeat most of the work. Bands hold about
+    // MAX_LAYER_BYTES/16 of output, and at least 32 rows.
+    let band_rows=u32::try_from((MAX_LAYER_BYTES/16)/(region.width as usize).max(1).saturating_mul(4)).unwrap_or(u32::MAX).max(32);
+    let count=(region.height as usize).checked_add(band_rows as usize-1).ok_or(ImageError::TooLarge)?/band_rows as usize;
     let root_bytes=count.checked_mul(core::mem::size_of::<(FilterPixelRegion,usize)>()).ok_or(ImageError::TooLarge)?;
     bytes.checked_add(root_bytes).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
     let mut roots=Vec::new();roots.try_reserve_exact(count).map_err(|_|ImageError::TooLarge)?;
@@ -3562,7 +3568,7 @@ fn resolve_layer_region_tiles(source:&[Command],filters:Option<&[lumen_common::f
     let source_id=graph.register_source(FilterGraphSource{view,end:view.start+source.len(),layer:None,capture,filters:Arc::from(filters),resource:None,geometric_support:None},reserved)?;
     let mut index=std::collections::BTreeMap::new();let mut row=0u32;
     while row<region.height {
-        let tile=FilterPixelRegion{height:(region.height-row).min(32),top:region.top+i64::from(row),..region};
+        let tile=FilterPixelRegion{height:(region.height-row).min(band_rows),top:region.top+i64::from(row),..region};
         let root=graph.add(source_id,filters.len(),tile,reserved,&mut index)?;
         graph.nodes[root].uses=graph.nodes[root].uses.checked_add(1).ok_or(ImageError::TooLarge)?;
         roots.push((tile,root));row+=tile.height;
@@ -7712,6 +7718,19 @@ mod tests {
     }
 
     #[test]
+    fn an_svg_image_blurs_a_filter_region_far_larger_than_its_canvas() {
+        // Figma exports glows as userSpaceOnUse filter regions several times the
+        // canvas with deviations near 100: the visible window must fit the budget.
+        let svg=r##"<svg xmlns="http://www.w3.org/2000/svg" width="626" height="626" viewBox="0 0 626 626"><g clip-path="url(#c)"><rect width="626" height="626" fill="#0B0F0A"/><g filter="url(#f)"><ellipse cx="313" cy="953" rx="370" ry="404" fill="#3D5AFE"/></g></g><defs><filter id="f" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB" x="-758" y="24.5" width="2142" height="1858"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur stdDeviation="87.5"/></filter><clipPath id="c"><rect width="626" height="626"/></clipPath></defs></svg>"##;
+        let image=decode_image_with_limit(svg.as_bytes(),256<<20).unwrap();
+        assert_eq!((image.width,image.height),(626,626));
+        let pixel=|x:usize,y:usize|&image.pixels[(y*626+x)*4..(y*626+x)*4+4];
+        assert!(pixel(313,620)[2]>120,"the glow reaches the bottom edge: {:?}",pixel(313,620));
+        assert!(pixel(313,10)[2]<20,"the top stays the dark background: {:?}",pixel(313,10));
+        assert!(pixel(313,450)[2]>pixel(313,300)[2],"the glow fades upward");
+    }
+
+    #[test]
     fn specification_filter_output_windows_bound_large_root_and_fixed_source() {
         let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
         let root="<style>html,body{margin:0}html{filter:blur(0px)}div{width:2000px;height:2000px;background:lightgreen}i{position:fixed;left:150px;top:100px;width:100px;height:100px;background:green}</style><div></div><i></i>";
@@ -7729,8 +7748,9 @@ mod tests {
         let mut bytes=0;
         let resolved=resolve_layers_region(&list.0,1.0,Some(&font),&mut GlyphCache::default(),&mut bytes,false,Some(viewport)).unwrap();
         assert!(bytes<=MAX_LAYER_BYTES,"retained output uses the existing total layer budget");
-        assert!(resolved.0.iter().any(|command|matches!(command,Command::Image{image,..}if image.height<=32)),
-            "large source resolves through bounded device rows");
+        let bands=resolved.0.iter().filter_map(|command|match command{Command::Image{image,..}=>Some(image.pixels.len()),_=>None}).collect::<Vec<_>>();
+        assert!(bands.len()>1 && bands.iter().all(|bytes|*bytes<=MAX_LAYER_BYTES/16),
+            "large source resolves through bounded device rows: {bands:?}");
         assert_exact_spatial_pixels(&render_with_font(&resolved,800,600,1.0,true,&font).unwrap(),&actual,"resolved row replay");
     }
 
