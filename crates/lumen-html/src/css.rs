@@ -32848,6 +32848,14 @@ fn compute_for_named_registered_inner(
         let shadows=style.resolved_text_shadows();
         if shadows!=style.text_shadows {style.text_shadows=shadows;}
     }
+    // Most elements end with the same extras as their parent but in their own
+    // allocation; sharing the parent's lets later comparisons (interning, the
+    // matched cache, restyle damage) stop at the pointer check.
+    if let Some(parent) = parent {
+        if let (Some(own), Some(inherited)) = (style.extras.as_ref(), parent.extras.as_ref()) {
+            if !Arc::ptr_eq(own, inherited) && **own == **inherited {style.extras = Some(inherited.clone());}
+        }
+    }
     if let Some(scalars) = mp_pending {
         // A style computed from a host answer a worker could not get is wrong
         // and must not reach other elements.
