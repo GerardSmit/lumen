@@ -8846,6 +8846,11 @@ fn rule_media_matches(&self, order: usize) -> bool {
         !self.effect_declarations.is_empty()
     }
 
+    /// The elements installed effect samples apply to.
+    pub(crate) fn effect_declaration_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.effect_declarations.iter().map(|effect| effect.node)
+    }
+
     /// Whether any rule can set a transition or animation property, or an
     /// `@keyframes` exists. Without one, and without inline styles or
     /// installed effects doing the same, no style change can start a transition.

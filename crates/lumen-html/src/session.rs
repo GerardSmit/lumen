@@ -4342,14 +4342,25 @@ impl RenderSession {
         result
     }
 
+    /// The nearest composed ancestor of `node` that is an element.
+    fn composed_parent_element(document:&Document,node:NodeId)->Result<Option<NodeId>,LayoutError> {
+        let mut current=document.composed_parent(node).map_err(|_|LayoutError::InvalidTree)?;
+        while let Some(id)=current {
+            if matches!(document.kind(id),Ok(NodeKind::Element{..})) {return Ok(Some(id));}
+            current=document.composed_parent(id).map_err(|_|LayoutError::InvalidTree)?;
+        }
+        Ok(None)
+    }
+
     /// The elements, in document order, a sparse snapshot covers: those a
     /// transition- or animation-declaring rule or an inline style can reach,
-    /// the `keep` targets, and every ancestor of those. `None` captures the
-    /// whole document: it is small, effect samples are installed, or a rule
-    /// reaches elements that cannot be named.
+    /// the `keep` targets, installed effect targets with their subtrees, and
+    /// every ancestor of those. `None` captures the whole document: it is
+    /// small, or a rule reaches elements that cannot be named.
     fn snapshot_candidates(&mut self,keep:&[NodeId])->Result<Option<Vec<NodeId>>,LayoutError> {
         const SPARSE_MIN_NODES:usize=512;
-        if self.document.node_count()<=SPARSE_MIN_NODES || self.rules.as_ref().is_none_or(css::StyleIndex::has_effect_declarations) {return Ok(None);}
+        if self.document.node_count()<=SPARSE_MIN_NODES {return Ok(None);}
+        if self.rules.is_none() {return Ok(None);}
         let Some(candidates)=self.cached_transition_candidates() else {return Ok(None)};
         if core::mem::take(&mut self.snapshot_watch_overflowed) {
             self.snapshot_watch.clear();
@@ -4369,6 +4380,10 @@ impl RenderSession {
         let document=&self.document;
         let root=document.root();
         let keep:alloc::collections::BTreeSet<u128>=keep.iter().map(|node|node.key()).collect();
+        // Installed effect samples reach their targets and, through
+        // inheritance, every descendant; those snapshots depend on the samples.
+        let effect_targets:alloc::collections::BTreeSet<u128>=rules.effect_declaration_nodes().map(|node|node.key()).collect();
+        let mut affected=alloc::collections::BTreeSet::new();
         let mut elements=Vec::new();
         let mut included=alloc::collections::BTreeSet::new();
         let mut cursor=Some(root);
@@ -4376,7 +4391,10 @@ impl RenderSession {
             if matches!(document.kind(node),Ok(NodeKind::Element{..})) {
                 elements.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
                 elements.push(node);
-                if keep.contains(&node.key()) || self.snapshot_watch.contains(&node.key()) || inline_style_may_transition(document,node) || candidates.matches(rules,document,node) {
+                let reached=!effect_targets.is_empty() && (effect_targets.contains(&node.key())
+                    || Self::composed_parent_element(document,node)?.is_some_and(|parent|affected.contains(&parent.key())));
+                if reached {affected.insert(node.key());}
+                if reached || keep.contains(&node.key()) || self.snapshot_watch.contains(&node.key()) || inline_style_may_transition(document,node) || candidates.matches(rules,document,node) {
                     let mut current=Some(node);
                     while let Some(id)=current {
                         if !included.insert(id.key()) {break;}
