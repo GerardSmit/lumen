@@ -745,6 +745,23 @@ impl GlyphCache {
     }
 }
 
+/// The glyph-cache key of the last face looked up. A run's glyphs nearly all
+/// share one face, and a provider's `face_key` is fixed while it is borrowed
+/// for a replay, so asking once per face change is enough.
+#[derive(Default)]
+struct FaceKeyMemo(Option<(u64, u64)>);
+
+impl FaceKeyMemo {
+    fn get(&mut self, font: &dyn FontProvider, face: u64) -> Result<u64, &'static str> {
+        if let Some((last, key)) = self.0 {
+            if last == face { return Ok(key); }
+        }
+        let key = font.face_key(face)?;
+        self.0 = Some((face, key));
+        Ok(key)
+    }
+}
+
 fn blit_glyph(
     image: &mut Rgba8Image,
     scale: f32,
@@ -1237,10 +1254,11 @@ impl ReplaySink for Raster<'_> {
             return;
         };
         let clip=self.current_clip();
+        let mut face_keys = FaceKeyMemo::default();
         for glyph in glyphs {
             let scaled_size = size * glyph.size_scale * self.scale;
             let key = (
-                match font.face_key(glyph.face) {
+                match face_keys.get(font, glyph.face) {
                     Ok(id) => id,
                     Err(error) => {
                         self.error = Some(ImageError::Font(error));
@@ -4240,9 +4258,10 @@ fn paint_bounds(
                 glyphs,
             } if color.a != 0 => {
                 let font = font.ok_or(ImageError::Font("font required"))?;
+                let mut face_keys = FaceKeyMemo::default();
                 for glyph in glyphs.iter() {
                     let key = (
-                        font.face_key(glyph.face).map_err(ImageError::Font)?,
+                        face_keys.get(font, glyph.face).map_err(ImageError::Font)?,
                         glyph.id,
                         (size * glyph.size_scale * scale).to_bits(),
                     );

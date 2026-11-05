@@ -1479,7 +1479,10 @@ impl FontSet {
 
     fn face_by_identity(&self,identity:u64)->Option<&Arc<FontFace>> {
         if identity==0 {return self.faces.first().map(|font|&font.face);}
-        let own=self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity) || font.face.is_variation_key(identity)).map(|font|&font.face);
+        // Plain identities first: the derived-key checks take locks.
+        let own=self.faces.iter().find(|font|font.face.id()==identity)
+            .or_else(||self.faces.iter().find(|font|font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity) || font.face.is_variation_key(identity)))
+            .map(|font|&font.face);
         #[cfg(feature = "system-fonts")]
         if own.is_none() {return system_fonts::by_identity(identity);}
         own

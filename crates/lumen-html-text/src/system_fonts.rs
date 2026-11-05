@@ -840,7 +840,11 @@ pub(crate) fn by_identity(identity: u64) -> Option<&'static Arc<FontFace>> {
                 })
             });
             drop(loaded);
-            found?
+            // Derived keys are unique and never reused, so a found one stays valid;
+            // a miss is not kept, as the face may be loaded later.
+            let found = found?;
+            lock(&state.by_id).insert(identity, found);
+            found
         }
     };
     state.faces[position as usize].get()?.as_ref().map(|loaded| &loaded.font.face)

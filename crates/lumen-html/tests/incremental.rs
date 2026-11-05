@@ -1823,3 +1823,25 @@ fn pulsing_pseudo_element_animation_does_not_lay_out() {
     fresh.with_forced_layout(|session| { render(session); });
     assert_eq!(session.scroll_extent(dot), fresh.scroll_extent(dot_fresh));
 }
+
+/// An opacity animation through 1 keeps its layer, so every sample after the
+/// first rewrites the frame; back below 1 it matches a fresh layout.
+#[test]
+fn opacity_animation_through_one_keeps_its_layer() {
+    let page = "<style>body{margin:0}#f{width:50px;height:20px;background:#36c}</style><div id=f></div><p>after</p>";
+    let mut session = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    animate(&mut session, "#f", &[("opacity", "0.5")]);
+    render(&mut session);
+    let passes = session.invalidation_stats().layout_passes;
+    for value in ["0.8", "1", "1", "0.6", "0.3"] {
+        animate(&mut session, "#f", &[("opacity", value)]);
+        render(&mut session);
+    }
+    assert_eq!(session.invalidation_stats().layout_passes, passes, "opacity samples through 1 lay out the page");
+    let actual = render(&mut session).clone();
+    let mut fresh = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    animate(&mut fresh, "#f", &[("opacity", "0.3")]);
+    assert_same("opacity through one", "patched", &actual, render(&mut fresh));
+}

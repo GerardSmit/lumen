@@ -14410,7 +14410,10 @@ pub(crate) fn patch_paint_commands(list: &[Command], sources: &[PaintSource], ch
             || old.appearance != css::Appearance::None) { return None; }
         if (background_changed || borders_changed) && (old.border_image.is_some() || old.background_images.is_some() || old.shadows.is_some()) { return None; }
         if decoration_changed && old.text_decoration_style == css::TextDecorationStyle::Wavy { return None; }
-        if opacity_changed && old.paints_as_group() != new.paints_as_group() { return None; }
+        // An opacity animation keeps its box a stacking context and isolation
+        // group throughout, so a sample at 1 keeps the layer at opacity 1 and a
+        // later sample below 1 rewrites it again. A mask paints its own group.
+        if opacity_changed && old.paints_as_group() != new.paints_as_group() && (old.has_mask() || new.has_mask()) { return None; }
         if (old.background.a == 0) != (new.background.a == 0) { return None; }
         if borders_changed && (has_nonuniform_border(old) != has_nonuniform_border(new)
             || side_colors(old).iter().zip(side_colors(new)).any(|(a, b)| (a.a == 0) != (b.a == 0))) { return None; }
@@ -14423,8 +14426,8 @@ pub(crate) fn patch_paint_commands(list: &[Command], sources: &[PaintSource], ch
                 .or_else(|| list.get(index))?;
             let mut command = current.clone();
             match &mut command {
-                Command::PushLayer { opacity, filters, clip: false, .. } if opacity_changed => {
-                    if !old.paints_as_group() || *filters != old.filters { continue; }
+                Command::PushLayer { opacity, filters, svg_clip, clip: false, .. } if opacity_changed => {
+                    if *filters != old.filters || !old.paints_as_group() && (*opacity != 1.0 || svg_clip.is_some()) { continue; }
                     if *opacity == old.opacity { *opacity = new.opacity; }
                     else if *opacity == old.opacity.clamp(0.0, 1.0) { *opacity = new.opacity.clamp(0.0, 1.0); }
                     else { continue; }
@@ -14477,7 +14480,7 @@ pub(crate) fn patch_paint_commands(list: &[Command], sources: &[PaintSource], ch
         }
         if !change.rendered { continue; }
         let visible = old.visibility_visible;
-        if opacity_changed && old.paints_as_group() && !layer { return None; }
+        if opacity_changed && (old.paints_as_group() || new.paints_as_group()) && !layer { return None; }
         if visible && color_changed && change.has_text && !text { return None; }
         if visible && background_changed && old.background.a != 0 && !background { return None; }
         if visible && borders_changed && border_widths(old).iter().any(|width| *width > 0.0) && !border { return None; }
