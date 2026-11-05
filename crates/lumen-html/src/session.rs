@@ -4173,10 +4173,14 @@ impl RenderSession {
         if !basis_matches || self.snapshot_rules_unbounded || !held.epoch.differs_only_in_document(&epoch) {return false;}
         if self.rules.as_ref().is_some_and(|rules|rules.has_counter_data() || rules.has_quote_content() || rules.has_list_item_data()) {return false;}
         self.note_snapshot_dirty();
-        if self.snapshot_dirty.all
-            || (self.snapshot_dirty.tree_changed && held.nodes.iter().any(|input|input.style.sibling_position_dependent)) {return false;}
+        if self.snapshot_dirty.all {return false;}
+        // A tree change moves siblings: elements whose values read their
+        // sibling position are stale too.
+        let tree_changed=self.snapshot_dirty.tree_changed;
         let nodes=self.snapshot_dirty.nodes.iter().chain(&self.snapshot_dirty.subtrees).chain(&self.snapshot_rule_subjects)
-            .map(|node|node.key()).collect();
+            .map(|node|node.key())
+            .chain(held.nodes.iter().filter(|input|tree_changed && input.style.sibling_position_dependent).map(|input|input.node.key()))
+            .collect();
         self.held_snapshot_stale=Some(nodes);
         true
     }
@@ -4520,8 +4524,17 @@ impl RenderSession {
             || self.document.mutations().iter()
                 .any(|mutation|mutation.version>self.snapshot_noted_version && matches!(mutation.kind,MutationKind::Tree{..}));
         // An inserted or removed node moves its later siblings; the dirty sets
-        // follow the selectors that notice, not `sibling-index()` in a value.
-        if tree_changed && previous.nodes.iter().any(|input|input.style.sibling_position_dependent) {return None;}
+        // follow the selectors that notice, not `sibling-index()` in a value,
+        // so the elements with such values are styled again (and below them
+        // what inherits a changed value).
+        const MAX_SIBLING_DEPENDENT:usize=4096;
+        let mut sibling_dependent=Vec::new();
+        if tree_changed {
+            for input in previous.nodes.iter().filter(|input|input.style.sibling_position_dependent) {
+                if sibling_dependent.len()>=MAX_SIBLING_DEPENDENT {return None;}
+                sibling_dependent.push(input.node.key());
+            }
+        }
         self.note_snapshot_dirty();
         if self.snapshot_dirty.all {return None;}
         let mut ranges=alloc::collections::BTreeMap::new();
@@ -4538,7 +4551,7 @@ impl RenderSession {
         // inherit, which the comparison with its previous style finds.
         Some(SnapshotBase{previous,ranges,
             dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key())
-                .chain(self.snapshot_effect_nodes.iter().copied()).collect(),
+                .chain(self.snapshot_effect_nodes.iter().copied()).chain(sibling_dependent).collect(),
             subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
     }
 
@@ -10990,6 +11003,20 @@ mod tests {
         let list = session.display_list(400, 600, &NoText).unwrap().clone();
         assert!(crate::layout::cell_measurements() > before);
         assert_eq!(list, reference_list(&nested_tables_source("", "width:120px;height:50px"), 400, 600));
+    }
+
+    #[test]
+    fn an_incremental_snapshot_restyles_values_that_read_their_sibling_position() {
+        let document = crate::html::parse("<style>li{width:calc(sibling-index() * 10px);transition:width 1s}</style><ul id=u><li id=a></li><li id=b></li><li id=c></li></ul>", 64).unwrap();
+        let (list, a, b, c) = (find(&document, "#u"), find(&document, "#a"), find(&document, "#b"), find(&document, "#c"));
+        let mut session = RenderSession::new(document);
+        let first = session.transition_snapshot_after(None, None).unwrap();
+        session.document_mut().insert_before(list, c, Some(a)).unwrap();
+        let before = session.invalidation_stats();
+        let next = session.transition_snapshot_after(None, Some(&first)).unwrap();
+        assert_eq!(session.invalidation_stats().transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+        let width = |node: NodeId| next.nodes.iter().find(|input| input.node == node && input.pseudo.is_none()).and_then(|input| input.style.width);
+        assert_eq!((width(c), width(a), width(b)), (Some(10.0), Some(20.0), Some(30.0)));
     }
 
     #[test]
