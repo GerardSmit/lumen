@@ -236,13 +236,35 @@ impl InsertingNodes {
     }
 }
 
+/// Namespaced attributes per element (index in the attribute list, namespace
+/// URI). Keyed by element: attribute lookups ask for one element's entry on
+/// every attribute they test, and a page can hold thousands of SVG owners.
+#[derive(Default)]
+struct AttributeNamespaces(alloc::collections::BTreeMap<u128, (NodeId, Vec<(usize, Arc<str>)>)>);
+
+impl AttributeNamespaces {
+    fn get(&self, owner: NodeId) -> Option<&(NodeId, Vec<(usize, Arc<str>)>)> { self.0.get(&owner.key()) }
+    fn get_mut(&mut self, owner: NodeId) -> Option<&mut (NodeId, Vec<(usize, Arc<str>)>)> { self.0.get_mut(&owner.key()) }
+    fn push(&mut self, entry: (NodeId, Vec<(usize, Arc<str>)>)) { self.0.insert(entry.0.key(), entry); }
+    fn retain(&mut self, mut keep: impl FnMut(&(NodeId, Vec<(usize, Arc<str>)>)) -> bool) { self.0.retain(|_, entry| keep(entry)); }
+    fn len(&self) -> usize { self.0.len() }
+    /// Nodes live in a B-tree; nothing to reserve.
+    fn try_reserve(&mut self, _additional: usize) -> Result<(), core::convert::Infallible> { Ok(()) }
+}
+
+impl IntoIterator for AttributeNamespaces {
+    type Item = (NodeId, Vec<(usize, Arc<str>)>);
+    type IntoIter = alloc::collections::btree_map::IntoValues<u128, Self::Item>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_values() }
+}
+
 /// Removed nodes retain their identity until explicitly destroyed.
 pub struct Document {
     pub(crate) registered_custom_properties: Vec<css::registered_properties::RegisteredCustomProperty>,
     pub(crate) highlights: Vec<highlights::Highlight>,
     id: u64,
     nodes: Vec<Node>,
-    attribute_namespaces: Vec<(NodeId, Vec<(usize, Arc<str>)>)>,
+    attribute_namespaces: AttributeNamespaces,
     /// Lazily materialized Attr nodes, aligned with each Element's compact attribute vector.
     /// No sidecar is allocated for parser-created attributes until the host requests a Node.
     // Only materialized Attr identities are stored here. Keep each owner's entries sparse so
@@ -366,7 +388,7 @@ impl Document {
             highlights: Vec::new(),
             id: NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed),
             nodes: alloc::vec![Node::new(NodeKind::Document, 1)],
-            attribute_namespaces: Vec::new(),
+            attribute_namespaces: AttributeNamespaces::default(),
             attribute_nodes: Vec::new(),
             literal_colon_names: Vec::new(),
             custom_element_is_values: Vec::new(),
@@ -1927,9 +1949,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             kind => kind.clone(),
         };
         let namespaces = self
-            .attribute_namespaces
-            .iter()
-            .find(|(owner, _)| *owner == source)
+            .attribute_namespaces.get(source)
             .map(|(_, namespaces)| namespaces.clone())
             .unwrap_or_default();
         let doctype_identifiers = self
@@ -2589,7 +2609,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         self.manual_assignments
             .try_reserve(source.manual_assignments.len())
             .map_err(|_| Error::LimitExceeded)?;
-        let mut remaining_namespaces = Vec::new();
+        let mut remaining_namespaces = AttributeNamespaces::default();
         remaining_namespaces
             .try_reserve(source.attribute_namespaces.len())
             .map_err(|_| Error::LimitExceeded)?;
@@ -2909,9 +2929,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             kind => kind.clone(),
         };
         let namespaces = source
-            .attribute_namespaces
-            .iter()
-            .find(|(owner, _)| *owner == node)
+            .attribute_namespaces.get(node)
             .map(|(_, namespaces)| namespaces.clone())
             .unwrap_or_default();
         let doctype_identifiers = source
@@ -3062,7 +3080,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     pub(crate) fn attribute_namespace_metadata(&self, id: NodeId) -> &[(usize, Arc<str>)] {
-        self.attribute_namespaces.iter().find(|(owner, _)| *owner == id)
+        self.attribute_namespaces.get(id)
             .map_or(&[], |(_, namespaces)| namespaces.as_slice())
     }
 
@@ -3711,11 +3729,12 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             return Err(Error::WrongKind);
         };
         let namespace = namespace.filter(|uri| !uri.is_empty());
+        let metadata = self.attribute_namespace_metadata(id);
         Ok(attributes
             .iter()
             .enumerate()
             .position(|(index, (name, _))| {
-                let uri = self.attribute_namespace_uri_at(id, index);
+                let uri = metadata.iter().find(|(known, _)| *known == index).map(|(_, uri)| uri.as_ref());
                 let actual_local = if uri.is_some() {
                     split_qualified_name(name.as_str()).1
                 } else {
@@ -3728,9 +3747,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     fn set_attribute_namespace_at(&mut self, id: NodeId, index: usize, uri: Option<&str>) {
         let uri = uri.filter(|uri| !uri.is_empty());
         if let Some((_, metadata)) = self
-            .attribute_namespaces
-            .iter_mut()
-            .find(|(owner, _)| *owner == id)
+            .attribute_namespaces.get_mut(id)
         {
             metadata.retain(|(known, _)| *known != index);
             if let Some(uri) = uri {
@@ -3743,9 +3760,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     fn attribute_namespace_rc_at(&self, id: NodeId, index: usize) -> Option<Arc<str>> {
-        self.attribute_namespaces
-            .iter()
-            .find(|(owner, _)| *owner == id)
+        self.attribute_namespaces.get(id)
             .and_then(|(_, metadata)| {
                 metadata
                     .iter()
@@ -4946,9 +4961,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             }
         }
         if let Some((_, metadata)) = self
-            .attribute_namespaces
-            .iter_mut()
-            .find(|(owner, _)| *owner == id)
+            .attribute_namespaces.get_mut(id)
         {
             metadata.retain(|(known, _)| *known != index);
             for (known, _) in metadata {
