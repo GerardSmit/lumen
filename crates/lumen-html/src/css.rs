@@ -31332,6 +31332,10 @@ fn compute_for_named_registered_inner(
             }
             // HTML rendering defaults remain lower priority than author CSS.
             if *namespace == Namespace::Html && html_rendering_attribute(attributes, context, "hidden").is_some() && tag != "embed" {
+                // HTML rendering: `[hidden=until-found i]:not(embed) { content-visibility: hidden }`.
+                if html_rendering_attribute(attributes, context, "hidden").is_some_and(|value| value.eq_ignore_ascii_case("until-found")) {
+                    extra_props::set_stored(&mut style, "content-visibility", Some("hidden"));
+                }
                 if matches!(tag, "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr") {
                     Value::Visibility { visible: false, collapsed: true }.apply(&mut style);
                 } else if html_rendering_attribute(attributes, context, "hidden")

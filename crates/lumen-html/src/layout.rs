@@ -41674,6 +41674,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             style.width=Some(specified_dimension(&style,width));
             style.height=Some(specified_height(&style,height));
         }
+        // A block container with `content-visibility: hidden` lays out and
+        // paints its own box only, sized as if empty by its size containment.
+        let skips_contents = !virtual_parent && !generated_box && contents_origin.is_none()
+            && matches!(style.display, Display::Block | Display::FlowRoot | Display::InlineBlock) && style.skips_contents();
         let display_contents = contents_origin.is_some();
         let pseudo_style = contents_origin.as_ref()
             .or_else(|| virtual_children.as_ref().map(|source| &source.origin_style)).unwrap_or(&style);
@@ -41683,12 +41687,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         } else {
             replacement_content_url(&style)?
         };
-        let mut generated_before = if is_fieldset || virtual_parent || iframe || object_replaced {
+        let mut generated_before = if is_fieldset || virtual_parent || iframe || object_replaced || skips_contents {
             None
         } else {
             self.virtual_generated_child(id, pseudo_style, css::PseudoElement::Before, available)?
         };
-        let mut generated_after = if is_fieldset || virtual_parent || iframe || object_replaced {
+        let mut generated_after = if is_fieldset || virtual_parent || iframe || object_replaced || skips_contents {
             None
         } else {
             self.virtual_generated_child(id, pseudo_style, css::PseudoElement::After, available)?
@@ -42509,7 +42513,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let virtual_children_are_flex_grid = matches!(style.display, Display::Flex | Display::Grid);
         let (mut flattened_block_children,column_generated_source) = if let Some(children) = virtual_children {
             (children.children,children.generated)
-        } else if is_fieldset || is_form_control || widget_replaced || iframe || object_replaced || virtual_children_are_flex_grid {
+        } else if is_fieldset || is_form_control || widget_replaced || iframe || object_replaced || virtual_children_are_flex_grid || skips_contents {
             (Vec::new(),None)
         } else {
             // Layout uses the anonymous box style, while descendant cascade
@@ -57206,6 +57210,24 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn content_visibility_hidden_skips_the_contents_of_a_block() {
+        let shaped = painted_text_runs("<div style='content-visibility:hidden;background:red'>secret<span>inner</span><table><tr><td>cell</td></tr></table></div><p>shown</p>");
+        assert!(shaped.iter().any(|text| text == "shown"), "{shaped:?}");
+        assert!(!shaped.iter().any(|text| text.contains("secret") || text.contains("inner") || text.contains("cell")), "{shaped:?}");
+        // Size containment sizes the skipping box as if it were empty.
+        let document = crate::html::parse("<body style='margin:0'><div style='content-visibility:hidden'><p style='height:80px;margin:0'>x</p></div><p id=after style='margin:0;height:5px;background:blue'></p>", 64).unwrap();
+        let list = display_list(&document, 200, 200, &NoShape).unwrap();
+        assert!(list.0.iter().any(|command| matches!(command, Command::FillRect { rect, .. } if rect.y == 0.0 && rect.height == 5.0)), "{:?}", list.0);
+    }
+
+    #[test]
+    fn until_found_content_is_skipped_unless_the_author_shows_it() {
+        let shaped = painted_text_runs("<div hidden=until-found>secret</div><div hidden=UNTIL-FOUND style='content-visibility:visible'>open</div><p>shown</p>");
+        assert!(shaped.iter().any(|text| text == "shown") && shaped.iter().any(|text| text == "open"), "{shaped:?}");
+        assert!(!shaped.iter().any(|text| text == "secret"), "{shaped:?}");
     }
 
     fn live_value_session(value: &Rc<RefCell<String>>, generation: &Rc<core::cell::Cell<u64>>) -> crate::session::RenderSession {
