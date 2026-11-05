@@ -1925,7 +1925,40 @@ pub(crate) struct IntrinsicSizes {
     /// Source-ancestry computed styles of list items, which the marker
     /// origin resolves in both intrinsic sizing and box layout.
     tree_styles: RefCell<BTreeMap<u128, TreeStyleEntry>>,
+    /// Table cell content measurements by cell node index, dropped with the
+    /// node's intrinsic sizes: every table that encloses a cell measures it
+    /// again, in every frame.
+    cells: RefCell<BTreeMap<usize, Vec<CellMeasure>>>,
 }
+
+/// A measurement of a table cell's content box (`measure_table_cell_size`),
+/// valid for an equal cell, styles, table axes, inline size and context.
+struct CellMeasure {
+    node: u128,
+    origin: Arc<Style>,
+    used: Arc<Style>,
+    axes: (GridAxesKey, [usize; 4]),
+    inline: u32,
+    depth: usize,
+    context: CellMeasureContext,
+    provenance: IntrinsicProvenance,
+    result: ((f32, f32), Option<FlowBaselines>),
+}
+
+type GridAxesKey = (bool, bool, bool);
+
+/// The measurement layout's inputs that come from the measuring layout.
+#[derive(Clone, Copy, PartialEq)]
+struct CellMeasureContext {
+    percentage_basis: Option<(f32, Option<f32>)>,
+    multicol_depth: usize,
+    export_block_table_baselines: bool,
+    container_units: ContainerUnitContextKey,
+}
+
+/// Cell measurements kept across frames, and per cell.
+const MAX_CELL_MEASURES: usize = 8192;
+const CELL_MEASURE_WAYS: usize = 4;
 
 /// The newest measurement of a slot and earlier ones with other styles,
 /// newest first: a box is measured with its own style and with used variants
@@ -1996,11 +2029,16 @@ impl IntrinsicSizes {
         self.children.borrow_mut().clear();
         self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
+        *self.cells.borrow_mut() = BTreeMap::new();
         *self.slots.borrow_mut() = BTreeMap::new();
         self.languages.borrow_mut().clear();
     }
     fn drop_slot(&self, slot: usize) {
         self.slots.borrow_mut().remove(&slot);
+        self.drop_cell(slot / 2);
+    }
+    fn drop_cell(&self, index: usize) {
+        self.cells.borrow_mut().remove(&index);
     }
     /// The margin escapes measured with the primary size of `slot`.
     fn margins(&self, slot: usize) -> Option<BlockMargins> {
@@ -2028,6 +2066,8 @@ impl IntrinsicSizes {
         self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
+        let mut cells = self.cells.borrow_mut();
+        if cells.values().map(Vec::len).sum::<usize>() > MAX_CELL_MEASURES { *cells = BTreeMap::new(); }
     }
     /// Keep at most `limit` retained sizes, dropping the oldest frames first.
     fn retain_newest(&self, limit: usize) {
@@ -2058,6 +2098,10 @@ impl IntrinsicSizes {
     /// Drop the entries that read a viewport axis which changed.
     fn retain_for_resize(&self, width: bool, height: bool) {
         let changed = u8::from(width) | (u8::from(height) << 1);
+        self.cells.borrow_mut().retain(|_, entries| {
+            entries.retain(|entry| entry.provenance.axes & changed == 0);
+            !entries.is_empty()
+        });
         let mut slots = self.slots.borrow_mut();
         for slot in slots.values_mut() {
             if slot.primary.as_ref().is_some_and(|entry| entry.provenance.axes & changed != 0 || entry.provenance.context.is_none()) {
@@ -2089,6 +2133,13 @@ std::thread_local! {
     static INTRINSIC_CHILDREN_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static FLEX_SHORTCUTS_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static ANONYMOUS_TEXT_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CELL_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Table cell content measurements laid out (not served from the memo) by this thread.
+#[cfg(test)]
+pub(crate) fn cell_measurements() -> usize {
+    CELL_MEASUREMENTS.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2378,6 +2429,9 @@ impl RetainedLayoutCache {
             }
         };
         for &(_, index, _) in &sizes { drop_slots(index as usize); }
+        // A cell's measurement includes its baselines, which a size boundary
+        // inside it does not keep, so it goes with the cell's fragment.
+        for &(_, index, _) in &fragments { intrinsics.drop_cell(index as usize); }
         let mut pending: Vec<NodeId> = subtrees.to_vec();
         let mut visited = 0usize;
         while let Some(node) = pending.pop() {
@@ -20274,7 +20328,99 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok((size.1, baselines))
     }
 
+    /// The content size and baselines of a cell laid out at `inline`. A
+    /// measurement is reused, in this and later frames, for an equal cell,
+    /// styles and measuring context until a change inside the cell drops it.
     fn measure_table_cell_size(&self, source: &TableCellContent,
+        children: &[Option<FlattenedBoxChild>], style: &Style, axes: TableAxes, inline: f32, depth: usize)
+        -> Result<((f32, f32), Option<FlowBaselines>), LayoutError> {
+        let TableCellContent::Node { node, style: origin } = source else {
+            return self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth);
+        };
+        if self.timeline_values.is_some() || self.measurement_glyphs.as_ref().is_some_and(|glyphs| !glyphs.is_empty()) {
+            return self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth);
+        }
+        let context = CellMeasureContext {
+            percentage_basis: self.percentage_basis,
+            multicol_depth: self.multicol_depth,
+            export_block_table_baselines: self.export_block_table_baselines,
+            container_units: self.container_units.get().into(),
+        };
+        let axes_key = ((axes.flow.vertical, axes.flow.reverse_block, axes.flow.reverse_inline), axes.sides);
+        let inline_key = inline.to_bits();
+        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.inline == inline_key && entry.depth == depth
+            && entry.axes == axes_key && entry.context == context && *entry.used == *style && *entry.origin == *origin;
+        let intrinsics = &*self.intrinsics;
+        {
+            let cells = intrinsics.cells.borrow();
+            if let Some(entry) = cells.get(&node.index()).and_then(|entries| entries.iter().find(|entry| matches(entry))) {
+                let provenance = &entry.provenance;
+                let images_current = match (provenance.pending.as_deref(), self.images) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(pending), Some(images)) => {
+                        let generation = images.generation();
+                        generation != 0 && generation == provenance.pending_generation
+                            || pending.iter().all(|(lookup, _)| images.still_pending(lookup))
+                    }
+                };
+                if images_current {
+                    if let (Some(pending), Some(images)) = (provenance.pending.as_deref(), self.images) {
+                        images.replay_pending(pending);
+                    }
+                    intrinsics.viewport_read((), provenance.axes);
+                    intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
+                    self.text_uses.set(self.text_uses.get().wrapping_add(1));
+                    return Ok(entry.result);
+                }
+            }
+        }
+        let mark = self.intrinsic_mark();
+        #[cfg(test)]
+        CELL_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+        let result = self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth)?;
+        let mut axes_read = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes_read |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes_read = 3; }
+        let pending = match (self.images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
+        };
+        let mut cells = intrinsics.cells.borrow_mut();
+        let entries = cells.entry(node.index()).or_default();
+        entries.retain(|entry| !matches(entry));
+        if entries.len() >= CELL_MEASURE_WAYS { entries.pop(); }
+        if entries.try_reserve(1).is_ok() {
+            entries.insert(0, CellMeasure {
+                node: node.key(),
+                origin: Arc::new(origin.clone()),
+                used: Arc::new(style.clone()),
+                axes: axes_key,
+                inline: inline_key,
+                depth,
+                context,
+                provenance: IntrinsicProvenance {
+                    frame: intrinsics.frame.get(),
+                    axes: axes_read,
+                    context: None,
+                    pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+                    pending: pending.map(|(lookups, _)| lookups),
+                },
+                result,
+            });
+        }
+        Ok(result)
+    }
+
+    fn measure_table_cell_size_uncached(&self, source: &TableCellContent,
         children: &[Option<FlattenedBoxChild>], style: &Style, axes: TableAxes, inline: f32, depth: usize)
         -> Result<((f32, f32), Option<FlowBaselines>), LayoutError> {
         let mut layout = self.measurement_layout();
@@ -57060,6 +57206,37 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 )
             })
             .collect()
+    }
+
+    fn live_value_session(value: &Rc<RefCell<String>>, generation: &Rc<core::cell::Cell<u64>>) -> crate::session::RenderSession {
+        let rows: String = (0..120).map(|row| alloc::format!("<p style='margin:0;height:10px'>row {row}</p>")).collect();
+        let mut document = crate::html::parse(&alloc::format!("<body style='margin:0'><form><input id=i></form>{rows}</body>"), 4096).unwrap();
+        let input = crate::selector::query_selector(&document, document.root(), "#i").unwrap().unwrap();
+        let read_generation = generation.clone();
+        document.set_validity_resolver(Rc::new(|_, _| None), Rc::new(move || read_generation.get()));
+        let read_value = value.clone();
+        document.set_form_value_resolver(Rc::new(move |node, read| {
+            if node == input { read(Some(&read_value.borrow())) } else { read(None) }
+        }));
+        crate::session::RenderSession::new(document)
+    }
+
+    #[test]
+    fn a_live_form_value_lays_out_the_boxes_around_its_control() {
+        let text = RecordingText::default();
+        let value = Rc::new(RefCell::new(String::from("a")));
+        let generation = Rc::new(core::cell::Cell::new(1));
+        let mut session = live_value_session(&value, &generation);
+        session.display_list(300, 2000, &text).unwrap();
+        *value.borrow_mut() = String::from("a longer value");
+        generation.set(2);
+        let before = session.invalidation_stats();
+        let list = session.display_list(300, 2000, &text).unwrap().clone();
+        let after = session.invalidation_stats();
+        assert!(after.boxes_laid_out - before.boxes_laid_out < 20, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
+        let fresh_value = Rc::new(RefCell::new(String::from("a longer value")));
+        let mut fresh = live_value_session(&fresh_value, &Rc::new(core::cell::Cell::new(2)));
+        assert_eq!(list, *fresh.display_list(300, 2000, &text).unwrap());
     }
 
     #[test]

@@ -2032,7 +2032,12 @@ impl RenderSession {
         // existing generation as the sole invalidation authority.
         let live_value_changed = validity_changed && self.document.has_form_value_resolver();
         if live_value_changed {
-            self.invalidate_paint();
+            // A live value is drawn in its control and sizes it; the boxes
+            // around the controls lay out again, the rest replay.
+            let controls = css::invalidation::form_controls(&self.document);
+            self.discard_frame();
+            self.layout_cache.invalidate_changed(&self.document, &controls, &[], &[], &|_| false);
+            self.paint_revision = self.paint_revision.wrapping_add(1);
             self.frame_id = self.frame_id.wrapping_add(1);
         }
         let shape_changed = interaction_changed && interaction_before.1 != self.synced_interaction.1;
@@ -10948,6 +10953,43 @@ mod tests {
         // A video or canvas publishes a new bitmap every frame.
         assert!(after.boxes_laid_out - before.boxes_laid_out < 20, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
         assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { image, .. } if Arc::ptr_eq(image, &next))));
+    }
+
+    fn nested_tables_source(top: &str, inner: &str) -> String {
+        alloc::format!("<body style='margin:0'><p id=t style='{top}'>top</p><table><tr><td>a<table><tr><td>b<table><tr>\
+            <td><div id=d style='{inner}'>c</div></td><td>d</td></tr></table></td><td>e</td></tr></table></td><td>f</td></tr></table>\
+            <table><tr><td>g</td><td><table><tr><td>h</td></tr></table></td></tr></table></body>")
+    }
+
+    #[test]
+    fn a_relayout_reuses_the_cell_measurements_of_unchanged_tables() {
+        let document = crate::html::parse(&nested_tables_source("", ""), 4096).unwrap();
+        let top = find(&document, "#t");
+        let mut session = RenderSession::new(document);
+        let first = crate::layout::cell_measurements();
+        session.display_list(400, 600, &NoText).unwrap();
+        let measured = crate::layout::cell_measurements() - first;
+        assert!(measured > 0);
+        session.document_mut().set_attribute(top, "style", "height:30px").unwrap();
+        let before = crate::layout::cell_measurements();
+        let list = session.display_list(400, 600, &NoText).unwrap().clone();
+        // The tables only move down: their cells keep their measurements.
+        let again = crate::layout::cell_measurements() - before;
+        assert!(again * 4 < measured, "{again} of {measured}");
+        assert_eq!(list, reference_list(&nested_tables_source("height:30px", ""), 400, 600));
+    }
+
+    #[test]
+    fn a_change_inside_a_cell_measures_its_tables_again() {
+        let document = crate::html::parse(&nested_tables_source("", ""), 4096).unwrap();
+        let inner = find(&document, "#d");
+        let mut session = RenderSession::new(document);
+        session.display_list(400, 600, &NoText).unwrap();
+        session.document_mut().set_attribute(inner, "style", "width:120px;height:50px").unwrap();
+        let before = crate::layout::cell_measurements();
+        let list = session.display_list(400, 600, &NoText).unwrap().clone();
+        assert!(crate::layout::cell_measurements() > before);
+        assert_eq!(list, reference_list(&nested_tables_source("", "width:120px;height:50px"), 400, 600));
     }
 
     #[test]
