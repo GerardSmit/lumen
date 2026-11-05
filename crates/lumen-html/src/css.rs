@@ -7614,6 +7614,8 @@ pub struct StyleIndex {
     generated_pseudo_rules: RuleBuckets,
     /// `::marker` rules, bucketed like the cascade.
     marker_pseudo_rules: RuleBuckets,
+    /// `::first-line` and `::first-letter` rules, bucketed by subject.
+    typographic_pseudo_rules: RuleBuckets,
     /// The subset of those rules which declare counter operations, counter
     /// functions or a list-item display; only these matter to the counter walk.
     counter_pseudo_rules: RuleBuckets,
@@ -7837,6 +7839,10 @@ fn is_content_pseudo_rule(rule: &Rule) -> bool {
         Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
         _ => false,
     })
+}
+
+fn is_typographic_pseudo_rule(rule: &Rule) -> bool {
+    matches!(rule.selector.pseudo_element, Some(PseudoElement::FirstLine | PseudoElement::FirstLetter))
 }
 
 fn is_marker_pseudo_rule(rule: &Rule) -> bool {
@@ -8618,6 +8624,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
             has_list_item_data,
             generated_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_content_pseudo_rule),
             marker_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_marker_pseudo_rule),
+            typographic_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_typographic_pseudo_rule),
             counter_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_counter_pseudo_rule),
             has_validity_data,
             rules,
@@ -8952,9 +8959,10 @@ fn rule_media_matches(&self, order: usize) -> bool {
 
     pub(crate) fn compute_typographic(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: &dyn TextShaper) -> Result<Option<Style>, CssError> {
-        if !self.has_typographic_content || !self.rules.iter().enumerate().any(|(order,rule)|
-            rule.selector.pseudo_element == Some(pseudo) && rule.matches_at(document, origin)
-                && self.rule_media_matches(order)) { return Ok(None); }
+        // Bucketed by subject: layout asks this of every block, and a utility
+        // stylesheet holds thousands of rules.
+        if !self.has_typographic_content
+            || !self.pseudo_rule_may_match(&self.typographic_pseudo_rules, document, origin, pseudo) { return Ok(None); }
         let mut filtered = self.compute_pseudo_computed(document, origin, origin_style, pseudo, Some(text))?;
         filtered.direction = origin_style.direction;
         filtered.writing_mode = origin_style.writing_mode;
@@ -9553,6 +9561,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
         self.quote_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_quote_pseudo_rule);
         self.generated_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_content_pseudo_rule);
         self.marker_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_marker_pseudo_rule);
+        self.typographic_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_typographic_pseudo_rule);
         self.counter_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_counter_pseudo_rule);
         let environment = self.environment;
         let media = self.media_results.get_mut();
@@ -44409,6 +44418,7 @@ mod incremental_style_tests {
             (&left.quote_pseudo_rules, &right.quote_pseudo_rules),
             (&left.generated_pseudo_rules, &right.generated_pseudo_rules),
             (&left.marker_pseudo_rules, &right.marker_pseudo_rules),
+            (&left.typographic_pseudo_rules, &right.typographic_pseudo_rules),
             (&left.counter_pseudo_rules, &right.counter_pseudo_rules),
         ] {
             assert_eq!(a.tags, b.tags);
@@ -44716,6 +44726,7 @@ mod incremental_style_tests {
             (&extended.quote_pseudo_rules, &full.quote_pseudo_rules),
             (&extended.generated_pseudo_rules, &full.generated_pseudo_rules),
             (&extended.marker_pseudo_rules, &full.marker_pseudo_rules),
+            (&extended.typographic_pseudo_rules, &full.typographic_pseudo_rules),
             (&extended.counter_pseudo_rules, &full.counter_pseudo_rules),
         ] {
             assert_eq!(left.tags, right.tags);
