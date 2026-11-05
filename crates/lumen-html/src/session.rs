@@ -1880,6 +1880,7 @@ impl RenderSession {
             _=>false,
         } {return Ok(());}
         let first_arrival = previous.is_none() && image.is_some();
+        let replaced = previous.is_some() && image.is_some();
         match (at,image) {
             (Ok(at),Some(image))=>self.node_bitmaps[at]=(node,image,metadata),
             (Ok(at),None)=>{self.node_bitmaps.remove(at);},
@@ -1891,6 +1892,15 @@ impl RenderSession {
             // box took its geometry from the image.
             self.bitmap_arrivals.push(node);
             self.failed_frame = None;
+            self.paint_revision = self.paint_revision.wrapping_add(1);
+            self.frame_id = self.frame_id.wrapping_add(1);
+            return Ok(());
+        }
+        if replaced && self.cached.is_some() && self.bitmap_arrivals.is_empty() {
+            // A new frame of a video or canvas, or another source: only the
+            // element and the boxes it sizes are laid out again.
+            self.discard_frame();
+            self.layout_cache.invalidate_changed(&self.document, &[node], &[], &[], &|_| false);
             self.paint_revision = self.paint_revision.wrapping_add(1);
             self.frame_id = self.frame_id.wrapping_add(1);
             return Ok(());
@@ -10918,6 +10928,26 @@ mod tests {
     fn reference_list(source: &str, width: u32, height: u32) -> DisplayList {
         let document = crate::html::parse(source, 4096).unwrap();
         RenderSession::new(document).display_list(width, height, &NoText).unwrap().clone()
+    }
+
+    #[test]
+    fn a_replaced_canvas_bitmap_lays_out_only_its_boxes() {
+        let rows: alloc::string::String = (0..120).map(|row| alloc::format!("<p>row {row}</p>")).collect();
+        let source = alloc::format!("<body style='margin:0'>{rows}<canvas id='c' width='2' height='1' style='width:4px;height:2px'></canvas></body>");
+        let document = crate::html::parse(&source, 4096).unwrap();
+        let node = find(&document, "#c");
+        let mut session = RenderSession::new(document);
+        let frame = |blue: u8| Arc::new(ImageData { width: 2, height: 1, pixels: alloc::vec![0, 0, blue, 255, 0, 0, blue, 255].into() });
+        session.set_node_bitmap(node, Some(frame(1))).unwrap();
+        session.display_list(200, 4000, &NoText).unwrap();
+        let next = frame(2);
+        session.set_node_bitmap(node, Some(next.clone())).unwrap();
+        let before = session.invalidation_stats();
+        let list = session.display_list(200, 4000, &NoText).unwrap().clone();
+        let after = session.invalidation_stats();
+        // A video or canvas publishes a new bitmap every frame.
+        assert!(after.boxes_laid_out - before.boxes_laid_out < 20, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
+        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { image, .. } if Arc::ptr_eq(image, &next))));
     }
 
     #[test]
