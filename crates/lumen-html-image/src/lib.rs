@@ -2350,7 +2350,16 @@ fn resource_edge_coordinate(value:i64,length:u32,edge:lumen_common::filter::reso
     };usize::try_from(mapped).ok()
 }
 fn resource_premultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSpace,opaque:bool) {
-    use lumen_common::color::Color;
+    use lumen_common::color::{Color,ColorSpace};
+    if space==ColorSpace::Srgb{
+        // sRGB to sRGB converts nothing; skip the per-pixel colour conversion.
+        for pixel in image.pixels.chunks_exact_mut(4){
+            let alpha=if opaque{1.0}else{f32::from(pixel[3])/255.0};
+            for channel in 0..3{pixel[channel]=(f32::from(pixel[channel])/255.0*alpha*255.0).round().clamp(0.0,255.0) as u8;}
+            if opaque{pixel[3]=255;}
+        }
+        return;
+    }
     for pixel in image.pixels.chunks_exact_mut(4){
         let color=Color::rgba8([pixel[0],pixel[1],pixel[2],pixel[3]]).to(space);
         let alpha=if opaque{1.0}else{color.alpha};
@@ -2359,7 +2368,12 @@ fn resource_premultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSp
     }
 }
 fn resource_demultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSpace) {
-    use lumen_common::color::Color;
+    use lumen_common::color::{Color,ColorSpace};
+    if space==ColorSpace::Srgb{
+        for pixel in image.pixels.chunks_exact_mut(4){let alpha=f32::from(pixel[3])/255.0;
+            for channel in 0..3{pixel[channel]=if alpha>0.0{((f32::from(pixel[channel])/255.0/alpha).clamp(0.0,1.0)*255.0+0.5) as u8}else{0};}}
+        return;
+    }
     for pixel in image.pixels.chunks_exact_mut(4){let alpha=f32::from(pixel[3])/255.0;
         let components=if alpha>0.0{core::array::from_fn(|channel|(f32::from(pixel[channel])/255.0/alpha).clamp(0.0,1.0))}else{[0.0;3]};
         pixel.copy_from_slice(&Color::new(space,components,alpha,0).to_rgba8());}
@@ -2442,13 +2456,20 @@ fn blur_resource_image(input:Rgba8Image,input_region:FilterPixelRegion,target:Fi
     occupied.checked_add(scratch).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
     let left=usize::try_from(target.left.checked_sub(expanded.left).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
     let top=usize::try_from(target.top.checked_sub(expanded.top).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
+    // A true Gaussian costs O(sigma) per pixel; from 2 device pixels on, three box
+    // passes per axis approximate it within the error Filter Effects allows.
+    let operating=sigma.map(|sigma|sigma*scale);let boxed=operating.iter().all(|sigma|*sigma>=2.0);
     for channel in 0..4{
         let mut plane=Vec::new();plane.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
         occupied.checked_add(scratch).and_then(|bytes|bytes.checked_add(plane.capacity().saturating_sub(pixels))).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
         plane.extend(working.pixels.chunks_exact(4).map(|pixel|pixel[channel]));
-        let source=image::GrayImage::from_raw(expanded.width,expanded.height,plane).ok_or(ImageError::InvalidViewport)?;
-        let blurred=image::imageops::blur_advanced(&source,parameters);
-        for y in 0..target.height as usize{for x in 0..target.width as usize{output.pixels[(y*target.width as usize+x)*4+channel]=blurred.as_raw()[(y+top)*expanded.width as usize+x+left];}}
+        let blurred=if boxed{
+            shadow::box_blur_plane_axes(&mut plane,expanded.width as usize,expanded.height as usize,operating,occupied)?;plane
+        }else{
+            let source=image::GrayImage::from_raw(expanded.width,expanded.height,plane).ok_or(ImageError::InvalidViewport)?;
+            image::imageops::blur_advanced(&source,parameters).into_raw()
+        };
+        for y in 0..target.height as usize{for x in 0..target.width as usize{output.pixels[(y*target.width as usize+x)*4+channel]=blurred[(y+top)*expanded.width as usize+x+left];}}
     }
     resource_demultiply(&mut output,space);
     Ok(output)
@@ -6536,6 +6557,44 @@ mod tests {
         let mut sum=0u64;let mut max=0u8;
         for (a,b) in fast.iter().zip(&exact) {let d=a.abs_diff(*b);sum+=u64::from(d);max=max.max(d);}
         assert!(max<=8 && (sum as f64/exact.len() as f64)<2.0,"max {max} mean {}",sum as f64/exact.len() as f64);
+    }
+
+    #[test]
+    fn srgb_resource_premultiply_matches_the_colour_conversion() {
+        use lumen_common::color::{Color,ColorSpace};
+        let mut pixels=Vec::with_capacity(256*256*4);
+        for alpha in 0..=255u8 {for value in 0..=255u8 {pixels.extend_from_slice(&[value,255-value,value/3,alpha]);}}
+        let image=Rgba8Image{width:256,height:256,pixels};
+        for opaque in [false,true] {
+            let mut fast=image.clone();resource_premultiply(&mut fast,ColorSpace::Srgb,opaque);
+            for (pixel,input) in fast.pixels.chunks_exact(4).zip(image.pixels.chunks_exact(4)) {
+                let color=Color::rgba8([input[0],input[1],input[2],input[3]]).to(ColorSpace::Srgb);
+                let alpha=if opaque{1.0}else{color.alpha};
+                for channel in 0..3 {assert_eq!(pixel[channel],(color.components[channel]*alpha*255.0).round().clamp(0.0,255.0) as u8,"premultiply {input:?} opaque={opaque}");}
+            }
+        }
+        let mut fast=image.clone();resource_demultiply(&mut fast,ColorSpace::Srgb);
+        for (pixel,input) in fast.pixels.chunks_exact(4).zip(image.pixels.chunks_exact(4)) {
+            let alpha=f32::from(input[3])/255.0;
+            let components=if alpha>0.0{core::array::from_fn(|channel|(f32::from(input[channel])/255.0/alpha).clamp(0.0,1.0))}else{[0.0;3]};
+            assert_eq!(pixel,&Color::new(ColorSpace::Srgb,components,alpha,0).to_rgba8(),"demultiply {input:?}");
+        }
+    }
+
+    #[test]
+    fn per_axis_box_blur_approximates_the_exact_gaussian() {
+        let (w,h)=(200usize,160usize);
+        let mut plane=vec![0u8;w*h];
+        for y in 50..110 {for x in 60..140 {plane[y*w+x]=if (x/7+y/9)%2==0 {255} else {180};}}
+        for sigma in [[2.0f32,2.0],[6.0,6.0],[12.0,4.0],[3.0,15.0]] {
+            let exact=image::imageops::blur_advanced(&image::GrayImage::from_raw(w as u32,h as u32,plane.clone()).unwrap(),
+                image::imageops::GaussianBlurParameters::new_anisotropic_sigma(sigma[0],sigma[1])).into_raw();
+            let mut fast=plane.clone();
+            shadow::box_blur_plane_axes(&mut fast,w,h,sigma,0).unwrap();
+            let mut sum=0u64;let mut max=0u8;
+            for (a,b) in fast.iter().zip(&exact) {let d=a.abs_diff(*b);sum+=u64::from(d);max=max.max(d);}
+            assert!(max<=16 && (sum as f64/exact.len() as f64)<1.5,"sigma {sigma:?}: max {max} mean {}",sum as f64/exact.len() as f64);
+        }
     }
 
     #[test]

@@ -218,7 +218,9 @@ fn blur_sizes(blur: f32, scale: f32) -> Result<([usize; 3], usize), ImageError> 
 /// approximation as CSS box shadows. `reserved_bytes` accounts for storage
 /// owned by the caller while this helper is active (for example the temporary
 /// pixmap from which a canvas alpha plane was extracted).
-// Shadows use three box passes (cost independent of radius, bounded scratch); SVG filters need exact per-axis sigma, so they use image::imageops' true Gaussian.
+// Shadows use three box passes (cost independent of radius, bounded scratch). SVG filters
+// with a deviation below 2 device pixels use image::imageops' true Gaussian; larger ones
+// use the per-axis box passes of `box_blur_plane_axes`.
 pub(super) fn blur_alpha_mask(
     mask: &mut [u8],
     width: usize,
@@ -262,6 +264,53 @@ pub(super) fn blur_alpha_mask(
     for x0 in (0..width).step_by(LANES) {
         let lanes = LANES.min(width - x0);
         scan_columns(&scratch, mask, width, height, x0, lanes, sizes, &mut ring);
+    }
+    super::pool::recycle(scratch);
+    Ok(())
+}
+
+/// Blur a plane in place with a separate three-box Gaussian approximation per axis, for
+/// device-pixel standard deviations of at least 2 (Filter Effects allows this for
+/// feGaussianBlur). Cost does not depend on the deviation, unlike a true convolution.
+/// Samples outside the plane count as zero. `None` when the scratch would exceed the
+/// layer budget.
+pub(super) fn box_blur_plane_axes(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    sigma: [f32; 2],
+    reserved_bytes: usize,
+) -> Result<(), ImageError> {
+    let pixels = width.checked_mul(height).ok_or(ImageError::TooLarge)?;
+    if pixels != mask.len() || sigma.iter().any(|sigma| !(*sigma >= 2.0)) {
+        return Err(ImageError::InvalidViewport);
+    }
+    let horizontal = blur_sizes(sigma[0] * 2.0, 1.0)?.0;
+    let vertical = blur_sizes(sigma[1] * 2.0, 1.0)?.0;
+    let ring_len = horizontal
+        .iter()
+        .sum::<usize>()
+        .max(vertical.iter().sum::<usize>())
+        .checked_mul(LANES)
+        .ok_or(ImageError::TooLarge)?;
+    pixels
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(ring_len.checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(reserved_bytes))
+        .filter(|bytes| *bytes <= MAX_LAYER_BYTES)
+        .ok_or(ImageError::TooLarge)?;
+    let mut scratch = super::pool::take_zeroed(pixels)?;
+    let mut ring = Vec::new();
+    ring.try_reserve_exact(ring_len)
+        .map_err(|_| ImageError::TooLarge)?;
+    ring.resize(ring_len, 0);
+    for y in 0..height {
+        let start = y * width;
+        scan(&mask[start..], &mut scratch[start..], width, 1, horizontal, &mut ring);
+    }
+    for x0 in (0..width).step_by(LANES) {
+        let lanes = LANES.min(width - x0);
+        scan_columns(&scratch, mask, width, height, x0, lanes, vertical, &mut ring);
     }
     super::pool::recycle(scratch);
     Ok(())
