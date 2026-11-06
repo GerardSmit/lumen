@@ -2737,9 +2737,14 @@ impl RetainedLayoutCache {
         let mut reason = 0;
         if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
             let entry = &self.entries[slot];
-            reason = if entry.key != *key && !(entry.translatable && entry.key.serves_translated(key)) { 1 }
+            // A fragment that resolved no size against a block size does not
+            // depend on its parent's definite height (`reads_block_basis`).
+            let unread = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: None, ..key.clone() };
+            let key = &if entry.reads_block_basis { key.clone() } else { unread(key) };
+            let entry_key = if entry.reads_block_basis { entry.key.clone() } else { unread(&entry.key) };
+            reason = if entry_key != *key && !(entry.translatable && entry_key.serves_translated(key)) { 1 }
                 else if !self.same_style(&entry.style, style) { 2 }
-                else if !self.same_style(&entry.parent_style, parent_style) { 3 }
+                else if !self.same_parent_style(entry, parent_style) { 3 }
                 else { 4 };
             if reason == 4 {
                 if let Some(shift) = entry.shift_to(at, key.cull) {
@@ -2789,9 +2794,7 @@ impl RetainedLayoutCache {
         // The parent's definite height reaches the subtree only through
         // sizes resolved against it, which `reads_block_basis` records.
         let parent_height = |key: &RetainedFragmentKey| if entry.reads_block_basis { key.parent_height } else { None };
-        let same_parent = self.same_style(&entry.parent_style, parent_style) || !entry.reads_block_basis
-            && entry.parent_style.writing_mode == css::WritingMode::HorizontalTb
-            && self.same_style(&{ let mut retained = (*entry.parent_style).clone(); retained.height = parent_style.height; retained }, parent_style);
+        let same_parent = self.same_parent_style(entry, parent_style);
         let compared = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: parent_height(key), ..unplaced(key) };
         if compared(&entry.key) != compared(key)
             || rare(&entry.key) != rare(key)
@@ -2802,6 +2805,15 @@ impl RetainedLayoutCache {
         }
         let shift = (at.0 - entry.origin.0, at.1 - entry.origin.1);
         (shift.0.is_finite() && shift.1.is_finite()).then(|| (Rc::clone(entry), shift))
+    }
+
+    /// The parent's style matches, or differs only in a height the fragment
+    /// never resolved anything against (`RetainedFragment::reads_block_basis`).
+    fn same_parent_style(&self, entry: &RetainedFragment, parent_style: &Style) -> bool {
+        self.same_style(&entry.parent_style, parent_style) || !entry.reads_block_basis
+            && entry.parent_style.writing_mode == css::WritingMode::HorizontalTb
+            && entry.parent_style.height != parent_style.height
+            && self.same_style(&{ let mut retained = (*entry.parent_style).clone(); retained.height = parent_style.height; retained }, parent_style)
     }
 
     fn remove_slot(&mut self, slot: usize) {

@@ -1908,3 +1908,36 @@ fn grid_row_measurement_replays_unchanged_item_contents() {
     let measured = session.invalidation_stats().boxes_measured - before;
     assert!(measured < 100, "an edit inside the item measured {measured} boxes");
 }
+
+#[test]
+fn grid_item_contents_replay_after_the_item_height_changes() {
+    // The row, and so the stretched item's definite height, grows; contents
+    // that resolve nothing against that height still replay.
+    let source = format!(
+        "<style>body{{margin:0}}#g{{display:grid;grid-template-columns:200px 1fr}}p{{margin:2px}}</style>\
+         <div id=g><div id=side>side</div><div id=main>{}</div></div>",
+        paras(300)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    attr(&mut session, "#p150", "style", "height:30px");
+    render(&mut session);
+    let before = counts(&session);
+    attr(&mut session, "#p150", "style", "height:60px");
+    render(&mut session);
+    let laid_out = counts(&session).boxes - before.boxes;
+    assert!(laid_out < 100, "a taller paragraph laid out {laid_out} boxes");
+}
+
+diff!(
+    grid_item_percentage_contents_follow_the_item_height,
+    "<style>body{margin:0}#g{display:grid;grid-template-columns:100px 1fr;grid-template-rows:auto}\
+     #pct{height:50%;background:red}p{margin:2px}</style>\
+     <div id=g><div id=side>side</div><div id=main><div id=pct>half</div><p id=a>a</p><p id=b>b</p></div></div>",
+    [
+        |s| attr(s, "#side", "style", "height:300px"),
+        |s| attr(s, "#a", "style", "height:80px"),
+        |s| attr(s, "#side", "style", "height:40px"),
+    ]
+);
