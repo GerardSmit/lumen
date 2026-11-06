@@ -6553,6 +6553,9 @@ impl RenderSession {
         let mut targets = Vec::new();
         let mut changed = Vec::new();
         let mut subtrees = Vec::new();
+        // The nodes the mutations change themselves, as opposed to those
+        // their selectors reach, whose styles may stay as they were.
+        let mut mutated_nodes = Vec::new();
         // (target, added, removed, is character data)
         let mut structural: Vec<(NodeId, Option<NodeId>, Option<NodeId>, bool)> = Vec::new();
         if mutations_pending {
@@ -6579,6 +6582,7 @@ impl RenderSession {
                 match &mutation.kind {
                     MutationKind::CharacterData => structural.push((mutation.target, None, None, true)),
                     MutationKind::Attribute(name) => {
+                        mutated_nodes.push(mutation.target);
                         if !layout_inert_attribute(&self.document, mutation.target, name.as_str()) {
                             subtrees.push(mutation.target);
                         }
@@ -6593,9 +6597,10 @@ impl RenderSession {
         }
         let rule_subjects = self.rule_subjects.take().unwrap_or_default();
         let subjects_taken = !rule_subjects.is_empty();
-        // Rule subjects are only candidates: one whose style stays as it was
-        // changes nothing, so they are checked against SVG references after
-        // the restyle, the mutated nodes before it.
+        // Rule subjects and the elements mutations reach through selectors are
+        // only candidates: one whose style stays as it was changes nothing, so
+        // they are checked against SVG references after the restyle, the
+        // mutated nodes before it.
         let mutated = targets.len();
         let mut forced_subjects = Vec::new();
         for (node, pseudo) in rule_subjects {
@@ -6608,7 +6613,7 @@ impl RenderSession {
                 forced_subjects.push(node);
             }
         }
-        let touched: Vec<NodeId> = targets[..mutated].iter().chain(subtrees.iter()).copied().collect();
+        let touched: Vec<NodeId> = mutated_nodes.iter().chain(subtrees.iter()).copied().collect();
         if self.svg_change_not_local(&touched, &structural) {
             self.invalidation_stats.bails[5] += 1;
             // `<use>` instances can show stale fragments of the changed subtree anywhere, and any
@@ -6635,9 +6640,9 @@ impl RenderSession {
                 return;
             }
         };
-        if subjects_taken {
-            let restyled_subjects: Vec<NodeId> = restyled.iter().map(|&(node, _)| node).chain(forced_subjects.iter().copied()).collect();
-            if self.svg_change_not_local(&restyled_subjects, &[]) {
+        if subjects_taken || mutated > 0 {
+            let restyled_candidates: Vec<NodeId> = restyled.iter().map(|&(node, _)| node).chain(forced_subjects.iter().copied()).collect();
+            if self.svg_change_not_local(&restyled_candidates, &[]) {
                 self.invalidation_stats.bails[5] += 1;
                 self.rules_reset = true;
                 return;
@@ -7880,6 +7885,28 @@ mod tests {
         session.document_mut().set_attribute(shape,"fill","green").unwrap();
         let changed=session.display_list(100,80,&NoText).unwrap().clone();
         assert_eq!(session.invalidation_stats().bails[5],bails+1,"the symbol a <use> instance renders changed");
+        assert_eq!(changed,fresh(&session));
+    }
+
+    #[test]
+    fn selector_reached_svg_resources_bail_only_when_their_style_changes() {
+        let markup="<!doctype html><style>body[pending] rect{stroke-width:1} body.dark rect{fill:green}</style>\
+            <body pending><svg width=40 height=20><defs><clipPath id=c><rect width=10 height=10 /></clipPath></defs>\
+            <rect width=20 height=20 fill=blue clip-path='url(#c)' /></svg><p id=text>x</p></body>";
+        let document=crate::html::parse(markup,128).unwrap();
+        let body=crate::selector::query_selector(&document,document.root(),"body").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        session.display_list(100,80,&NoText).unwrap();
+        let fresh=|session:&RenderSession|{let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());fresh.display_list(100,80,&NoText).unwrap().clone()};
+        let bails=session.invalidation_stats().bails[5];
+        // `body[pending] rect` reaches the clip path's rect, which keeps its style.
+        session.document_mut().set_attribute(body,"pending","later").unwrap();
+        let changed=session.display_list(100,80,&NoText).unwrap().clone();
+        assert_eq!(session.invalidation_stats().bails[5],bails,"the reached rect keeps its style");
+        assert_eq!(changed,fresh(&session));
+        session.document_mut().set_attribute(body,"class","dark").unwrap();
+        let changed=session.display_list(100,80,&NoText).unwrap().clone();
+        assert_eq!(session.invalidation_stats().bails[5],bails+1,"the clip path's rect changed fill");
         assert_eq!(changed,fresh(&session));
     }
 
