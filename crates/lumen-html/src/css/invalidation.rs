@@ -331,6 +331,9 @@ pub(crate) struct InvalidationSets {
     /// their siblings (the usual relative walk), or elements below `E`'s
     /// parent, which `Collector::reach` then also visits.
     free_relatives: bool,
+    /// Some `:has()` argument starts with `+` or `~`: its anchor can precede
+    /// the element the argument matches.
+    has_sibling_relation: bool,
 }
 
 /// The subject keys of `:has()` arguments, as seen by a `Collector`.
@@ -613,6 +616,7 @@ impl InvalidationSets {
                 }
                 LogicalPseudo::Has(relatives) => {
                     let relatives: &[RelativeSelector] = relatives;
+                    self.has_sibling_relation |= relatives.iter().any(|relative| matches!(relative.relation, Relation::Adjacent | Relation::Following));
                     // A `:has()` in another compound changes the match of
                     // that compound only, so it reaches what the compound's
                     // position reaches from each anchor its key admits.
@@ -1023,7 +1027,7 @@ impl InvalidationSets {
             siblings: self.unkeyed_relatives || self.relative_keys.iter().any(|(_, siblings)| *siblings),
         };
         let work_limit = limit * 16 + document.node_count() * 8;
-        Collector { document, anchors: &self.anchors, relatives, free: self.free_relatives, seen: BTreeSet::new(), nodes: Vec::new(), limit, work: 0, work_limit }
+        Collector { document, anchors: &self.anchors, relatives, free: self.free_relatives.then_some(self.has_sibling_relation), seen: BTreeSet::new(), nodes: Vec::new(), limit, work: 0, work_limit }
     }
 
     /// The elements whose styles a change of element state can change: each
@@ -1097,8 +1101,9 @@ struct Collector<'a> {
     document: &'a Document,
     anchors: &'a [(AnchorKey, u8)],
     relatives: Relatives<'a>,
-    /// `InvalidationSets::free_relatives`.
-    free: bool,
+    /// `InvalidationSets::free_relatives`, with whether a `:has()` anchor can
+    /// precede the element its argument matches.
+    free: Option<bool>,
     seen: BTreeSet<(u64, u32, u32)>,
     nodes: Vec<NodeId>,
     limit: usize,
@@ -1247,28 +1252,41 @@ impl Collector<'_> {
                 }
                 current = self.document.composed_parent(id).ok().flatten();
             }
-            if self.free {
+            if let Some(preceding) = self.free {
                 // Anchors below the parent (`InvalidationSets::free_relatives`).
-                let scope = self.document.composed_parent(node).ok().flatten().unwrap_or(node);
-                let mut pending = Vec::from([scope]);
-                while let Some(current) = pending.pop() {
-                    let mut child = self.document.first_child(current).ok().flatten();
-                    while let Some(id) = child {
-                        if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+                // Combinators lead down and right, so a compound matched at
+                // `node` changes matches in its subtree and those of its
+                // following siblings, whose ancestors there are those
+                // subtrees' roots and elements; an anchor that can precede
+                // its match may also be any earlier sibling's.
+                let first = if preceding { self.document.composed_parent(node).ok().flatten().and_then(|parent| self.document.first_child(parent).ok().flatten()) } else { None };
+                let mut root = first.or(Some(node));
+                while let Some(start) = root {
+                    if matches!(self.document.kind(start), Ok(NodeKind::Element { .. })) {
+                        let mut pending = Vec::from([start]);
+                        while let Some(current) = pending.pop() {
                             // Any key: such an anchor can hold the match below it.
-                            if relatives {
-                                self.relative(id, false)?;
+                            if current != node {
+                                if relatives {
+                                    self.relative(current, false)?;
+                                }
+                                if anchored {
+                                    self.anchor(current)?;
+                                }
                             }
-                            if anchored {
-                                self.anchor(id)?;
+                            let mut child = self.document.first_child(current).ok().flatten();
+                            while let Some(id) = child {
+                                if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+                                    pending.push(id);
+                                }
+                                child = self.document.next_sibling(id).ok().flatten();
                             }
-                            pending.push(id);
+                            if let Some(shadow) = self.document.shadow_root(current).ok().flatten() {
+                                pending.push(shadow);
+                            }
                         }
-                        child = self.document.next_sibling(id).ok().flatten();
                     }
-                    if let Some(root) = self.document.shadow_root(current).ok().flatten() {
-                        pending.push(root);
-                    }
+                    root = self.document.next_sibling(start).ok().flatten();
                 }
             }
         }
@@ -1402,6 +1420,16 @@ mod tests {
         document.insert_before(section, added, None).unwrap();
         let affected = sets.affected(&document, document.mutations()).expect("a child list change stays bounded");
         assert!(!affected.contains(&far));
+    }
+
+    #[test]
+    fn has_with_a_nested_combinator_after_a_sibling_relation_reaches_earlier_anchors() {
+        let css = ".a:has(~ :is(.peer ~ *)) { color: red }";
+        let (mut document, sets) = setup("<div><p class=a>h</p><p>e</p><p>x</p></div><p class=a>far</p>", css);
+        let paragraphs = elements(&document, "p");
+        document.set_attribute(paragraphs[1], "class", "peer").unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        assert!(affected.contains(&paragraphs[0]));
     }
 
     #[test]
