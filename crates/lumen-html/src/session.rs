@@ -532,7 +532,39 @@ fn layout_inert_attribute(document: &Document, node: NodeId, name: &str) -> bool
         || name.starts_with("data-")
         || (name.starts_with("on") && name.len() > 2)
         || (name == "href" && matches!(crate::forms::html_element_local_name(document, node), Some("a" | "area")))
+        || (matches!(document.kind(node), Ok(NodeKind::Element { namespace: crate::Namespace::Html, .. }))
+            && HTML_ATTRIBUTES.binary_search(&name).is_err())
 }
+
+/// Every attribute HTML defines, current and obsolete, sorted. Layout and
+/// paint read only these directly; any other attribute of an HTML element
+/// (`pending` on `body`, a custom element's own attributes) reaches the
+/// rendering only through selectors and `attr()`, which the restyle compares.
+const HTML_ATTRIBUTES: &[&str] = &[
+    "abbr", "accept", "accept-charset", "accesskey", "action", "align", "alink", "allow", "allowfullscreen", "alpha",
+    "alt", "anchor", "archive", "as", "async", "autocapitalize", "autocomplete", "autocorrect", "autofocus",
+    "autoplay", "axis", "background", "behavior", "bgcolor", "blocking", "border", "bordercolor", "bottommargin",
+    "cellpadding", "cellspacing", "char", "charoff", "charset", "checked", "cite", "class", "classid", "clear",
+    "closedby", "code", "codebase", "codetype", "color", "colorspace", "cols", "colspan", "command", "commandfor",
+    "compact", "content", "contenteditable", "controls", "coords", "crossorigin", "data", "datafld", "dataformatas",
+    "datasrc", "datetime", "declare", "decoding", "default", "defer", "dir", "direction", "dirname", "disabled",
+    "download", "draggable", "enctype", "enterkeyhint", "event", "exportparts", "face", "fetchpriority", "for",
+    "form", "formaction", "formenctype", "formmethod", "formnovalidate", "formtarget", "frame", "frameborder",
+    "headers", "headingoffset", "headingreset", "height", "hidden", "high", "href", "hreflang", "hspace",
+    "http-equiv", "id", "imagesizes", "imagesrcset", "inert", "inputmode", "integrity", "interestfor", "is", "ismap",
+    "itemid", "itemprop", "itemref", "itemscope", "itemtype", "kind", "label", "lang", "language", "leftmargin",
+    "link", "list", "loading", "longdesc", "loop", "low", "lowsrc", "marginheight", "marginwidth", "max", "maxlength",
+    "media", "method", "min", "minlength", "multiple", "muted", "name", "nohref", "nomodule", "nonce", "noresize",
+    "noshade", "novalidate", "nowrap", "open", "optimum", "part", "pattern", "ping", "placeholder", "playsinline",
+    "popover", "popovertarget", "popovertargetaction", "poster", "preload", "profile", "readonly", "referrerpolicy",
+    "rel", "required", "rev", "reversed", "rightmargin", "rows", "rowspan", "rules", "sandbox", "scheme", "scope",
+    "scrollamount", "scrolldelay", "scrolling", "selected", "shadowrootclonable", "shadowrootcustomelementregistry",
+    "shadowrootdelegatesfocus", "shadowrootmode", "shadowrootserializable", "shape", "size", "sizes", "slot", "span",
+    "spellcheck", "src", "srcdoc", "srclang", "srcset", "standby", "start", "step", "style", "summary", "tabindex",
+    "target", "text", "title", "topmargin", "translate", "truespeed", "type", "usemap", "valign", "value",
+    "valuetype", "version", "vlink", "vspace", "width", "wrap", "writingsuggestions", "xml:base", "xml:lang",
+    "xml:space", "xmlns", "xmlns:xlink",
+];
 
 /// Merges touching rects and bounds the list, collapsing it to one rect
 /// when it stays longer than `MAX_DAMAGE_RECTS`.
@@ -7886,6 +7918,37 @@ mod tests {
         let changed=session.display_list(100,80,&NoText).unwrap().clone();
         assert_eq!(session.invalidation_stats().bails[5],bails+1,"the symbol a <use> instance renders changed");
         assert_eq!(changed,fresh(&session));
+    }
+
+    #[test]
+    fn attributes_html_does_not_define_keep_descendant_fragments() {
+        assert!(HTML_ATTRIBUTES.windows(2).all(|pair| pair[0] < pair[1]), "binary search needs a sorted list");
+        let markup="<!doctype html><style>body{margin:0} p{height:10px;margin:0} body[pending] #first{height:20px}</style>\
+            <body pending><p id=first>one</p><p>two</p><p>three</p><x-widget><p>four</p></x-widget></body>";
+        let document=crate::html::parse(markup,128).unwrap();
+        let get=|document:&Document,id:&str|crate::selector::query_selector(document,document.root(),id).unwrap().unwrap();
+        let (body,widget)=(get(&document,"body"),get(&document,"x-widget"));
+        let mut session=RenderSession::new(document);
+        session.display_list(100,80,&NoText).unwrap();
+        for (node,name,value) in [(body,"ready",""),(widget,"state","open"),(body,"pending","later")] {
+            assert!(layout_inert_attribute(session.document(),node,name));
+            let passes=session.invalidation_stats().layout_passes;
+            session.document_mut().set_attribute(node,name,value).unwrap();
+            let changed=session.display_list(100,80,&NoText).unwrap().clone();
+            assert!(session.invalidation_stats().layout_passes==passes || session.layout_cache_stats().hits>=2,
+                "{name}: the frame is kept or its unchanged paragraphs replay");
+            let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());
+            assert_eq!(&changed,fresh.display_list(100,80,&NoText).unwrap(),"{name}");
+        }
+        session.document_mut().remove_attribute(body,"pending").unwrap();
+        let changed=session.display_list(100,80,&NoText).unwrap().clone();
+        let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());
+        assert_eq!(&changed,fresh.display_list(100,80,&NoText).unwrap(),"a selector-visible removal restyles");
+        for (element,name) in [("td","colspan"),("ol","start"),("img","width"),("body","bgcolor"),("h1","headingoffset")] {
+            let document=crate::html::parse(&alloc::format!("<table><tr><{element}>"),16).unwrap();
+            let node=crate::selector::query_selector(&document,document.root(),element).unwrap().unwrap();
+            assert!(!layout_inert_attribute(&document,node,name),"{element} {name}");
+        }
     }
 
     #[test]
