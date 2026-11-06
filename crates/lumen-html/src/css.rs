@@ -25069,6 +25069,13 @@ impl core::ops::BitOr for AncestorBloom {
     }
 }
 
+impl core::ops::BitAnd for AncestorBloom {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self([self.0[0] & other.0[0], self.0[1] & other.0[1], self.0[2] & other.0[2], self.0[3] & other.0[3]])
+    }
+}
+
 impl core::ops::BitOrAssign for AncestorBloom {
     fn bitor_assign(&mut self, other: Self) { *self = *self | other; }
 }
@@ -25510,7 +25517,7 @@ impl Selector {
         if self.part.is_some() || self.host || self.slotted {
             return AncestorBloom::EMPTY;
         }
-        let mut mask = AncestorBloom::EMPTY;
+        let mut mask = self.logical_ancestor_mask();
         let mut current = self;
         while let Some((Relation::Child | Relation::Descendant, ancestor)) = &current.ancestor {
             if !(ancestor.host || ancestor.slotted || ancestor.part.is_some()) {
@@ -25523,8 +25530,23 @@ impl Selector {
                 for class in &ancestor.classes {
                     mask |= bloom_bits(2, class);
                 }
+                mask |= ancestor.logical_ancestor_mask();
             }
             current = &**ancestor;
+        }
+        mask
+    }
+
+    /// The ancestor keys every alternative of this compound's `:is()` and
+    /// `:where()` arguments requires. A match needs one alternative, so only
+    /// the bits all of them share are required: `:where(.space-y-4 > *)`
+    /// needs a `.space-y-4` ancestor, `:where(.dark, .dark *)` needs nothing.
+    fn logical_ancestor_mask(&self) -> AncestorBloom {
+        let mut mask = AncestorBloom::EMPTY;
+        for pseudo in &self.logical {
+            let (LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors)) = pseudo else { continue };
+            let Some((first, rest)) = selectors.split_first() else { continue };
+            mask |= rest.iter().fold(first.ancestor_mask(), |shared, selector| shared & selector.ancestor_mask());
         }
         mask
     }
@@ -45116,6 +45138,27 @@ mod incremental_style_tests {
         ] {
             let (reds, _) = filtered_reds(html, css);
             assert_eq!(reds, expected, "{css}");
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_uses_ancestors_every_logical_alternative_shares() {
+        let html = "<div class=a><i id=i1 class=c>x</i><i id=i2>y</i></div><div class=b><i id=i3 class=c>z</i></div>\
+                    <section class=a><div class=d><i id=i4>w</i></div></section><i id=i5 class=a>v</i>";
+        for (css, expected, rejects) in [
+            (":where(.a > :not(:last-child)) { color: red }", vec!["i1"], true),
+            (":is(.a > *) { color: red }", vec!["i1", "i2", "i4"], true),
+            (":is(.a .d > *) { color: red }", vec!["i4"], true),
+            (":is(.a > *, .b > *) { color: red }", vec!["i1", "i2", "i3", "i4"], false),
+            (":where(.a, .a *) { color: red }", vec!["i1", "i2", "i4", "i5"], false),
+            (":is(.a *, .b > .c) .c { color: red }", vec![], false),
+            (":is(:is(.a > *)) { color: red }", vec!["i1", "i2", "i4"], true),
+            ("div:is(.a *) > i { color: red }", vec!["i4"], true),
+        ] {
+            let (reds, rejected) = filtered_reds(html, css);
+            let reds = reds.into_iter().filter(|id| id.starts_with('i')).collect::<Vec<_>>();
+            assert_eq!(reds, expected, "{css}");
+            if rejects { assert!(rejected > 0, "{css}: rejected {rejected}"); }
         }
     }
 
