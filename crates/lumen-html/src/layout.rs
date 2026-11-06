@@ -1929,8 +1929,10 @@ pub(crate) struct IntrinsicSizes {
     /// Flow children built by a flex or grid container's first intrinsic
     /// pass, kept for the other mode's pass of the same frame.
     children: RefCell<Vec<IntrinsicChildren>>,
-    /// Block sizes of stretched column flex items laid out this frame, so
-    /// nested column flex containers measure each item once per width.
+    /// Block sizes of stretched column flex items and grid items laid out at
+    /// a width, so nested flex and grid containers measure each item once per
+    /// width. They live as long as the item's intrinsic slot: whatever drops
+    /// that (a change inside the item, a resize of an axis it read) drops them.
     stretched: RefCell<Vec<StretchedFlexHeight>>,
     /// Source-ancestry computed styles of list items, which the marker
     /// origin resolves in both intrinsic sizing and box layout.
@@ -2020,7 +2022,6 @@ struct IntrinsicChildren {
 const MAX_INTRINSIC_CHILDREN_MEMO: usize = 64;
 
 struct StretchedFlexHeight {
-    frame: u32,
     id: NodeId,
     width: f32,
     inline_size: f32,
@@ -2029,6 +2030,9 @@ struct StretchedFlexHeight {
     container: Style,
     context: IntrinsicContext,
     axes: u8,
+    /// Images still loading when the item was measured, with the resolver
+    /// generation then; the height holds while they stay pending.
+    pending: Option<(Arc<[(PendingLookup, bool)]>, u64)>,
     height: f32,
 }
 
@@ -2046,6 +2050,10 @@ impl IntrinsicSizes {
     fn drop_slot(&self, slot: usize) {
         self.slots.borrow_mut().remove(&slot);
         self.drop_cell(slot / 2);
+        let mut stretched = self.stretched.borrow_mut();
+        if stretched.iter().any(|entry| entry.id.index() == slot / 2) {
+            stretched.retain(|entry| entry.id.index() != slot / 2);
+        }
     }
     fn drop_cell(&self, index: usize) {
         self.cells.borrow_mut().remove(&index);
@@ -2072,7 +2080,6 @@ impl IntrinsicSizes {
         self.measured.set(0);
         self.reused.set(0);
         self.children.borrow_mut().clear();
-        self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
@@ -2108,6 +2115,7 @@ impl IntrinsicSizes {
     /// Drop the entries that read a viewport axis which changed.
     fn retain_for_resize(&self, width: bool, height: bool) {
         let changed = u8::from(width) | (u8::from(height) << 1);
+        self.stretched.borrow_mut().retain(|entry| entry.axes & changed == 0);
         self.cells.borrow_mut().retain(|_, entries| {
             entries.retain(|entry| entry.provenance.axes & changed == 0);
             !entries.is_empty()
@@ -26803,15 +26811,19 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         };
         let Some(context) = self.intrinsic_context() else { return measure(); };
         let intrinsics = &*self.intrinsics;
-        let frame = intrinsics.frame.get();
-        let hit = intrinsics.stretched.borrow().iter().find(|entry| entry.frame == frame
-            && entry.id == node && entry.width == container_width
+        let images = self.images;
+        let hit = intrinsics.stretched.borrow().iter().find(|entry| entry.id == node
+            && entry.width == container_width
             && entry.inline_size == inline_size
             && entry.parent_height == self.parent_height
             && entry.item == *item && entry.container == *container
-            && entry.context.same_for_slot(&context, node.index() * 2))
-            .map(|entry| (entry.height, entry.axes));
-        if let Some((height, axes)) = hit {
+            && entry.context.same_for_slot(&context, node.index() * 2)
+            && entry.pending.as_ref().is_none_or(|(pending, generation)| images.is_some_and(|images|
+                *generation != 0 && images.generation() == *generation
+                    || pending.iter().all(|(lookup, _)| images.still_pending(lookup)))))
+            .map(|entry| (entry.height, entry.axes, entry.pending.as_ref().map(|(pending, _)| pending.clone())));
+        if let Some((height, axes, pending)) = hit {
+            if let (Some(pending), Some(images)) = (pending, images) { images.replay_pending(&pending); }
             intrinsics.viewport_read((), axes);
             return Ok(height);
         }
@@ -26822,17 +26834,21 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
         }
         if css::viewport_read_counts() != mark.css { axes = 3; }
-        let settled = match (self.images, mark.pending) {
-            (Some(images), Some(since)) => images.pending_mark() == since,
-            _ => true,
+        let pending = match (images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
         };
-        if settled {
-            let mut memo = intrinsics.stretched.borrow_mut();
-            if memo.len() >= MAX_STRETCHED_FLEX_MEMO { memo.remove(0); }
-            memo.push(StretchedFlexHeight { frame, id: node, width: container_width, inline_size,
-                parent_height: self.parent_height, item: item.clone(), container: container.clone(),
-                context, axes, height });
-        }
+        let mut memo = intrinsics.stretched.borrow_mut();
+        if memo.len() >= MAX_STRETCHED_FLEX_MEMO { memo.remove(0); }
+        memo.push(StretchedFlexHeight { id: node, width: container_width, inline_size,
+            parent_height: self.parent_height, item: item.clone(), container: container.clone(),
+            context, axes, pending, height });
         Ok(height)
     }
 
