@@ -2810,14 +2810,20 @@ impl RenderSession {
         }
         if index.is_none() { self.cssom_stylesheet_texts.try_reserve(1).map_err(|_| LayoutError::Css(css::CssError { offset: 0, message: "CSSOM source allocation failed" }))?; }
         let source_index = self.stylesheet_sources.iter().position(|entry| entry.owner == node && entry.identity == identity);
+        // CSSOM text is the serialization of rules the CSSOM already parsed, so
+        // a sheet without an import graph cannot fail to parse. Like Blink's
+        // dirty style sheet contents, it is compiled once, when style is next
+        // needed, however many rules a script inserts before then.
+        let deferred = imports.is_none()
+            && source_index.is_none_or(|index| self.stylesheet_sources[index].source.imports.is_empty());
         let edit = if let Some(index) = source_index {
             let edit = css::prepare_stylesheet_text_edit_with_import_map(&mut self.stylesheet_sources[index].source, text.clone(), imports).map_err(LayoutError::Css)?;
-            if let Err(error) = css::parse_graph_with_topology(&self.stylesheet_sources[index].source, self.media_environment(), css::StylesheetIdentity::Dom(node), &self.cssom_topology_overrides) {
+            if deferred { None }
+            else if let Err(error) = css::parse_graph_with_topology(&self.stylesheet_sources[index].source, self.media_environment(), css::StylesheetIdentity::Dom(node), &self.cssom_topology_overrides) {
                 edit.rollback(&mut self.stylesheet_sources[index].source);
                 return Err(LayoutError::Css(error));
-            }
-            Some(edit)
-        } else { css::parse_stylesheet(&text).map_err(LayoutError::Css)?; None };
+            } else { Some(edit) }
+        } else { if !deferred { css::parse_stylesheet(&text).map_err(LayoutError::Css)?; } None };
         let next = layout::CssomStylesheetText { owner: node, identity, text: text.clone() };
         let previous = if let Some(index) = index { Some(core::mem::replace(&mut self.cssom_stylesheet_texts[index], next)) }
             else { self.cssom_stylesheet_texts.push(next); None };
@@ -2827,7 +2833,7 @@ impl RenderSession {
         let previous_linked = linked_index.map(|index| core::mem::replace(&mut self.linked_stylesheets[index].2, String::from(text.as_ref())));
         self.rules = None;
         self.previous_rules = None;
-        if let Err(error) = self.refresh_rules() {
+        if let Err(error) = if deferred { Ok(()) } else { self.refresh_rules() } {
             if let Some(index) = index { self.cssom_stylesheet_texts[index] = previous.unwrap(); } else { self.cssom_stylesheet_texts.pop(); }
             if let (Some(index), Some(previous)) = (linked_index, previous_linked) { self.linked_stylesheets[index].2 = previous; }
             if let (Some(index), Some(edit)) = (source_index, edit) { edit.rollback(&mut self.stylesheet_sources[index].source); }
