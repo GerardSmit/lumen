@@ -12,8 +12,13 @@ use super::{
 use alloc::{sync::Arc, vec::Vec};
 use core::cell::RefCell;
 
-const MAX_ENTRIES: usize = 256;
-const MAX_BYTES: usize = lumen_common::budget::retained(32 << 20);
+// A page styled by CSS-in-JS can hold hundreds of live sheets, and every
+// rebuild looks each one up: a cap below the live count evicts sheets the
+// same rebuild still needs, so every lookup misses. One framework bundle can
+// also parse to tens of megabytes, which a smaller budget refuses outright and
+// so parses again on every rebuild.
+const MAX_ENTRIES: usize = 2048;
+const MAX_BYTES: usize = lumen_common::budget::retained(64 << 20);
 const RULE_HEAP_ESTIMATE: usize = core::mem::size_of::<Selector>() + 16 + 64;
 
 enum Key {
@@ -361,6 +366,22 @@ mod tests {
         assert!(cache.inner.borrow().entries.iter().all(|entry| !entry.pinned));
         cache.insert_graph(&source("https://x.test/extra.css", &sheet_text(99)), super::super::parse_graph(&source("https://x.test/extra.css", &sheet_text(99)), environment).unwrap());
         assert!(cache.inner.borrow().entries.len() <= 4, "installed entries are evictable again");
+    }
+
+    #[test]
+    fn rebuilds_of_hundreds_of_small_sheets_parse_each_once() {
+        let environment = MediaEnvironment::default();
+        let sheets: Vec<StylesheetSource> = (0..600).map(|index| source(&alloc::format!("https://x.test/{index}.css"),
+            &alloc::format!(".c{index}{{width:{index}px}}"))).collect();
+        let cache = StylesheetParseCache::default();
+        for _ in 0..3 {
+            cache.begin_rebuild();
+            for sheet in &sheets {
+                cache.parse_graph(sheet, environment, None, &[]).unwrap();
+            }
+            cache.finish_rebuild();
+        }
+        assert_eq!(cache.counts(), (600, 1200), "a CSS-in-JS page's live sheets stay cached between rebuilds");
     }
 
     #[test]
