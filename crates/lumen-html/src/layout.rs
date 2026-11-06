@@ -1447,7 +1447,6 @@ struct RetainedKeyRare {
     fixed_containing_block: Option<Rect>,
     fixed_containing_block_node: Option<NodeId>,
     sticky_bounds: Option<Rect>,
-    scroll_hazards: usize,
     transform_depth: usize,
     svg_geometry_capture: bool,
     source_capture: bool,
@@ -38550,7 +38549,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             fixed_containing_block: self.fixed_containing_block,
             fixed_containing_block_node: self.fixed_containing_block_node,
             sticky_bounds: self.sticky_bounds,
-            scroll_hazards: self.scroll_hazards,
+            // No `scroll_hazards`: it counts hazards laid out before the box,
+            // and a fragment is retained only when its own layout adds none
+            // (see `stable` in `box_for_with_children_output`), so scroll
+            // containers inside it compare equal counts wherever it replays.
             transform_depth: self.transform_depth,
             svg_geometry_capture: self.svg_geometry_capture,
             source_capture: self.source_capture_depth != 0,
@@ -47008,6 +47010,25 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         .unwrap();
         let images = |_: &str| -> ImageState { panic!("offscreen image was loaded") };
         display_list_with_images(&document, 20, 10, &NoShape, &images).unwrap();
+    }
+
+    #[test]
+    fn fragments_after_a_box_that_becomes_sticky_still_replay() {
+        let markup = "<!doctype html><style>body{margin:0}p{height:10px;margin:0}</style><p id='changed'>one</p><p>two</p><p>three</p><p>four</p>";
+        let changed_style = "position:sticky;top:0";
+        let document = crate::html::parse(markup, 64).unwrap();
+        let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        session.display_list(100, 100, &FixedText).unwrap();
+        session.document_mut().set_attribute(changed, "style", changed_style).unwrap();
+        let list = session.display_list(100, 100, &FixedText).unwrap().clone();
+        assert!(session.layout_cache_stats().hits >= 3, "the paragraphs after the sticky one replay");
+
+        let document = crate::html::parse(markup, 64).unwrap();
+        let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+        let mut fresh = crate::session::RenderSession::new(document);
+        fresh.document_mut().set_attribute(changed, "style", changed_style).unwrap();
+        assert_eq!(&list, fresh.display_list(100, 100, &FixedText).unwrap());
     }
 
     #[test]
