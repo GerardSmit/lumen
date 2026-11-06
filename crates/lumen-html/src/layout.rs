@@ -29816,8 +29816,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
     fn prepare_case_context(&self, paragraph: &mut InlineParagraph,
         shared: &mut Option<(NodeId, Option<Rc<InlineCaseContext>>)>) -> Result<(), LayoutError> {
-        if !self.rules.has_typographic_content() && !paragraph.spans.iter().any(|span|span.style.text_transform.needs_case_context()) {
-            paragraph.case_context_prepared=true;
+        if !paragraph.spans.iter().any(|span|span.style.text_transform.needs_case_context()) {
+            // A `::first-letter`/`::first-line` style may still bring a
+            // transform once the paragraph is split; `transform_paragraph`
+            // prepares the context then, so no subtree walk is spent on the
+            // paragraphs that never transform.
+            if !self.rules.has_typographic_content() { paragraph.case_context_prepared=true; }
             return Ok(());
         }
         let Some(source) = paragraph.case_sources.first() else { return Ok(()); };
