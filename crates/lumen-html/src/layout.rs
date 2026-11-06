@@ -44304,9 +44304,6 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             content_extent_height -= text_box_trim_end;
         }
         let content_extent_without_last_margin = (content_extent_height - previous_margin.value()).max(0.0);
-        // The last margin of a box that ends its parent's flow still reaches
-        // the parent's scrollable overflow; elsewhere it stays inside the box.
-        let ends_parent_flow = self.ends_parent_flow(id);
         let min_height_affects_used_size = style.min_height_intrinsic.is_some()
             || style.min_height > content_extent_without_last_margin;
         // Clearance followed by collapse-through boxes cannot join the parent's
@@ -44675,6 +44672,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
         }
         self.finish_hit(hit,hit_rect);
+        // The last margin of a box that ends its parent's flow still reaches
+        // the parent's scrollable overflow; elsewhere it stays inside the box.
+        // Only a box with such a margin scans its following siblings' styles.
+        let ends_parent_flow = content_extent_height != content_extent_without_last_margin
+            && self.overflow_frames.last().is_some_and(|frame| frame.node == id)
+            && self.ends_parent_flow(id);
         if let Some(frame) = self
             .overflow_frames
             .last_mut()
@@ -44696,7 +44699,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             if let Some(rect)=OverflowRect::new(local_x,local_y,padding_box.width,padding_box.height){frame.set_padding_box(rect);}
                         // Flex's natural line measurements size auto boxes; final movable
             // child projections, not pre-alignment measurements, own overflow.
-            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),(if scroll_container||vertical_block_flow||style.contain_layout||bottom_collapses||ends_parent_flow {content_extent_height} else {content_extent_without_last_margin}).max(content_height))};
+            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),(if scroll_container||vertical_block_flow||style.contain_layout||bottom_collapses
+||ends_parent_flow {content_extent_height} else {content_extent_without_last_margin}).max(content_height))};
             // Overflowing content of a scroll container keeps its end padding
             // reachable (CSS Overflow 3 §2.2).
             let reverse=scroll_reverse(&style);
