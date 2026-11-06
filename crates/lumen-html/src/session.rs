@@ -1206,6 +1206,8 @@ pub struct InvalidationStats {
     pub styles_computed: u64,
     /// Boxes laid out (retained fragments replayed are not counted).
     pub boxes_laid_out: u64,
+    /// Boxes laid out to measure a size (an auto grid row, a flex item).
+    pub boxes_measured: u64,
     pub fragments_replayed: u64,
     /// Retained-fragment lookups that missed, by what differed: no fragment
     /// was retained, its constraints, its style, its parent style, its position.
@@ -7291,6 +7293,7 @@ impl RenderSession {
             stats.layout_passes += 1;
             stats.styles_computed += styles.computed_styles as u64;
             stats.boxes_laid_out += self.layout_cache.boxes_laid_out() as u64;
+            stats.boxes_measured += self.layout_cache.boxes_measured() as u64;
             stats.fragments_replayed += self.layout_cache.stats().hits as u64;
             for (total, misses) in stats.fragment_misses.iter_mut().zip(self.layout_cache.miss_reasons()) {
                 *total += misses as u64;

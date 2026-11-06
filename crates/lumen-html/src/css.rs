@@ -4765,6 +4765,13 @@ impl Style {
         let slots = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
         slots.into_iter().any(|slot| self.cyclic_percentage_slot(slot))
     }
+    /// Whether a size of this box resolves against a block size: block-axis
+    /// percentages (sizes, flex basis, vertical insets), or a vertical
+    /// writing mode, where block sizes are physical widths.
+    pub(crate) fn reads_block_basis(&self) -> bool {
+        self.writing_mode != WritingMode::HorizontalTb
+            || [4, 148, 20, 35, 37, 51, 52, 88, 93, 94, 97, 98].into_iter().any(|slot| self.cyclic_percentage_slot(slot))
+    }
     pub(crate) fn has_height_percentage(&self) -> bool {
         self.cyclic_percentage_slot(4)
     }

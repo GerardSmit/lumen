@@ -1624,6 +1624,9 @@ struct RetainedFragment {
     /// Layout of this subtree consulted the text shaper, so its commands and
     /// geometry depend on loaded fonts.
     has_text: bool,
+    /// A box inside resolved a size against a block size, which the parent's
+    /// definite height (`key.parent_height`) can supply.
+    reads_block_basis: bool,
     /// Loading images this subtree was laid out around (placeholder geometry),
     /// and the resolver generation they were last known to be loading at. The
     /// fragment replays while they are all still loading.
@@ -1945,6 +1948,12 @@ pub(crate) struct IntrinsicSizes {
     /// Measurements made and cache hits served since `begin_frame`.
     measured: core::cell::Cell<usize>,
     reused: core::cell::Cell<usize>,
+    /// Boxes measurement layouts laid out since `begin_frame`.
+    boxes_measured: core::cell::Cell<usize>,
+    /// Boxes laid out or replayed whose size resolves against a block size
+    /// (`Style::reads_block_basis`), counted like `Layout::text_uses` so a
+    /// retained fragment knows whether its parent's definite height mattered.
+    block_basis_reads: core::cell::Cell<u64>,
     /// Flow children built by a flex or grid container's first intrinsic
     /// pass, kept for the other mode's pass of the same frame.
     children: RefCell<Vec<IntrinsicChildren>>,
@@ -2143,6 +2152,7 @@ impl IntrinsicSizes {
     fn begin_frame(&self) {
         self.measured.set(0);
         self.reused.set(0);
+        self.boxes_measured.set(0);
         self.children.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
@@ -2580,6 +2590,11 @@ impl RetainedLayoutCache {
         self.laid_out
     }
 
+    /// Boxes laid out by measurement layouts this frame.
+    pub(crate) fn boxes_measured(&self) -> usize {
+        self.intrinsics.boxes_measured.get()
+    }
+
     /// Intrinsic sizes measured and served from the retained sizes this frame.
     pub(crate) fn intrinsics_measured(&self) -> (usize, usize) {
         (self.intrinsics.measured.get(), self.intrinsics.reused.get())
@@ -2737,6 +2752,56 @@ impl RetainedLayoutCache {
         self.misses = self.misses.saturating_add(1);
         self.miss_reasons[reason] = self.miss_reasons[reason].saturating_add(1);
         None
+    }
+
+    /// `lookup` for a block size measurement, which keeps only the advance
+    /// and discards the commands. Inputs that place a fragment's contents
+    /// without changing its advance do not matter: the paint cull, its
+    /// position (`anchored`), the containing blocks of positioned and sticky
+    /// descendants, the root's paint propagation sources, and the depth,
+    /// which only bounds recursion.
+    fn measured(
+        &self,
+        key: &RetainedFragmentKey,
+        parent_style: &Style,
+        style: &Style,
+        at: (f32, f32),
+    ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
+        let entry = &self.entries[*self.index.get(&retained_node_key(key.node))?];
+        let placement = |rare: &RetainedKeyRare| RetainedKeyRare {
+            fixed_containing_block: None,
+            fixed_containing_block_node: None,
+            sticky_bounds: None,
+            canvas_background_source: None,
+            viewport_overflow_source: None,
+            ..rare.clone()
+        };
+        let rare = |key: &RetainedFragmentKey| key.rare.as_deref().map(placement).unwrap_or_default();
+        let unplaced = |key: &RetainedFragmentKey| RetainedFragmentKey {
+            anchored: None,
+            depth: 0,
+            containing_block: None,
+            containing_block_node: None,
+            cull: Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            rare: None,
+            ..key.clone()
+        };
+        // The parent's definite height reaches the subtree only through
+        // sizes resolved against it, which `reads_block_basis` records.
+        let parent_height = |key: &RetainedFragmentKey| if entry.reads_block_basis { key.parent_height } else { None };
+        let same_parent = self.same_style(&entry.parent_style, parent_style) || !entry.reads_block_basis
+            && entry.parent_style.writing_mode == css::WritingMode::HorizontalTb
+            && self.same_style(&{ let mut retained = (*entry.parent_style).clone(); retained.height = parent_style.height; retained }, parent_style);
+        let compared = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: parent_height(key), ..unplaced(key) };
+        if compared(&entry.key) != compared(key)
+            || rare(&entry.key) != rare(key)
+            || !self.same_style(&entry.style, style)
+            || !same_parent
+        {
+            return None;
+        }
+        let shift = (at.0 - entry.origin.0, at.1 - entry.origin.1);
+        (shift.0.is_finite() && shift.1.is_finite()).then(|| (Rc::clone(entry), shift))
     }
 
     fn remove_slot(&mut self, slot: usize) {
@@ -4711,6 +4776,10 @@ struct Layout<'a> {
     counter_positions: Cow<'a, [CounterNodeValues]>,
     /// Session-owned bounded subtree command/geometry cache.
     retained_fragments: Option<&'a mut RetainedLayoutCache>,
+    /// A measurement's read-only view of the layout's retained fragments: a
+    /// block size measurement replays an unchanged subtree's fragment instead
+    /// of laying it out again (see `RetainedLayoutCache::measured`).
+    retained_read: Option<&'a RetainedLayoutCache>,
     /// Cell borders are painted once by the collapsed-border conflict pass.
     suppressed_border_node: Option<NodeId>,
     table_surface_painted: Option<(NodeId,usize)>,
@@ -4957,6 +5026,7 @@ impl<'a> Layout<'a> {
         quote_positions: Cow::Owned(Vec::new()),
         counter_positions: Cow::Owned(Vec::new()),
         retained_fragments,
+        retained_read: None,
         suppressed_border_node: None,
         table_surface_painted: None,
         table_cell_projection: None,
@@ -5021,8 +5091,16 @@ impl Layout<'_> {
         self.resolve_style_percentages_for_box(style, Some(width), height, Some(width))
     }
 
+    fn note_block_basis_read(&self) {
+        let reads = &self.intrinsics.block_basis_reads;
+        reads.set(reads.get().wrapping_add(1));
+    }
+
     fn resolve_style_percentages_for_box(&self, style: &Style, width: Option<f32>,
         height: Option<f32>, inline: Option<f32>) -> Style {
+        if style.reads_block_basis() {
+            self.note_block_basis_read();
+        }
         let context = self.container_units.get();
         let mut resolved=style.clone();
         let _ = resolved.resolve_query_context_with_text(context,Some(self.text));
@@ -20300,6 +20378,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         layout.multicol_depth = self.multicol_depth;
         layout.export_block_table_baselines = self.export_block_table_baselines;
         layout.intrinsics = Rc::clone(&self.intrinsics);
+        layout.retained_read = self.retained_fragments.as_deref().or(self.retained_read);
         layout.quote_positions = Cow::Borrowed(self.quote_positions.as_ref());
         layout.counter_positions = Cow::Borrowed(self.counter_positions.as_ref());
         layout.cull = MEASUREMENT_CULL;
@@ -38507,6 +38586,17 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         Ok((command_map,hit_map))
     }
 
+    /// A plain block size measurement that replays retained fragments
+    /// (`RetainedLayoutCache::measured`): no geometry, no min/max-content
+    /// sizing, and none of the contexts `intrinsic_context` keeps out of
+    /// retained sizes.
+    fn measures_from_retained(&self) -> bool {
+        self.retained_read.is_some() && self.retained_fragments.is_none() && self.geometry.is_none()
+            && self.intrinsic_inline_axis.is_none() && !self.intrinsic_minimum_atomics
+            && self.paragraph_column_flow.is_none() && self.rendered_table_context.is_none()
+            && self.table_cell_projection.is_none() && self.timeline_values.is_none()
+    }
+
     fn retained_fragment_key(
         &self,
         id: NodeId,
@@ -38552,7 +38642,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || self.transform_depth != 0
             || self.pending_escapes.len() > RETAINED_OUTER_PAINT_RECORDS
             || self.positioned_flow_paints.len() > RETAINED_OUTER_PAINT_RECORDS
-            || self.geometry.is_none()
+            || (self.geometry.is_none() && !self.measures_from_retained())
         {
             return None;
         }
@@ -38626,7 +38716,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
         }
         let Some(geometry) = self.geometry.as_deref_mut() else {
-            return Err(LayoutError::InvalidTree);
+            // A block size measurement (`RetainedLayoutCache::measured`)
+            // discards commands and keeps no geometry: only the margin state
+            // and overflow that the boxes after this one see remain.
+            if !self.measures_from_retained() {
+                return Err(LayoutError::InvalidTree);
+            }
+            self.collapsed_top = fragment.collapsed_top;
+            self.collapsed_bottom = fragment.collapsed_bottom;
+            self.was_through = fragment.was_through;
+            return self.include_local_overflow_with_margin(fragment.overflow.parent, fragment.overflow.margin, placement, OverflowRoute::Parent, 0..0, movable);
         };
         if geometry.collect_rendered_text {
             let boxes = fragment.rendered_text_boxes.as_deref().unwrap_or(&[]);
@@ -39096,6 +39195,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_bytes: geometry.rendered_text_bytes.checked_sub(rendered_bytes_start)?,
             rendered_table_context: self.rendered_table_context,
             has_text,
+            reads_block_basis: true,
             pending_images: None,
             deferred_images: None,
             pending_generation: 0,
@@ -39512,13 +39612,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         let placement=self.pending_overflow_placement.take().unwrap_or_else(||self.overflow_placement(x,y));
         let retain_to_parent=core::mem::take(&mut self.pending_overflow_moves);
+        if computed.as_ref().is_none_or(Style::reads_block_basis) {
+            self.note_block_basis_read();
+        }
         let key = if computed.as_ref().is_some_and(|style|style.transform_timeline_source().is_some()) || child_override.is_some() || self.table_cell_projection.is_some_and(|(node, level, _)| node == id && level == depth) {
             None
         } else { self.retained_fragment_key(id, parent_style, &computed, x, y, available, depth) };
         let collect_rendered_text = self.collects_rendered_text();
+        let read = self.retained_read.filter(|_| self.measures_from_retained());
         if let Some((fragment, shift)) = key
             .as_ref()
-            .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key, parent_style, computed.as_ref()?, (x, y)))
+            .and_then(|key| match self.retained_fragments.as_deref_mut() {
+                Some(cache) => cache.lookup(key, parent_style, computed.as_ref()?, (x, y)),
+                None => read?.measured(key, parent_style, computed.as_ref()?, (x, y)),
+            })
             .filter(|(fragment, _)| !collect_rendered_text || fragment.rendered_text_collected)
             .filter(|(fragment, _)| self.retained_pending_images_unchanged(fragment))
             .filter(|(fragment, _)| self.retained_floats_fit(fragment, y))
@@ -39545,6 +39652,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             if fragment.has_text {
                 self.text_uses.set(self.text_uses.get().wrapping_add(1));
+            }
+            if fragment.reads_block_basis {
+                self.note_block_basis_read();
             }
             return Ok(fragment.advance);
         }
@@ -39595,6 +39705,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let command_start = self.commands.len();
         let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order);
         let text_uses_before = self.text_uses.get();
+        let block_basis_before = self.intrinsics.block_basis_reads.get();
         let pending_mark = self.images.map_or(0, |images| images.pending_mark());
         let deferred_mark = self.geometry.as_deref().map_or(0, |geometry| geometry.deferred_images.len());
         let timeline_source_uses_before=self.timeline_source_uses;
@@ -39653,7 +39764,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             self.cull = self.viewport;
             self.cull_scroll = (0.0, 0.0);
         }
-        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.laid_out += 1; }
+        match self.retained_fragments.as_deref_mut() {
+            Some(cache) => cache.laid_out += 1,
+            None => self.intrinsics.boxes_measured.set(self.intrinsics.boxes_measured.get() + 1),
+        }
         let result = self.box_for_uncached(id, parent_style, computed, x, y, available, depth, child_override, output_rect);
         self.cull = saved_cull;
         self.cull_scroll = saved_cull_scroll;
@@ -39750,6 +39864,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     paint_starts,
                     paint_source_start,
                 ) {
+                    fragment.reads_block_basis = self.intrinsics.block_basis_reads.get() != block_basis_before;
                     if fragment.key.floats_above {
                         fragment.float_floor = box_float_floor;
                         fragment.float_base = y - self.float_offset.1;

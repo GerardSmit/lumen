@@ -1886,3 +1886,25 @@ fn tailwind_group_and_peer_has_variants_restyle_partially() {
     render(&mut session);
     assert_eq!(counts(&session).full, before.full, "a keyed or nested-combinator :has() fell back to a full restyle");
 }
+
+#[test]
+fn grid_row_measurement_replays_unchanged_item_contents() {
+    // An auto row needs each item's block size at its column width. After an
+    // edit inside an item, its unchanged contents replay in that measurement
+    // instead of being laid out again.
+    let source = format!(
+        "<style>body{{margin:0}}#g{{display:grid;grid-template-columns:200px 1fr}}p{{margin:2px}}</style>\
+         <div id=g><div id=side>side</div><div id=main>{}</div></div>",
+        paras(300)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    text(&mut session, "#p150", "warm");
+    render(&mut session);
+    let before = session.invalidation_stats().boxes_measured;
+    text(&mut session, "#p150", "edited paragraph text");
+    render(&mut session);
+    let measured = session.invalidation_stats().boxes_measured - before;
+    assert!(measured < 100, "an edit inside the item measured {measured} boxes");
+}
