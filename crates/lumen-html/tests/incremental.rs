@@ -793,6 +793,28 @@ diff!(
 );
 
 diff!(
+    has_with_nested_combinators_and_where_keyed_groups,
+    "<style>body{margin:0}.v:not(:is(:where(.group):has([data-lg]) *)){height:20px}\
+     .h:has(:is(.peer .x)){padding:4px}.s:has(:is(.peer ~ *)){margin-left:7px}\
+     .g:is(:where(.group):not(:has(:is(:where(.peer):not([data-active])~*))) *){border-top:3px solid}</style>\
+     <main id=m><section id=sec><div class=h id=in><i class=x>1</i></div></section>\
+     <div class=group id=grp><p id=p>t</p><b class=v id=v1>v</b><u class=peer id=pe>a</u><u class=g id=g1>b</u></div></main>\
+     <div class=h id=far><i class=x>2</i></div><div class=s id=sib><u id=u1>a</u><u>b</u></div>",
+    [
+        |s| attr(s, "#p", "data-lg", ""),
+        |s| attr(s, "#sec", "class", "peer"),
+        |s| attr(s, "#u1", "class", "peer"),
+        |s| attr(s, "#pe", "data-active", ""),
+        |s| {
+            add(s, "#grp", "i", &[("class", "x"), ("id", "nx")], Some("n"), Some("#v1"));
+        },
+        |s| unattr(s, "#p", "data-lg"),
+        |s| del(s, "#pe"),
+        |s| attr(s, "#sec", "class", ""),
+    ]
+);
+
+diff!(
     hover_free_deep_tree_ancestor_changes,
     "<style>body{margin:0}.l1 .l3{color:red}.l2 > .l3 + .l3{height:30px}.hot .l2{padding:5px}</style>\
      <div class=l1 id=r><div class=l2 id=m><div class=l3 id=a>a</div><div class=l3 id=b>b</div></div></div>",
@@ -1844,4 +1866,23 @@ fn opacity_animation_through_one_keeps_its_layer() {
     let mut fresh = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
     animate(&mut fresh, "#f", &[("opacity", "0.3")]);
     assert_same("opacity through one", "patched", &actual, render(&mut fresh));
+}
+
+#[test]
+fn tailwind_group_and_peer_has_variants_restyle_partially() {
+    let source = "<style>body{margin:0}.v:not(:is(:where(.group):has([data-lg]) *)){height:20px}\
+        .g:is(:where(.group):not(:has(:is(:where(.peer):not([data-active])~*))) *){border-top:3px solid}</style>\
+        <div class=group id=grp><p id=p>t</p><b class=v>v</b><u class=peer id=pe>a</u><u class=g>b</u></div>\
+        <div id=list><p id=q>q</p></div>";
+    let mut session = RenderSession::new(html::parse(source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    let before = counts(&session);
+    attr(&mut session, "#p", "data-lg", "");
+    render(&mut session);
+    attr(&mut session, "#pe", "data-active", "");
+    render(&mut session);
+    add(&mut session, "#list", "p", &[("id", "fresh")], Some("fresh"), None);
+    render(&mut session);
+    assert_eq!(counts(&session).full, before.full, "a keyed or nested-combinator :has() fell back to a full restyle");
 }
