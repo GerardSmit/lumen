@@ -43,6 +43,7 @@ struct RuntimeCrypto {
 }
 
 static RUNTIME_CRYPTO: OnceLock<RuntimeCrypto> = OnceLock::new();
+static TRUST_ANCHORS: OnceLock<Vec<rustls::pki_types::TrustAnchor<'static>>> = OnceLock::new();
 
 /// Install strong entropy and synchronized wall-clock providers for transport-free TLS clients.
 /// The entropy callback must fill the entire slice from a CSPRNG or return an error. The clock
@@ -99,7 +100,29 @@ fn runtime_provider() -> Result<Arc<CryptoProvider>, String> {
         .clone())
 }
 
-/// Construct a verified Rustls client config from the bundled Mozilla roots plus caller roots.
+/// Replace the bundled Mozilla roots with the embedder's for transport-free TLS clients. Install
+/// before the first connection: the configs of [`client_config_with_roots`] are shared.
+pub fn install_trust_anchors(
+    anchors: Vec<rustls::pki_types::TrustAnchor<'static>>,
+) -> Result<(), String> {
+    if anchors.is_empty() {
+        return Err(String::from("TLS trust anchors are empty"));
+    }
+    TRUST_ANCHORS
+        .set(anchors)
+        .map_err(|_| String::from("TLS trust anchors are already installed"))
+}
+
+fn base_roots(installed: Option<&[rustls::pki_types::TrustAnchor<'static>]>) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    match installed {
+        Some(anchors) => roots.extend(anchors.iter().cloned()),
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    roots
+}
+
+/// Construct a verified Rustls client config from the installed or bundled roots plus caller roots.
 /// Certificate verification uses the clock installed by [`install_runtime_crypto`]. Configs
 /// without caller roots are shared per ALPN list, so the trust store is built once and TLS
 /// sessions are resumed across connections through the config's session cache.
@@ -140,8 +163,7 @@ fn build_client_config(
     extra_roots: &[Vec<u8>],
 ) -> Result<Arc<ClientConfig>, String> {
     let provider = runtime_provider()?;
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut roots = base_roots(TRUST_ANCHORS.get().map(Vec::as_slice));
     for root in extra_roots {
         roots
             .add(CertificateDer::from(root.clone()))
@@ -878,6 +900,21 @@ mod tests {
             }
             install_runtime_crypto(random, now).unwrap();
         });
+    }
+
+    #[test]
+    fn installed_anchors_replace_the_bundled_roots() {
+        let anchor = webpki_roots::TLS_SERVER_ROOTS[0].clone();
+        assert_eq!(base_roots(Some(&[anchor])).roots.len(), 1);
+        assert_eq!(
+            base_roots(None).roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len()
+        );
+    }
+
+    #[test]
+    fn an_empty_anchor_set_is_refused() {
+        assert!(install_trust_anchors(Vec::new()).is_err());
     }
 
     fn self_signed() -> (Vec<u8>, Vec<u8>) {

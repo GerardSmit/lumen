@@ -13,7 +13,8 @@ pub mod engine;
 
 mod rustls;
 pub use rustls::{
-    client_config_with_roots, install_runtime_crypto, ClientSession, PlaintextRead,
+    client_config_with_roots, install_runtime_crypto, install_trust_anchors, ClientSession,
+    PlaintextRead,
     RuntimeRandomFill, RuntimeUnixTimeSource,
 };
 #[cfg(any(not(unix), target_os = "android"))]
