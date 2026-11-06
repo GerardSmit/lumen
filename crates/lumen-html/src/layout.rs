@@ -1933,7 +1933,7 @@ pub(crate) struct IntrinsicSizes {
     /// a width, so nested flex and grid containers measure each item once per
     /// width. They live as long as the item's intrinsic slot: whatever drops
     /// that (a change inside the item, a resize of an axis it read) drops them.
-    stretched: RefCell<Vec<StretchedFlexHeight>>,
+    stretched: RefCell<StretchedFlexMemo>,
     /// Source-ancestry computed styles of list items, which the marker
     /// origin resolves in both intrinsic sizing and box layout.
     tree_styles: RefCell<BTreeMap<u128, TreeStyleEntry>>,
@@ -2036,7 +2036,55 @@ struct StretchedFlexHeight {
     height: f32,
 }
 
-const MAX_STRETCHED_FLEX_MEMO: usize = 256;
+/// Nested column flex containers measure each item by laying it out, and
+/// laying out an item measures its own items again: without the memo that
+/// work doubles at every level, and a page with a few hundred such items
+/// needs thousands of entries to keep them.
+const MAX_STRETCHED_FLEX_MEMO: usize = 8192;
+
+/// The measured heights of column flex items by node, oldest entry evicted
+/// first.
+#[derive(Default)]
+struct StretchedFlexMemo {
+    nodes: BTreeMap<usize, Vec<StretchedFlexHeight>>,
+    len: usize,
+    /// Node of each entry in insertion order; a dropped entry may leave its
+    /// node here until it is popped.
+    order: alloc::collections::VecDeque<usize>,
+}
+
+impl StretchedFlexMemo {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn entries(&self, node: NodeId) -> &[StretchedFlexHeight] {
+        self.nodes.get(&node.index()).map_or(&[], Vec::as_slice)
+    }
+    fn push(&mut self, entry: StretchedFlexHeight) {
+        while self.len >= MAX_STRETCHED_FLEX_MEMO {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(entries) = self.nodes.get_mut(&oldest) {
+                if !entries.is_empty() { entries.remove(0); self.len -= 1; }
+                if entries.is_empty() { self.nodes.remove(&oldest); }
+            }
+        }
+        if self.order.len() >= 2 * MAX_STRETCHED_FLEX_MEMO {
+            self.order = self.nodes.iter().flat_map(|(&node, entries)| core::iter::repeat_n(node, entries.len())).collect();
+        }
+        let node = entry.id.index();
+        self.order.push_back(node);
+        self.nodes.entry(node).or_default().push(entry);
+        self.len += 1;
+    }
+    fn remove_node(&mut self, node: usize) {
+        if let Some(entries) = self.nodes.remove(&node) { self.len -= entries.len(); }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&StretchedFlexHeight) -> bool) {
+        let mut len = 0;
+        self.nodes.retain(|_, entries| { entries.retain(&mut keep); len += entries.len(); !entries.is_empty() });
+        self.len = len;
+    }
+}
 
 impl IntrinsicSizes {
     fn clear(&self) {
@@ -2050,10 +2098,7 @@ impl IntrinsicSizes {
     fn drop_slot(&self, slot: usize) {
         self.slots.borrow_mut().remove(&slot);
         self.drop_cell(slot / 2);
-        let mut stretched = self.stretched.borrow_mut();
-        if stretched.iter().any(|entry| entry.id.index() == slot / 2) {
-            stretched.retain(|entry| entry.id.index() != slot / 2);
-        }
+        self.stretched.borrow_mut().remove_node(slot / 2);
     }
     fn drop_cell(&self, index: usize) {
         self.cells.borrow_mut().remove(&index);
@@ -26812,7 +26857,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let Some(context) = self.intrinsic_context() else { return measure(); };
         let intrinsics = &*self.intrinsics;
         let images = self.images;
-        let hit = intrinsics.stretched.borrow().iter().find(|entry| entry.id == node
+        let hit = intrinsics.stretched.borrow().entries(node).iter().find(|entry| entry.id == node
             && entry.width == container_width
             && entry.inline_size == inline_size
             && entry.parent_height == self.parent_height
@@ -26844,9 +26889,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             _ => None,
         };
-        let mut memo = intrinsics.stretched.borrow_mut();
-        if memo.len() >= MAX_STRETCHED_FLEX_MEMO { memo.remove(0); }
-        memo.push(StretchedFlexHeight { id: node, width: container_width, inline_size,
+        intrinsics.stretched.borrow_mut().push(StretchedFlexHeight { id: node, width: container_width, inline_size,
             parent_height: self.parent_height, item: item.clone(), container: container.clone(),
             context, axes, pending, height });
         Ok(height)
