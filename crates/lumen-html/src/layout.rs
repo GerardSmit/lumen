@@ -1421,7 +1421,8 @@ pub struct RetainedLayoutCacheStats {
 }
 
 /// Inputs of a box's layout other than its styles and its position. A
-/// fragment is replayed at another position when `anchored` is `None`.
+/// fragment is replayed at another position when `anchored` is `None`, or
+/// when it is translatable (see `RetainedFragmentKey::serves_translated`).
 #[derive(Clone, PartialEq)]
 struct RetainedFragmentKey {
     node: NodeId,
@@ -1464,6 +1465,25 @@ struct RetainedKeyRare {
 impl RetainedFragmentKey {
     fn decorations(&self) -> &[TextDecoration] {
         self.rare.as_deref().map_or(&[], |rare| &rare.decorations)
+    }
+
+    /// Whether a translatable fragment laid out under `self` serves `other`.
+    /// Such a fragment holds no absolutely positioned or fixed descendant,
+    /// which are the only boxes that resolve against the containing block's
+    /// position, so the box position and containing block origin may differ;
+    /// the containing block size is still compared, as intrinsic sizes do.
+    fn serves_translated(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.available == other.available
+            && self.floats_above == other.floats_above
+            && self.depth == other.depth
+            && self.parent_height == other.parent_height
+            && self.containing_block.map(sized_only) == other.containing_block.map(sized_only)
+            && self.containing_block_node == other.containing_block_node
+            && self.cull == other.cull
+            && self.viewport == other.viewport
+            && self.container_units == other.container_units
+            && self.rare == other.rare
     }
 }
 
@@ -2702,7 +2722,7 @@ impl RetainedLayoutCache {
         let mut reason = 0;
         if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
             let entry = &self.entries[slot];
-            reason = if entry.key != *key { 1 }
+            reason = if entry.key != *key && !(entry.translatable && entry.key.serves_translated(key)) { 1 }
                 else if !self.same_style(&entry.style, style) { 2 }
                 else if !self.same_style(&entry.parent_style, parent_style) { 3 }
                 else { 4 };
@@ -47010,6 +47030,30 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         .unwrap();
         let images = |_: &str| -> ImageState { panic!("offscreen image was loaded") };
         display_list_with_images(&document, 20, 10, &NoShape, &images).unwrap();
+    }
+
+    #[test]
+    fn fragments_inside_a_positioned_ancestor_replay_after_content_above_them_grows() {
+        for (inner, replays) in [
+            ("<p>two</p><p>three</p><p>four</p>", true),
+            ("<p>two</p><div style='height:10px'><i style='position:absolute;top:0'>x</i></div><p>four</p>", true),
+        ] {
+            let markup = alloc::format!("<!doctype html><style>body{{margin:0}}p{{height:10px;margin:0}}</style>\
+                <div style='position:relative'><p id='changed'>one</p>{inner}</div>");
+            let document = crate::html::parse(&markup, 64).unwrap();
+            let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+            let mut session = crate::session::RenderSession::new(document);
+            session.display_list(100, 100, &FixedText).unwrap();
+            session.document_mut().set_attribute(changed, "style", "height:30px").unwrap();
+            let list = session.display_list(100, 100, &FixedText).unwrap().clone();
+            if replays { assert!(session.layout_cache_stats().hits >= 2, "{inner}: the paragraphs below the grown one replay"); }
+
+            let document = crate::html::parse(&markup, 64).unwrap();
+            let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+            let mut fresh = crate::session::RenderSession::new(document);
+            fresh.document_mut().set_attribute(changed, "style", "height:30px").unwrap();
+            assert_eq!(&list, fresh.display_list(100, 100, &FixedText).unwrap(), "{inner}");
+        }
     }
 
     #[test]
