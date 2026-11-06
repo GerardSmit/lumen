@@ -1155,7 +1155,7 @@ pub struct RenderSession {
     rule_subjects: Option<Vec<(NodeId, bool)>>,
     /// A rules rebuild dropped every retained style since the last style pass.
     rules_reset: bool,
-    svg_use_cache: Cell<Option<(u64, bool)>>,
+    svg_use_cache: RefCell<Option<(u64, Option<Rc<[String]>>)>>,
 }
 
 /// Cumulative counters of the style and layout work a session did, for hosts
@@ -1651,7 +1651,7 @@ impl RenderSession {
             style_parallelism: None,
             rule_subjects: None,
             rules_reset: false,
-            svg_use_cache: Cell::new(None),
+            svg_use_cache: RefCell::new(None),
         }
     }
     /// Changes whenever the cached display list is rebuilt or invalidated.
@@ -2831,8 +2831,14 @@ impl RenderSession {
         // href identity remains unchanged. Inline snapshots need no DOM writes.
         let linked_index = self.linked_stylesheets.iter().position(|(owner, _, _)| *owner == node);
         let previous_linked = linked_index.map(|index| core::mem::replace(&mut self.linked_stylesheets[index].2, String::from(text.as_ref())));
-        self.rules = None;
-        self.previous_rules = None;
+        if self.cssom_rule_overrides.is_empty() && self.cssom_topology_overrides.is_empty() {
+            // As for an edited <style> text: the rebuild restyles only the
+            // subjects of the rules that differ from the stashed ones.
+            self.stash_rules();
+        } else {
+            self.rules = None;
+            self.previous_rules = None;
+        }
         if let Err(error) = if deferred { Ok(()) } else { self.refresh_rules() } {
             if let Some(index) = index { self.cssom_stylesheet_texts[index] = previous.unwrap(); } else { self.cssom_stylesheet_texts.pop(); }
             if let (Some(index), Some(previous)) = (linked_index, previous_linked) { self.linked_stylesheets[index].2 = previous; }
@@ -3214,6 +3220,11 @@ impl RenderSession {
             let boundary_bytes = if topologies[..position].iter().any(|entry| alloc::sync::Arc::ptr_eq(&entry.boundaries, &topology.boundaries)) { 0 } else { topology.boundaries.len() * core::mem::size_of::<css::nesting::DeclarationBoundary>() };
             retained_bytes = retained_bytes.checked_add(source_bytes).and_then(|bytes| bytes.checked_add(boundary_bytes)).and_then(|bytes| bytes.checked_add(topology.source_url.as_ref().map_or(0, |url| url.len()))).ok_or(LayoutError::Css(css::CssError { offset: 0, message: "CSSOM retained source budget exceeded" }))?;
             if retained_bytes > 8 * 1024 * 1024 { return Err(LayoutError::Css(css::CssError { offset: 0, message: "CSSOM retained source budget exceeded" })); }
+        }
+        // Rules inserted or deleted without edited declarations or nested
+        // topology leave nothing to stage; the sheet's new text rebuilds them.
+        if overrides.is_empty() && topologies.is_empty() && self.cssom_rule_overrides.is_empty() && self.cssom_topology_overrides.is_empty() {
+            return Ok(());
         }
         self.cssom_rule_overrides = overrides;
         self.cssom_topology_overrides = topologies;
@@ -6458,16 +6469,61 @@ impl RenderSession {
         true
     }
 
-    fn svg_use_present(&self) -> bool {
+    /// The ids `<use>` elements reference, `None` when they cannot be bounded.
+    fn svg_use_targets(&self) -> Option<Rc<[String]>> {
         let version = self.document.version();
-        match self.svg_use_cache.get() {
-            Some((cached, present)) if cached == version => present,
-            _ => {
-                let present = document_has_svg_use(&self.document);
-                self.svg_use_cache.set(Some((version, present)));
-                present
-            }
+        if let Some((cached, targets)) = self.svg_use_cache.borrow().as_ref() {
+            if *cached == version { return targets.clone(); }
         }
+        let targets = svg_use_targets(&self.document).map(Rc::from);
+        *self.svg_use_cache.borrow_mut() = Some((version, targets.clone()));
+        targets
+    }
+
+    /// Whether a change at `touched` or of `structural` shows outside the
+    /// fragments of the changed nodes: it lies in an SVG resource definition,
+    /// which `url()` references reach from anywhere, or in what a `<use>`
+    /// instance renders.
+    fn svg_change_not_local(&self, touched: &[NodeId], structural: &[(NodeId, Option<NodeId>, Option<NodeId>, bool)]) -> bool {
+        let nodes = || touched.iter().chain(structural.iter().map(|entry| &entry.0)).copied();
+        if !nodes().any(|node| in_svg(&self.document, node)) {
+            return false;
+        }
+        nodes().any(|node| in_svg_resource(&self.document, node)) || self.svg_use_affected(touched, structural)
+    }
+
+    /// Whether a change at `touched` (or of the subtrees `added` and
+    /// `removed`) may show in a `<use>` instance: it lies in, or adds or
+    /// removes, an element some `<use>` references. Other SVG changes stay
+    /// local to their own fragments.
+    fn svg_use_affected(&self, touched: &[NodeId], structural: &[(NodeId, Option<NodeId>, Option<NodeId>, bool)]) -> bool {
+        let Some(targets) = self.svg_use_targets() else { return true };
+        if targets.is_empty() { return false; }
+        let referenced = |node: NodeId| matches!(self.document.kind(node),
+            Ok(NodeKind::Element { attributes, .. }) if crate::svg::attribute(attributes, "id").is_some_and(|id| targets.iter().any(|target| target == id)));
+        let inside = |node: NodeId| {
+            let mut current = Some(node);
+            for _ in 0..512 {
+                let Some(id) = current else { return false };
+                if referenced(id) { return true; }
+                current = self.document.composed_parent(id).ok().flatten();
+            }
+            true
+        };
+        if touched.iter().chain(structural.iter().map(|entry| &entry.0)).any(|&node| inside(node)) { return true; }
+        structural.iter().flat_map(|entry| [entry.1, entry.2]).flatten().any(|subtree| {
+            // A removed subtree may no longer be walkable; then it may have held a target.
+            if self.document.kind(subtree).is_err() { return true; }
+            let mut pending = alloc::vec![subtree];
+            let mut visited = 0usize;
+            while let Some(node) = pending.pop() {
+                visited += 1;
+                if visited > self.document.node_count().saturating_add(1) || referenced(node) { return true; }
+                let mut child = self.document.first_child(node).ok().flatten();
+                while let Some(id) = child { pending.push(id); child = self.document.next_sibling(id).ok().flatten(); }
+            }
+            false
+        })
     }
 
     /// Restyle only the elements the journaled mutations and the last rules
@@ -6537,6 +6593,11 @@ impl RenderSession {
         }
         let rule_subjects = self.rule_subjects.take().unwrap_or_default();
         let subjects_taken = !rule_subjects.is_empty();
+        // Rule subjects are only candidates: one whose style stays as it was
+        // changes nothing, so they are checked against SVG references after
+        // the restyle, the mutated nodes before it.
+        let mutated = targets.len();
+        let mut forced_subjects = Vec::new();
         for (node, pseudo) in rule_subjects {
             if self.document.kind(node).is_err() {
                 continue;
@@ -6544,22 +6605,11 @@ impl RenderSession {
             targets.push(node);
             if pseudo {
                 changed.push(node);
+                forced_subjects.push(node);
             }
         }
-        // `<use>` instances render a referenced SVG subtree outside the
-        // fragments that contain it, so SVG changes there are not local.
-        let svg_touched = targets
-            .iter()
-            .chain(subtrees.iter())
-            .chain(structural.iter().map(|entry| &entry.0))
-            .any(|&node| in_svg(&self.document, node));
-        let resource_touched = svg_touched
-            && targets
-                .iter()
-                .chain(subtrees.iter())
-                .chain(structural.iter().map(|entry| &entry.0))
-                .any(|&node| in_svg_resource(&self.document, node));
-        if svg_touched && (resource_touched || self.svg_use_present()) {
+        let touched: Vec<NodeId> = targets[..mutated].iter().chain(subtrees.iter()).copied().collect();
+        if self.svg_change_not_local(&touched, &structural) {
             self.invalidation_stats.bails[5] += 1;
             // `<use>` instances can show stale fragments of the changed subtree anywhere, and any
             // taken rule subjects were not applied: `relayout` must restyle everything and drop
@@ -6585,6 +6635,14 @@ impl RenderSession {
                 return;
             }
         };
+        if subjects_taken {
+            let restyled_subjects: Vec<NodeId> = restyled.iter().map(|&(node, _)| node).chain(forced_subjects.iter().copied()).collect();
+            if self.svg_change_not_local(&restyled_subjects, &[]) {
+                self.invalidation_stats.bails[5] += 1;
+                self.rules_reset = true;
+                return;
+            }
+        }
         let custom_rebases = self.style_cache.borrow_mut().take_custom_rebases();
         self.layout_cache.note_custom_rebases(custom_rebases);
         // Elements added without a box (`display: none`, such as a stylesheet
@@ -7328,7 +7386,7 @@ fn in_svg(document: &Document, node: NodeId) -> bool {
 /// Whether `node` is, or sits inside, an SVG resource definition (a filter, paint server, clip,
 /// mask, marker or `defs`). Elements reference these through `url()` without being their
 /// ancestors, so a change inside one is not local to its own fragments. `<symbol>` is only
-/// reached through `<use>`, which `svg_use_present` already covers.
+/// reached through `<use>`, which `svg_use_affected` already covers.
 fn in_svg_resource(document: &Document, node: NodeId) -> bool {
     let mut current = Some(node);
     for _ in 0..512 {
@@ -7343,18 +7401,25 @@ fn in_svg_resource(document: &Document, node: NodeId) -> bool {
     true
 }
 
-/// Whether any `<use>` element exists, including inside shadow trees that
-/// selector queries do not enter. Treats a walk past the node budget as true.
-fn document_has_svg_use(document: &Document) -> bool {
+/// The fragment ids of every `<use>` reference, including inside shadow
+/// trees that selector queries do not enter. `None` past the node budget.
+fn svg_use_targets(document: &Document) -> Option<Vec<String>> {
+    let mut targets: Vec<String> = Vec::new();
     let mut pending = alloc::vec![document.root()];
     let mut visited = 0usize;
     while let Some(node) = pending.pop() {
         visited += 1;
         if visited > document.node_count().saturating_add(1) {
-            return true;
+            return None;
         }
-        if matches!(document.kind(node), Ok(NodeKind::Element { namespace: crate::Namespace::Svg, name, .. }) if name.as_str() == "use") {
-            return true;
+        if let Ok(NodeKind::Element { namespace: crate::Namespace::Svg, name, attributes }) = document.kind(node) {
+            if crate::svg::local_name(name) == "use" {
+                // Only the fragment names an element; a reference without one
+                // names no element of this document.
+                if let Some((_, id)) = crate::svg::attribute(attributes, "href").and_then(|href| href.split_once('#')) {
+                    if !targets.iter().any(|target| target == id) { targets.push(String::from(id)); }
+                }
+            }
         }
         if let Some(shadow) = document.shadow_root(node).ok().flatten() {
             pending.push(shadow);
@@ -7365,7 +7430,7 @@ fn document_has_svg_use(document: &Document) -> bool {
             child = document.next_sibling(id).ok().flatten();
         }
     }
-    false
+    Some(targets)
 }
 
 mod effect_staging;
@@ -7794,6 +7859,28 @@ mod tests {
         let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());
         assert_eq!(changed,fresh.display_list(100,80,&NoText).unwrap().clone(),"generic XML uses the same invalidation and fresh layout path as HTML");
         assert_eq!(changed,session.display_list(100,80,&NoText).unwrap().clone());
+    }
+
+    #[test]
+    fn svg_changes_outside_use_references_stay_incremental() {
+        let markup="<!doctype html><svg width=0 height=0><symbol id=icon viewBox='0 0 10 10'><rect id=shape width=10 height=10 fill=red /></symbol></svg>\
+            <svg width=40 height=20><use href='#icon' width=20 height=20 /></svg>\
+            <svg width=40 height=20><rect id=plain width=10 height=10 fill=blue /></svg>";
+        let document=crate::html::parse(markup,128).unwrap();
+        let get=|session:&RenderSession,id:&str|crate::selector::query_selector(session.document(),session.document().root(),id).unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        session.display_list(100,80,&NoText).unwrap();
+        let plain=get(&session,"#plain");let shape=get(&session,"#shape");
+        let fresh=|session:&RenderSession|{let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());fresh.display_list(100,80,&NoText).unwrap().clone()};
+        let bails=session.invalidation_stats().bails[5];
+        session.document_mut().set_attribute(plain,"fill","green").unwrap();
+        let changed=session.display_list(100,80,&NoText).unwrap().clone();
+        assert_eq!(session.invalidation_stats().bails[5],bails,"no <use> references the changed rect");
+        assert_eq!(changed,fresh(&session));
+        session.document_mut().set_attribute(shape,"fill","green").unwrap();
+        let changed=session.display_list(100,80,&NoText).unwrap().clone();
+        assert_eq!(session.invalidation_stats().bails[5],bails+1,"the symbol a <use> instance renders changed");
+        assert_eq!(changed,fresh(&session));
     }
 
     #[test]
