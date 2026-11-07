@@ -42,15 +42,22 @@ impl DomStyle {
             // percentage translation, or a fixed margin, padding, min/max size
             // or static inset, reads the up-to-date style alone. Container
             // queries can change the style itself, so they always lay out.
+            // `@container` rules restyle only elements below a query container,
+            // whose size or scroll state takes layout (as Blink lays out such
+            // containers for a style read); style queries need no layout.
+            let queried = {
+                let mut session = self.realm.session.borrow_mut();
+                session.has_container_queries() && self.inside_query_container(&mut session, pending_fonts.as_ref())?
+            };
             let needs_layout = resolved && css::computed_values::needs_layout(&property) && {
                 let mut session = self.realm.session.borrow_mut();
-                session.has_container_queries()
+                queried
                     || self.resolved_style(&mut session, pending_fonts.as_ref())
                         .map_or(true, |style| style.resolved_value_needs_layout(&property))
             };
             let needs_container_context = if needs_layout { false } else {
                 let mut session = self.realm.session.borrow_mut();
-                if session.has_container_queries() { true } else {
+                if queried { true } else {
                 let inherited = css::property_inherits_query_context(&property);
                 let mut current = Some(self.node);
                 let mut pending = self.pseudo.is_some()
@@ -153,6 +160,25 @@ impl DomStyle {
                 canonical_content_property(name, value)
             }))
     }
+    /// Whether an ancestor of the element (or, for a pseudo-element, its
+    /// originating element) is a size or scroll-state query container.
+    fn inside_query_container(&self, session: &mut lumen_html::session::RenderSession, fonts:Option<&super::canvas::CanvasFontSource>) -> OpResult<bool> {
+        let text=fonts.map(|fonts|fonts as &dyn lumen_html::paint::TextShaper);
+        let mut current = if self.pseudo.is_some() { Some(self.node) } else { session.document().composed_parent(self.node).map_err(dom_error)? };
+        for _ in 0..512 {
+            let Some(node) = current else { return Ok(false); };
+            if matches!(session.document().kind(node), Ok(NodeKind::Element { .. })) {
+                let style = session.computed_style_with_text(node, text)
+                    .map_err(|error| OpError::new("InvalidStateError", format!("computed style failed: {error:?}")))?;
+                if style.container_type != css::ContainerType::Normal || style.container_flags.scroll_state || style.container_flags.anchored {
+                    return Ok(true);
+                }
+            }
+            current = session.document().composed_parent(node).map_err(dom_error)?;
+        }
+        Ok(true)
+    }
+
     fn resolved_style(&self, session: &mut lumen_html::session::RenderSession, fonts:Option<&super::canvas::CanvasFontSource>) -> Result<css::Style, lumen_html::layout::LayoutError> {
         let text=fonts.map(|fonts|fonts as &dyn lumen_html::paint::TextShaper);
         match self.pseudo {
@@ -878,6 +904,30 @@ mod tests {
         let before=layouts.get();
         read(&mut engine,"target.style.position='relative';target.style.left='10%';other.style.width='70px';return getComputedStyle(target).left","40px");
         assert!(layouts.get()>before,"a positioned inset reads its used value");
+    }
+
+    #[test]
+    fn container_queries_lay_out_only_for_elements_inside_query_containers() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<style>.box{container-type:inline-size;width:300px}@container (min-width:200px){#inside{opacity:.5}}\
+            @container style(--on:1){#styled{opacity:.25}}</style><div class=box><p id=inside>i</p></div><p id=outside>o</p><div style='--on:1'><p id=styled>s</p></div>",64).unwrap();
+        let layouts=Rc::new(std::cell::Cell::new(0));
+        let count=layouts.clone();
+        realm.set_layout_flusher(Rc::new(move|session|{count.set(count.get()+1);session.display_list(400,300,super::super::canvas::canvas_fallback_fonts())
+            .map(|_|()).map_err(|error|format!("{error:?}"))}));
+        let read=|engine:&mut Engine,source:&str,expected:&str|{
+            let check=format!("(()=>{{const value=(()=>{{{source}}})();if(value!=={expected:?})throw Error(value);return true}})()");
+            let result=engine.eval_value(&check).unwrap().unwrap_or_else(|error|panic!("{source}: {}",engine.ctx().coerce_string(&error).map(|text|text.to_string()).unwrap_or_default()));
+            assert!(matches!(result,Value::Bool(true)));
+        };
+        realm.flush_layout().unwrap();
+        let before=layouts.get();
+        read(&mut engine,"outside.style.color='red';return getComputedStyle(outside).opacity","1");
+        read(&mut engine,"outside.style.color='blue';return getComputedStyle(styled).opacity","0.25");
+        assert_eq!(layouts.get(),before,"elements outside query containers resolve from style alone");
+        read(&mut engine,"outside.style.color='green';return getComputedStyle(inside).opacity","0.5");
+        assert!(layouts.get()>before,"an element inside a size container lays its container out");
+        read(&mut engine,"document.querySelector('.box').style.width='100px';return getComputedStyle(inside).opacity","1");
     }
 
     #[test]
