@@ -6002,7 +6002,16 @@ impl RenderSession {
             self.discard_frame();
         }
         self.failed_frame = None;
-        if !keeps_fragments || !replayed {
+        if node != root && !query_container {
+            // A nested scroller's offset changes only what is culled inside
+            // it: fragments containing it replay its commands and go, those
+            // inside it replay only where no culling decision changes
+            // (`RetainedFragment::shift_to`), and boxes elsewhere do not
+            // depend on it.
+            if !replayed {
+                self.layout_cache.invalidate_changed(&self.document, &[], &[], &[node], &|_| false);
+            }
+        } else if !keeps_fragments || !replayed {
             self.layout_cache.clear();
         }
         self.paint_revision = self.paint_revision.wrapping_add(1);
@@ -11443,6 +11452,33 @@ mod tests {
         let child = fresh.document().first_child(find(fresh.document(), "#b")).unwrap().unwrap();
         fresh.document_mut().replace_data(child, "bb").unwrap();
         assert_eq!(&list, fresh.display_list_with_images(200, 400, &Mono, &images).unwrap());
+    }
+
+    #[test]
+    fn scrolling_a_nested_scroller_far_keeps_fragments_outside_it() {
+        let mut source = String::from("<style>body{margin:0;font:10px/10px sans-serif}p{margin:0}#s{height:40px;overflow:auto}</style>");
+        for index in 0..20 { source.push_str(&alloc::format!("<p>before {index}</p>")); }
+        source.push_str("<div id=s>");
+        for index in 0..400 { source.push_str(&alloc::format!("<p>row {index}</p>")); }
+        source.push_str("</div>");
+        for index in 0..20 { source.push_str(&alloc::format!("<p>after {index}</p>")); }
+        let document = crate::html::parse(&source, 1 << 16).unwrap();
+        let scroller = find(&document, "#s");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(200, 400, &Mono).unwrap();
+        let mut relaid = 0;
+        for offset in [1500.0, 3000.0, 200.0, 3900.0] {
+            let (replayed, layouts) = (session.invalidation_stats().fragments_replayed, session.layout_count());
+            session.set_scroll_offset(scroller, 0.0, offset).unwrap();
+            session.display_list(200, 400, &Mono).unwrap();
+            if session.layout_count() != layouts {
+                relaid += 1;
+                assert!(session.invalidation_stats().fragments_replayed > replayed, "boxes outside the scroller replay after scrolling to {offset}");
+            }
+        }
+        assert!(relaid > 0, "a scroll beyond the scroller's window lays out again");
+        assert_eq!(session.invalidation_stats().verify_mismatches, 0);
     }
 
     #[test]
