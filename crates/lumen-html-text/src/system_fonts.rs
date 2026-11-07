@@ -43,6 +43,26 @@ pub fn enable_system_fonts() {
     ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Builds the index of installed fonts and loads the generic families' regular and bold faces
+/// on a background thread, so the first layout of a page does not wait for the font files. Hosts
+/// call it once system fonts are enabled, before a page needs text; without system fonts it does
+/// nothing. Later lookups share the loaded faces.
+pub fn prewarm_system_fonts() {
+    if !system_fonts_enabled() || STATE.get().is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("font-prewarm".into()).spawn(|| {
+        let fonts = state();
+        for generic in [GenericFontFamily::SansSerif, GenericFontFamily::Serif, GenericFontFamily::Monospace,
+            GenericFontFamily::SystemUi] {
+            for weight in [400, 700] {
+                let _ = fonts.generic(generic, &FontSpec { weight, ..FontSpec::default() });
+            }
+        }
+        let _ = fonts.scan.get_or_init(|| fonts.index.scan_list());
+    });
+}
+
 pub fn system_fonts_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }

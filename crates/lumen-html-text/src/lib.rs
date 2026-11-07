@@ -14,7 +14,7 @@ mod sfnt;
 #[cfg(feature = "system-fonts")]
 mod system_fonts;
 #[cfg(feature = "system-fonts")]
-pub use system_fonts::{enable_system_fonts, system_fonts_enabled};
+pub use system_fonts::{enable_system_fonts, prewarm_system_fonts, system_fonts_enabled};
 
 mod manual_font_registry;
 mod spacing_trim;
@@ -725,11 +725,19 @@ fn is_private_use_cluster(cluster: &str) -> bool {
 
 fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelection,
     features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
-        let language = context.language;
     let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
     face.set_variations(context.variations);
     face.set_points_per_em(context.points_per_em);
-    let script=resolve_script(&face,script,context);
+    let buffer = shape_input(&face, text, rtl, script, context)?;
+    Ok(rustybuzz::shape(&face, features, buffer))
+}
+
+/// The buffer `text` is shaped from with `face`: its directional controls
+/// dropped, its context, direction, script and language set.
+fn shape_input(face: &rustybuzz::Face<'_>, text: &str, rtl: bool, script: ScriptSelection,
+    context: ShapeContext<'_>) -> Result<rustybuzz::UnicodeBuffer, &'static str> {
+    let language = context.language;
+    let script=resolve_script(face,script,context);
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     // UAX #9 has already consumed directional controls before a resolved
     // script run reaches this function. They contribute no glyph or advance;
@@ -764,7 +772,104 @@ fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelec
     if let Some(language)=language.filter(|language|!language.is_empty()) {
         if let Ok(language)=language.parse::<rustybuzz::Language>() {buffer.set_language(language);}
     }
-    Ok(rustybuzz::shape(&face, features, buffer))
+    Ok(buffer)
+}
+
+/// Faces parsed for shaping, per size and variation coordinates, with the
+/// shape plans compiled for them. Parsing a face reads and indexes its layout
+/// tables and compiling a plan maps its features to lookups; layout shapes the
+/// same face at a few sizes many times per frame.
+struct ShaperCache {
+    busy: AtomicBool,
+    entries: UnsafeCell<Vec<ShaperEntry>>,
+}
+
+struct ShaperEntry {
+    size: Option<u32>,
+    variations: Vec<(u32, u32)>,
+    // Borrows the owning `FontFace`'s bytes, which outlive the cache (see `FontFace::shapers`).
+    face: rustybuzz::Face<'static>,
+    plans: Vec<(PlanKey, rustybuzz::ShapePlan)>,
+}
+
+#[derive(PartialEq)]
+struct PlanKey {
+    direction: u8,
+    script: u32,
+    language: Option<String>,
+    features: Vec<(u32, u32, u32, u32)>,
+}
+
+const MAX_SHAPER_FACES: usize = 8;
+const MAX_SHAPER_PLANS: usize = 16;
+
+// SAFETY: entries are only read or changed while `busy` is held.
+unsafe impl Sync for ShaperCache {}
+
+impl ShaperCache {
+    const fn new() -> Self {
+        Self { busy: AtomicBool::new(false), entries: UnsafeCell::new(Vec::new()) }
+    }
+
+    /// Shapes `text` with the face `bytes` holds, reusing a parsed face and
+    /// plan when one matches. `bytes` must be the bytes of the face that owns
+    /// this cache. Another thread shaping with the face at the same time parses
+    /// its own.
+    fn shape(&self, bytes: &Arc<[u8]>, text: &str, rtl: bool, script: ScriptSelection,
+        features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
+        if self.busy.swap(true, Ordering::Acquire) {
+            return shape_buffer_context(bytes, text, rtl, script, features, context);
+        }
+        // SAFETY: busy grants exclusive access until it is released below.
+        let entries = unsafe { &mut *self.entries.get() };
+        let result = Self::shape_with(entries, bytes, text, rtl, script, features, context);
+        self.busy.store(false, Ordering::Release);
+        result
+    }
+
+    fn shape_with(entries: &mut Vec<ShaperEntry>, bytes: &Arc<[u8]>, text: &str, rtl: bool, script: ScriptSelection,
+        features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
+        let size = context.points_per_em.map(f32::to_bits);
+        let variations = context.variations.iter().map(|variation| (variation.tag.0, variation.value.to_bits())).collect::<Vec<_>>();
+        let index = match entries.iter().position(|entry| entry.size == size && entry.variations == variations) {
+            Some(index) => index,
+            None => {
+                // SAFETY: the bytes are the owning face's, which drops this
+                // cache before them; the slice outlives every entry.
+                let bytes: &'static [u8] = unsafe { &*Arc::as_ptr(bytes) };
+                let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
+                face.set_variations(context.variations);
+                face.set_points_per_em(context.points_per_em);
+                if entries.len() >= MAX_SHAPER_FACES { entries.remove(0); }
+                entries.push(ShaperEntry { size, variations, face, plans: Vec::new() });
+                entries.len() - 1
+            }
+        };
+        let entry = &mut entries[index];
+        let buffer = shape_input(&entry.face, text, rtl, script, context)?;
+        let key = PlanKey {
+            direction: match buffer.direction() {
+                rustybuzz::Direction::LeftToRight => 0, rustybuzz::Direction::RightToLeft => 1,
+                rustybuzz::Direction::TopToBottom => 2, rustybuzz::Direction::BottomToTop => 3,
+                rustybuzz::Direction::Invalid => 4,
+            },
+            script: buffer.script().tag().0,
+            language: buffer.language().map(|language| String::from(language.as_str())),
+            features: features.iter().map(|feature| (feature.tag.0, feature.value, feature.start, feature.end)).collect(),
+        };
+        let plan = match entry.plans.iter().position(|(cached, _)| *cached == key) {
+            Some(plan) => plan,
+            None => {
+                let language = buffer.language();
+                let plan = rustybuzz::ShapePlan::new(&entry.face, buffer.direction(), Some(buffer.script()),
+                    language.as_ref(), features);
+                if entry.plans.len() >= MAX_SHAPER_PLANS { entry.plans.remove(0); }
+                entry.plans.push((key, plan));
+                entry.plans.len() - 1
+            }
+        };
+        Ok(rustybuzz::shape_with_plan(&entry.face, &entry.plans[plan].1, buffer))
+    }
 }
 
 fn shape_bidi_context(shaper:&dyn TextShaper,text:&str,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<ShapedRun,()> {
@@ -2336,6 +2441,8 @@ fn rasterize_coverage(font: &fontdue::Font, glyph_id: u16, size: f32) -> GlyphCo
 
 pub struct FontFace {
     id: u64,
+    // Declared before `bytes`, so it drops first: its faces borrow them.
+    shapers: ShaperCache,
     bytes: Arc<[u8]>,
     glyph_count: u16,
     invisible_id: AtomicU64,
@@ -2744,6 +2851,7 @@ variation_advances: VariationGlyphCache::new(),
             shapes: RunCache::new(),
             widths: RunCache::new(),
             rasterizers: RasterizerCache::new(),
+            shapers: ShaperCache::new(),
         })
     }
 
@@ -3072,7 +3180,7 @@ variation_advances: VariationGlyphCache::new(),
         size_scale:f32,cluster_offset:usize,features:&[rustybuzz::Feature],glyphs:&mut Vec<Glyph>,x:&mut f32,
         advances:Option<&mut Vec<RawClusterAdvance>>,context:ShapeContext<'_>) -> Result<(), &'static str> {
         let context = ShapeContext { points_per_em: Some(size), ..context };
-        let shaped = shape_buffer_context(&self.bytes, text, rtl, script, features,context)?;
+        let shaped = self.shapers.shape(&self.bytes, text, rtl, script, features,context)?;
         append_glyphs(
             shaped,
             size / self.units_per_em,
@@ -3269,7 +3377,7 @@ variation_advances: VariationGlyphCache::new(),
             features
         };
         let context = ShapeContext { points_per_em: Some(size), ..context };
-        let shaped = shape_buffer_context(&self.bytes, &transformed, rtl, script, features,context)?;
+        let shaped = self.shapers.shape(&self.bytes, &transformed, rtl, script, features,context)?;
         if glyphs.len().saturating_add(shaped.len()) > MAX_SHAPE_TEXT_BYTES {
             return Err("caps glyph run too large");
         }
@@ -3335,7 +3443,7 @@ variation_advances: VariationGlyphCache::new(),
         let context = ShapeContext { points_per_em: Some(size), ..ShapeContext::language(None) };
         if text.is_ascii() && rtl != Some(true) {
             return visit(
-                shape_buffer_context(&self.bytes, text, false, Script::Latin.into(), features, context)?,
+                self.shapers.shape(&self.bytes, text, false, Script::Latin.into(), features, context)?,
                 0,
             );
         }
@@ -3347,7 +3455,7 @@ variation_advances: VariationGlyphCache::new(),
                 let value = &text[range.clone()];
                 for item in script_ranges(value, rtl)? {
                     visit(
-                        shape_buffer_context(
+                        self.shapers.shape(
                             &self.bytes,
                             &value[item.start..item.end],
                             rtl,
@@ -4443,6 +4551,27 @@ pub static TEST_FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans
 #[cfg(all(test, feature = "bundled-fonts"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_faces_and_plans_shape_like_a_freshly_parsed_face() {
+        let bytes:Arc<[u8]>=Arc::from(DEFAULT_FONT_BYTES);
+        let cache=ShaperCache::new();
+        let glyphs=|buffer:rustybuzz::GlyphBuffer|buffer.glyph_infos().iter().zip(buffer.glyph_positions())
+            .map(|(info,position)|(info.glyph_id,info.cluster,position.x_advance,position.x_offset)).collect::<Vec<_>>();
+        let kern=[rustybuzz::Feature::new(ttf_parser::Tag::from_bytes(b"kern"),0,..)];
+        // More sizes than the cache keeps, so later passes shape with re-parsed entries.
+        for _ in 0..2 {
+            for size in 0..MAX_SHAPER_FACES+2 {
+                let context=ShapeContext{points_per_em:Some(10.0+size as f32),..ShapeContext::language(Some("en"))};
+                for (text,rtl,features) in [("AVATAR office",false,&[][..]),("AVATAR",false,&kern[..]),("abc",true,&[][..])] {
+                    let fresh=glyphs(shape_buffer_context(&bytes,text,rtl,Script::Latin.into(),features,context).unwrap());
+                    let cached=glyphs(cache.shape(&bytes,text,rtl,Script::Latin.into(),features,context).unwrap());
+                    assert_eq!(cached,fresh,"{text} at {size}");
+                }
+            }
+        }
+    }
+
     use alloc::format;
     use alloc::vec;
 
