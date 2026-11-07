@@ -1416,6 +1416,10 @@ const MAX_COLLAPSED_BORDER_CANDIDATES: usize = 64 * 1024;
 pub struct RetainedLayoutCacheStats {
     pub hits: usize,
     pub misses: usize,
+    /// Block size measurements served from a fragment, then those that were not,
+    /// by what differed: no fragment, its constraints, placement-free inputs,
+    /// its style, its parent style. Counted over the cache's lifetime.
+    pub measured: [u64; 6],
     pub entries: usize,
     pub bytes: usize,
 }
@@ -2394,6 +2398,7 @@ pub(crate) struct RetainedLayoutCache {
     frame_clock: u64,
     hits: usize,
     misses: usize,
+    measured: core::cell::Cell<[u64; 6]>,
     /// Misses of the frame by what differed: no fragment, its constraints,
     /// its style, its parent style, its position.
     miss_reasons: [usize; 5],
@@ -2666,6 +2671,7 @@ impl RetainedLayoutCache {
         RetainedLayoutCacheStats {
             hits: self.hits,
             misses: self.misses,
+            measured: self.measured.get(),
             entries: self.entries.len(),
             bytes: self.bytes,
         }
@@ -2794,7 +2800,16 @@ impl RetainedLayoutCache {
         style: &Style,
         at: (f32, f32),
     ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
-        let entry = &self.entries[*self.index.get(&retained_node_key(key.node))?];
+        let count = |reason: usize| {
+            let mut counts = self.measured.get();
+            counts[reason] = counts[reason].saturating_add(1);
+            self.measured.set(counts);
+        };
+        let Some(&slot) = self.index.get(&retained_node_key(key.node)) else {
+            count(1);
+            return None;
+        };
+        let entry = &self.entries[slot];
         let placement = |rare: &RetainedKeyRare| RetainedKeyRare {
             fixed_containing_block: None,
             fixed_containing_block_node: None,
@@ -2818,11 +2833,13 @@ impl RetainedLayoutCache {
         let parent_height = |key: &RetainedFragmentKey| if entry.reads_block_basis { key.parent_height } else { None };
         let same_parent = self.same_parent_style(entry, parent_style);
         let compared = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: parent_height(key), ..unplaced(key) };
-        if compared(&entry.key) != compared(key)
-            || rare(&entry.key) != rare(key)
-            || !self.same_style(&entry.style, style)
-            || !same_parent
-        {
+        let reason = if compared(&entry.key) != compared(key) { 2 }
+            else if rare(&entry.key) != rare(key) { 3 }
+            else if !self.same_style(&entry.style, style) { 4 }
+            else if !same_parent { 5 }
+            else { 0 };
+        count(reason);
+        if reason != 0 {
             return None;
         }
         let shift = (at.0 - entry.origin.0, at.1 - entry.origin.1);
