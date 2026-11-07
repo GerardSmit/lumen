@@ -1127,6 +1127,25 @@ diff!(
 );
 
 diff!(
+    boxes_replay_inside_transformed_ancestors,
+    "<style>body{margin:0}.spin{transform:rotate(10deg) scale(.8);padding:4px}.move{transform:translate(5px,7px)}\
+     .card{border:1px solid;padding:2px;margin:2px}.inner{transform:scale(1.5)}.stick{position:sticky;top:0}</style>\
+     <div id=s class=spin><div id=a class=card>a<p>a1</p></div><div id=b class=card>b</div>\
+     <div class=move><div id=c class=card>c<div class=inner><p id=d>d</p></div></div><div id=e class=card>e</div></div></div>\
+     <div class=move><div id=f class=card>f<p class=stick>s</p></div><div id=g class=card>g</div></div>",
+    [
+        |s| text(s, "#b", "b b b"),
+        |s| attr(s, "#s", "style", "transform:rotate(20deg)"),
+        |s| text(s, "#c", "c c"),
+        |s| attr(s, "#a", "style", "height:30px"),
+        |s| unattr(s, "#s", "style"),
+        |s| text(s, "#g", "g g g"),
+        |s| attr(s, "#e", "class", "card inner"),
+        |s| del(s, "#b"),
+    ]
+);
+
+diff!(
     relative_and_group_boxes_replay_inside_flex_rows,
     "<style>body{margin:0}.row{display:flex}.cell{flex:1;position:relative}.cell span{position:absolute;right:0;top:0;z-index:1}\
      .glass{opacity:.8}.big{height:60px}</style>\

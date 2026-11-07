@@ -7395,10 +7395,11 @@ impl RenderSession {
         let Ok(mut full) = full else { return };
         apply_paint_worklet_cache(&mut full.0, &self.paint_worklet_cache, &mut Vec::new());
         let Some(cached) = self.cached.as_mut() else { return };
-        if cached.list.approx_eq(&full, VERIFY_TOLERANCE) {
+        if cached.list.approx_eq(&full, VERIFY_TOLERANCE) && cached.geometry.hits_approx_eq(&geometry, VERIFY_TOLERANCE) {
             return;
         }
         cached.list = full;
+        cached.geometry = geometry;
         self.invalidation_stats.verify_mismatches += 1;
         self.damage_pending = None;
         self.paint_revision = self.paint_revision.wrapping_add(1);
@@ -11406,6 +11407,42 @@ mod tests {
         session.document_mut().set_attribute(box_, "style", "width:50px").unwrap();
         session.display_list(200, 400, &NoText).unwrap();
         assert_eq!(session.invalidation_stats().verify_mismatches, 0);
+    }
+
+    #[test]
+    fn boxes_with_background_images_replay_across_sibling_edits_and_arrivals() {
+        let source = "<style>body{margin:0;font:10px/10px sans-serif}.bg{width:60px;height:20px;background:url(back.png) 0 0/7px 3px}\
+            .wrap{background-image:url(wrap.png);padding:2px}</style>\
+            <div class=bg id=a>a</div><div class=wrap><div class=bg>w</div><p>inner</p></div>\
+            <div id=b>b</div><div class=bg>c</div>";
+        let document = crate::html::parse(source, 4096).unwrap();
+        let b = find(&document, "#b");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        let images = Sources::new();
+        session.display_list_with_images(200, 400, &Mono, &images).unwrap();
+        let edit = |session: &mut RenderSession, text: &str| {
+            let child = session.document().first_child(b).unwrap().unwrap();
+            session.document_mut().replace_data(child, text).unwrap();
+        };
+        edit(&mut session, "b b");
+        session.display_list_with_images(200, 400, &Mono, &images).unwrap();
+        images.arrive("back.png");
+        session.display_list_with_images(200, 400, &Mono, &images).unwrap();
+        edit(&mut session, "b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b b");
+        session.display_list_with_images(200, 400, &Mono, &images).unwrap();
+        images.arrive("wrap.png");
+        edit(&mut session, "b");
+        session.display_list_with_images(200, 400, &Mono, &images).unwrap();
+        edit(&mut session, "bb");
+        let list = session.display_list_with_images(200, 400, &Mono, &images).unwrap().clone();
+        let stats = session.invalidation_stats();
+        assert_eq!(stats.verify_mismatches, 0);
+        assert!(stats.fragments_replayed > 0, "{stats:?}");
+        let mut fresh = RenderSession::new(crate::html::parse(source, 4096).unwrap());
+        let child = fresh.document().first_child(find(fresh.document(), "#b")).unwrap().unwrap();
+        fresh.document_mut().replace_data(child, "bb").unwrap();
+        assert_eq!(&list, fresh.display_list_with_images(200, 400, &Mono, &images).unwrap());
     }
 
     #[test]

@@ -11934,6 +11934,22 @@ pub(crate) struct HitTransform {
 }
 
 impl LayoutGeometry {
+    /// Whether two layouts hit-test alike: the same hit regions in the same
+    /// order, with rectangles and transforms equal within `tolerance`.
+    pub(crate) fn hits_approx_eq(&self, other: &LayoutGeometry, tolerance: f32) -> bool {
+        let near = |a: f32, b: f32| (a - b).abs() <= tolerance || a == b;
+        let rect = |a: &Rect, b: &Rect| near(a.x, b.x) && near(a.y, b.y) && near(a.width, b.width) && near(a.height, b.height);
+        self.hits.len() == other.hits.len()
+            && self.transforms.len() == other.transforms.len()
+            && self.hits.iter().zip(&other.hits).all(|(a, b)| {
+                a.node == b.node && a.pseudo == b.pseudo && a.hit_testable == b.hit_testable && rect(&a.rect, &b.rect)
+            })
+            && self.transforms.iter().zip(&other.transforms).all(|(a, b)| {
+                let (m, n) = (a.matrix, b.matrix);
+                a.hits == b.hits && near(m.a, n.a) && near(m.b, n.b) && near(m.c, n.c) && near(m.d, n.d) && near(m.e, n.e) && near(m.f, n.f)
+            })
+    }
+
     pub(crate) fn clip_transforms<'a>(&'a self,clip:&'a HitClip)->impl DoubleEndedIterator<Item=Affine>+'a {
         clip.source_transform.iter().map(|matrix|**matrix).chain(
             self.transforms[clip.first_transform..].iter().filter(move |transform|
@@ -38664,13 +38680,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || css::columns::active(&style)
             || self.paragraph_column_flow.as_ref().is_some_and(|flow|flow.pending || !flow.wrappers.is_empty())
             || style.sibling_position_dependent
-            || style.background_images.is_some()
             || style.background_attachment.as_ref().is_some_and(|items| {
                 items
                     .iter()
                     .any(|item| *item != css::BackgroundAttachment::Scroll)
             })
-            || self.transform_depth != 0
             || (self.geometry.is_none() && !self.measures_from_retained())
         {
             return None;
