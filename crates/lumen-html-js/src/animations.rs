@@ -1583,6 +1583,22 @@ fn transition_pair_eligible(property:&str,from:&str,to:&str,allow_discrete:bool,
     }
 }
 
+/// Whether sampling these keyframe transform lists against the base list
+/// resolves a percentage against the element's reference box. Lists whose functions pair up
+/// index by index interpolate each translate's pixel and percentage parts on their
+/// own, and the percentages resolve at paint as in Blink; only the matrix
+/// fallback for mismatched functions needs the box, and with it a layout.
+fn transforms_need_reference_box(keyframes:impl Iterator<Item=Vec<lumen_html::css::Transform>>,
+    base:Option<&[lumen_html::css::Transform]>)->bool {
+    use lumen_html::css::Transform;
+    let percent=|list:&[Transform]|list.iter().any(|transform|matches!(transform,Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0));
+    let mut lists:Vec<Vec<Transform>>=keyframes.collect();
+    if let Some(base)=base {lists.push(base.to_vec());}
+    if !lists.iter().any(|list|percent(list)) {return false;}
+    let kind=|transform:&Transform|core::mem::discriminant(transform);
+    !lists.iter().all(|a|lists.iter().all(|b|a.iter().zip(b).all(|(x,y)|kind(x)==kind(y))))
+}
+
 fn interpolate_transform_animation(from:&str,to:&str,progress:f64,
     context:&(lumen_html::css::Style,lumen_html::paint::Rect,lumen_html::css::MediaEnvironment))->Option<String> {
     let (style,rect,viewport)=context;
@@ -3424,11 +3440,11 @@ let property_pass=|name:&str| {
                             }
                         }
                         let registered_transform_reference=transform_pass && record.keyframes.iter().any(|frame|frame.declarations.iter().any(|(property,_)|property.starts_with("--") && registered_syntax(property).is_some_and(|syntax|syntax.contains("<transform-"))));
-                        let needs_reference=registered_transform_reference || transform_pass && record.keyframes.iter().flat_map(|frame|frame.declarations.iter().map(|(property,value)|(property,value)))
-                            .any(|(property,value)|property=="transform"
-                                && lumen_html::css::parse_animation_transforms(value,&style,viewport,shadow_text)
-                                    .is_some_and(|transforms|transforms.iter().any(|transform|matches!(transform,lumen_html::css::Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0))))
-                            || transform_pass&&base_style.as_ref().is_some_and(|style|style.transforms.as_deref().is_some_and(|transforms|transforms.iter().any(|transform|matches!(transform,lumen_html::css::Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0))));
+                        let needs_reference=registered_transform_reference || transform_pass && transforms_need_reference_box(
+                            record.keyframes.iter().flat_map(|frame|frame.declarations.iter())
+                                .filter(|(property,_)|property=="transform")
+                                .filter_map(|(_,value)|lumen_html::css::parse_animation_transforms(value,&style,viewport,shadow_text).map(|list|list.to_vec())),
+                            base_style.as_ref().and_then(|style|style.transforms.as_deref()));
                         if transform_pass && (needs_reference || style.font_query_context_pending()) && !query_geometry_ready {
                             drop(session);realm.flush_layout()?;query_geometry_ready=true;session=realm.session.borrow_mut();
                             style=match record.pseudo {
@@ -6396,7 +6412,15 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
         eval_ok(&mut engine,"absoluteEffect.cancel()");
         let before_transform=layouts.get();
         eval_ok(&mut engine,"globalThis.referenceEffect=shadowSamples[2].animate({transform:['translateX(0%)','translateX(100%)']},{duration:1000,fill:'both'});referenceEffect.currentTime=500");
-        assert!(layouts.get()>before_transform,"percentage transform samples retain actual reference-box layout");
+        assert_eq!(layouts.get(),before_transform,"paired percentage translates interpolate without a reference box");
+        let sample_node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),".sample:nth-child(3)").unwrap().unwrap());
+        let transforms=realm.session.borrow_mut().computed_style(sample_node).unwrap().transforms.clone();
+        assert!(matches!(transforms.as_deref(),Some([lumen_html::css::Transform::Translate(x,_)]) if x.percent==50.0 && x.pixels==0.0),
+            "the sampled translate keeps its percentage for paint to resolve: {transforms:?}");
+        eval_ok(&mut engine,"referenceEffect.cancel()");
+        let before_mismatch=layouts.get();
+        eval_ok(&mut engine,"globalThis.mismatchEffect=shadowSamples[2].animate({transform:['translateX(0%)','rotate(90deg) translateX(100%)']},{duration:1000,fill:'both'});mismatchEffect.currentTime=500");
+        assert!(layouts.get()>before_mismatch,"mismatched lists interpolate as matrices, which resolve percentages against the actual reference box");
     }
 
     #[test]

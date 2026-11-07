@@ -60,6 +60,11 @@ pub fn prewarm_system_fonts() {
             }
         }
         let _ = fonts.scan.get_or_init(|| fonts.index.scan_list());
+        // Every style's `ic` unit base measures "水" in its fallback face, so the
+        // first layout of any page asks for the CJK fallback.
+        for weight in [400, 700] {
+            let _ = fonts.fallback('水', None, &FontSpec { weight, ..FontSpec::default() });
+        }
     });
 }
 
