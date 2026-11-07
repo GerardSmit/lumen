@@ -38659,21 +38659,22 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         // Keep the retained path narrow: in-flow block-level boxes (block,
         // list item, flow root, flex and grid containers, statically or
-        // relatively positioned) in a block container (block, list item, flow
-        // root, inline block, table cell or caption) or as flex and grid
-        // items, whose used size is in their style. Inline-level and table
-        // boxes, out-of-flow boxes and scroll containers stay on the normal
-        // layout path and can still reuse safe descendants. A box whose own
-        // paint records (stacking contexts, escapes) reach outside it is
-        // retained with them, in `RetainedPaintPhases`.
+        // relatively positioned, transformed or not) in a block container
+        // (block, list item, flow root, inline block, table cell or caption)
+        // or as flex and grid items, whose used size is in their style.
+        // Inline-level and table boxes, out-of-flow boxes and scroll
+        // containers stay on the normal layout path and can still reuse safe
+        // descendants. A box whose own paint records (stacking contexts,
+        // z-index order, escapes) reach outside it is retained with them, in
+        // `RetainedPaintPhases`. Inside a transformed ancestor a fragment
+        // replays in the ancestor's local space, which its key's transform
+        // depth pins.
         if depth == 0
             || matches!(name.as_str(), "html" | "body")
             || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption | Display::Flex | Display::Grid)
             || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid)
             || !matches!(style.position, Position::Static | Position::Relative)
             || style.float != Float::None
-            || style.z_index.is_some()
-            || style.has_transform()
             || style.overflow_clip
             || style.overflow_x != css::Overflow::Visible
             || style.overflow_y != css::Overflow::Visible

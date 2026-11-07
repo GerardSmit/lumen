@@ -1142,6 +1142,29 @@ diff!(
         |s| text(s, "#g", "g g g"),
         |s| attr(s, "#e", "class", "card inner"),
         |s| del(s, "#b"),
+        |s| attr(s, "#a", "style", "height:12px;transform:skewX(8deg)"),
+        |s| text(s, "#d", "d d d"),
+        |s| attr(s, "#f", "style", "transform:translate(-3px,2px) rotate(3deg)"),
+        |s| text(s, "#g", "g"),
+        |s| attr(s, "#a", "style", "transform:skewX(8deg)"),
+    ]
+);
+
+diff!(
+    z_indexed_boxes_replay_in_their_stacking_order,
+    "<style>body{margin:0}.r{position:relative;margin-top:-6px;height:20px;border:1px solid}.lo{z-index:-1;background:#fc0}\
+     .hi{z-index:3;background:#0cf}.mid{z-index:1;background:#c0f}.row{display:flex}.row>div{z-index:2;margin-left:-4px;background:#0f0;width:30px}</style>\
+     <div id=a class='r hi'>a<div class='r lo'>a1</div></div><div id=b class='r lo'>b</div><div id=c class='r mid'>c<p>c1</p></div>\
+     <div class=row><div id=d>d</div><div id=e style='z-index:-2'>e</div><div id=f>f</div></div><div id=g class=r>g</div>",
+    [
+        |s| text(s, "#b", "b b"),
+        |s| attr(s, "#g", "class", "r hi"),
+        |s| attr(s, "#a", "style", "height:30px"),
+        |s| text(s, "#e", "e e e"),
+        |s| attr(s, "#c", "class", "r lo"),
+        |s| attr(s, "#d", "style", "z-index:5"),
+        |s| unattr(s, "#a", "style"),
+        |s| del(s, "#b"),
     ]
 );
 
