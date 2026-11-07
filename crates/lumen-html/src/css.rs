@@ -3554,6 +3554,39 @@ pub struct Style {
     pub grid_row: GridPlacement,
 }
 
+/// The last anonymous child styles built, by parent style.
+struct AnonymousChildStyles {
+    busy: core::sync::atomic::AtomicBool,
+    entries: core::cell::UnsafeCell<Vec<(Style, Style)>>,
+}
+// SAFETY: entries are only read or changed while `busy` is held.
+unsafe impl Sync for AnonymousChildStyles {}
+static ANONYMOUS_CHILD_STYLES: AnonymousChildStyles = AnonymousChildStyles {
+    busy: core::sync::atomic::AtomicBool::new(false),
+    entries: core::cell::UnsafeCell::new(Vec::new()),
+};
+const MAX_ANONYMOUS_CHILD_STYLES: usize = 8;
+
+impl AnonymousChildStyles {
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<(Style, Style)>) -> R) -> Option<R> {
+        use core::sync::atomic::Ordering;
+        if self.busy.swap(true, Ordering::Acquire) { return None; }
+        // SAFETY: busy grants exclusive access until it is released below.
+        let result = f(unsafe { &mut *self.entries.get() });
+        self.busy.store(false, Ordering::Release);
+        Some(result)
+    }
+    fn find(&self, parent: &Style) -> Option<Style> {
+        self.with(|entries| entries.iter().rev().find(|(cached, _)| cached == parent).map(|(_, child)| child.clone())).flatten()
+    }
+    fn store(&self, parent: &Style, child: &Style) {
+        self.with(|entries| {
+            if entries.len() >= MAX_ANONYMOUS_CHILD_STYLES { entries.remove(0); }
+            entries.push((parent.clone(), child.clone()));
+        });
+    }
+}
+
 fn arcs_equal<T: ?Sized + PartialEq>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -4185,6 +4218,16 @@ impl Style {
     /// Build the anonymous text/box style for a boxless element's contents.
     /// Descendant elements still inherit from its complete computed style.
     pub(crate) fn display_contents_child_style(&self) -> Self {
+        // Layout asks for the anonymous style of the same parent many times
+        // per pass (table rows and cells, generated boxes); it depends on the
+        // parent style alone.
+        if let Some(child) = ANONYMOUS_CHILD_STYLES.find(self) { return child; }
+        let child = self.build_display_contents_child_style();
+        ANONYMOUS_CHILD_STYLES.store(self, &child);
+        child
+    }
+
+    fn build_display_contents_child_style(&self) -> Self {
         let mut child = Self::initial();
         child.display = Display::Block;
         child.html_cell_padding_hint = self.html_cell_padding_hint;
