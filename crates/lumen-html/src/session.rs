@@ -6382,8 +6382,9 @@ impl RenderSession {
                     patches.push((index, command));
                 }
                 // A paint-only use without a record (srcset candidates, nested
-                // cross-fade images, ...) cannot be painted into the frame.
-                if !covered {
+                // cross-fade images, ...) cannot be painted into the frame; an
+                // `<img>` that painted nothing needs nothing painted.
+                if !covered && !frame.geometry.painted_nothing(lookup) {
                     return false;
                 }
             }
@@ -11577,6 +11578,27 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_size_container_keeps_its_container_queries_answered() {
+        let source = "<style>body{margin:0;font:10px/10px sans-serif}p{margin:0}#c{container-type:inline-size;width:150px}\
+            @container (min-width:100px){.q{color:red}}</style><div id=wrap style='position:relative'><div id=c><p class=q>query</p>\
+            <p>more</p></div></div><p id=z>tail</p>";
+        let document = crate::html::parse(source, 256).unwrap();
+        let z = find(&document, "#z");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(200, 400, &Mono).unwrap();
+        let (clears, passes) = (session.invalidation_stats().fragment_clears, session.invalidation_stats().intrinsic_clears[3]);
+        for height in ["30px", "12px"] {
+            session.document_mut().set_attribute(z, "style", &alloc::format!("height:{height}")).unwrap();
+            session.display_list(200, 400, &Mono).unwrap();
+        }
+        let stats = session.invalidation_stats();
+        assert_eq!((stats.fragment_clears, stats.intrinsic_clears[3]), (clears, passes), "no container query pass follows the replay");
+        assert!(stats.fragments_replayed > 0);
+        assert_eq!(stats.verify_mismatches, 0);
+    }
+
+    #[test]
     fn scrolling_a_nested_scroller_far_keeps_fragments_outside_it() {
         let mut source = String::from("<style>body{margin:0;font:10px/10px sans-serif}p{margin:0}#s{height:40px;overflow:auto}</style>");
         for index in 0..20 { source.push_str(&alloc::format!("<p>before {index}</p>")); }
@@ -12423,6 +12445,39 @@ mod tests {
             "<body style='margin:0'><img src='fallback.png' srcset='big.png 2x' width=100 height=50 style='display:block'>", 64).unwrap()), ());
         let reference = fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
         assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn a_sized_img_arriving_outside_the_painted_area_needs_no_layout() {
+        let source = "<body style='margin:0'><img src='a.png' width=10 height=10 style='display:block'>\
+            <div style='height:5000px'></div><img src='a.png' width=10 height=10><img src='b.png' width=10 height=10>";
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        let images = Library::new();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let layouts = session.layout_count();
+        // The culled `b.png` paints nothing; `a.png` is also painted at the top.
+        images.arrive("a.png", 5);
+        images.arrive("b.png", 6);
+        let list = session.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        assert_eq!(session.layout_count(), layouts, "the arrivals are painted into the frame");
+        assert_eq!(painted_pixels(&list), [5]);
+        let mut fresh = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        assert!(list.0 == fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().0, "the patch paints what a layout does");
+    }
+
+    #[test]
+    fn an_arrival_shared_by_a_culled_img_and_a_cross_fade_paints_the_cross_fade() {
+        let source = "<body style='margin:0'><div style='width:40px;height:20px;background-image:cross-fade(50% url(c.png), 50% url(d.png))'></div>\
+            <div style='height:5000px'></div><img src='c.png' width=10 height=10>";
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        let images = Library::new();
+        images.arrive("d.png", 2);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        images.arrive("c.png", 4);
+        let list = session.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        let mut fresh = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        assert!(list.0 == fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().0, "the cross-fade shows its arrived image");
     }
 
     #[test]

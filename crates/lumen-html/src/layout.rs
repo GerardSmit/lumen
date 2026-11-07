@@ -2375,6 +2375,8 @@ pub(crate) struct RetainedLayoutCache {
     /// Fragments with at most this many commands are not retained.
     min_commands: usize,
     clock: u64,
+    /// `clock` when the current frame began.
+    frame_clock: u64,
     hits: usize,
     misses: usize,
     /// Misses of the frame by what differed: no fragment, its constraints,
@@ -2641,6 +2643,7 @@ impl RetainedLayoutCache {
         self.miss_reasons = [0; 5];
         self.laid_out = 0;
         self.clock = self.clock.saturating_add(1);
+        self.frame_clock = self.clock;
         self.intrinsics.begin_frame();
     }
 
@@ -2834,6 +2837,12 @@ impl RetainedLayoutCache {
 
     /// Removes the least recently used fragment.
     fn evict_oldest(&mut self) -> bool {
+        self.evict_oldest_before(u64::MAX)
+    }
+
+    /// Evicts the least recently used fragment, unless it was stored or used
+    /// at `limit` or later.
+    fn evict_oldest_before(&mut self, limit: u64) -> bool {
         loop {
             let Some((&stamp, &node)) = self.lru.iter().next() else { return false };
             let Some(&slot) = self.index.get(&node) else {
@@ -2847,6 +2856,7 @@ impl RetainedLayoutCache {
                 self.lru.insert(used, node);
                 continue;
             }
+            if used >= limit { return false; }
             self.remove_slot(slot);
             return true;
         }
@@ -2927,7 +2937,10 @@ impl RetainedLayoutCache {
                 self.unheld_style_bytes([(&fragment.parent_style, parent_bytes), (&fragment.style, style_bytes)]),
             ) > self.budget.max_bytes
         {
-            if !self.evict_oldest() {
+            // A full cache keeps what this frame stored or replayed: the
+            // boxes laid out first are the descendants of those stored last,
+            // which hold copies of them and go as soon as one inside changes.
+            if !self.evict_oldest_before(self.frame_clock) {
                 return;
             }
         }
@@ -4696,6 +4709,12 @@ struct Layout<'a> {
     /// Bumped by content whose position does not follow its scroll container
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
+    /// Lookups that `html_image_presentation` made for paint-only `<img>`
+    /// elements, for `LayoutGeometry::culled_images`.
+    img_lookups: core::cell::RefCell<Vec<PendingLookup>>,
+    /// The `scroll_hazards` a retained fragment cannot carry: all but those
+    /// of absolutely positioned boxes, whose count a replay adds again.
+    unretainable_hazards: usize,
     gap_capture: Option<css::gap_decorations::Input>,
     /// Viewport-fixed and viewport-sticky boxes recorded as scroll anchors
     /// (`ScrollRegion::anchor`) for scrolling the document by translation.
@@ -4994,6 +5013,8 @@ impl<'a> Layout<'a> {
         cull: viewport,
         paint_extent: None,
         scroll_hazards: 0,
+        img_lookups: Default::default(),
+        unretainable_hazards: 0,
         gap_capture: None,
         root_anchors: 0,
         root_scroll_hazards: 0,
@@ -8554,7 +8575,7 @@ struct BoxChildOverride {
     cell_height_phase: Option<TableCellHeightPhase>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct PositionedClipPolicy {
     source: (NodeId,Option<css::PseudoElement>),
     containing_block: Option<NodeId>,
@@ -11455,6 +11476,16 @@ pub(crate) struct LayoutGeometry {
     /// Paint-only images which were still loading when this was laid out; see
     /// [`DeferredImage`].
     pub deferred_images: Vec<DeferredImage>,
+    /// Lookups of paint-only `<img>` elements that were still loading. One
+    /// that has no record in `deferred_images` painted nothing (it is hidden,
+    /// or outside the culled area), so its arrival changes no command of this
+    /// frame, unless a background asked for it too (`background_lookups`).
+    pub(crate) culled_images: Vec<PendingLookup>,
+    /// Lookups of background images that were still loading; a nested
+    /// cross-fade image among them paints without a record.
+    pub(crate) background_lookups: Vec<PendingLookup>,
+    /// More lookups than these lists keep were made.
+    pub(crate) lookups_incomplete: bool,
     /// `(deferred image, command)` of the deferred backgrounds, found when a
     /// frame is first scrolled and kept until a deferred image is retired.
     pub(crate) deferred_commands: Option<Vec<(usize, usize)>>,
@@ -12216,8 +12247,29 @@ impl LayoutGeometry {
     }
 
     /// Drops `arrived` deferred images, once they are painted into the frame.
+    /// Notes paint-only lookups made since `mark` in `culled_images` (an
+    /// `<img>`) or `background_lookups`.
+    fn note_paint_only_lookups(&mut self, images: &dyn ImageResolver, mark: usize, image: bool) {
+        if images.pending_mark() == mark { return; }
+        for (lookup, _) in images.pending_since(mark) { self.note_lookup(lookup, image); }
+    }
+
+    fn note_lookup(&mut self, lookup: PendingLookup, image: bool) {
+        let list = if image { &mut self.culled_images } else { &mut self.background_lookups };
+        if list.contains(&lookup) { return; }
+        if list.len() >= 4096 { self.lookups_incomplete = true; return; }
+        list.push(lookup);
+    }
+
+    /// Whether an arrived `lookup` with no record painted nothing.
+    pub(crate) fn painted_nothing(&self, lookup: &PendingLookup) -> bool {
+        !self.lookups_incomplete && self.culled_images.contains(lookup) && !self.background_lookups.contains(lookup)
+    }
+
     pub(crate) fn retire_deferred_images(&mut self, arrived: &[PendingLookup]) {
         self.deferred_images.retain(|record| !arrived.contains(&record.lookup));
+        self.culled_images.retain(|lookup| !arrived.contains(lookup));
+        self.background_lookups.retain(|lookup| !arrived.contains(lookup));
         self.deferred_commands = None;
     }
 
@@ -15853,7 +15905,19 @@ fn resolved_gap(pixels: f32, fraction: f32, basis: Option<f32>) -> f32 {
 type StackingEscape=(usize,usize,usize,usize,usize,usize,i32,(NodeId,Option<css::PseudoElement>),u64,bool);
 
 struct RetainedPaintPhases {
-    contexts:Arc<[PaintContext]>,completed:Arc<[usize]>,escapes:Arc<[StackingEscape]>,surfaces:Arc<[StackingEscape]>,order_advance:u64,
+    contexts:Arc<[PaintContext]>,completed:Arc<[usize]>,escapes:Arc<[StackingEscape]>,surfaces:Arc<[StackingEscape]>,
+    /// `positioned_flow_paints` entries the box added, relative to its first
+    /// command, hit and paint order.
+    positioned:Arc<[PositionedFlowPaint]>,
+    /// The clip policies of absolutely positioned descendants, relative to
+    /// the box's first command and hit, and the scroll hazards they added.
+    clips:Arc<[PositionedClipPolicy]>,
+    /// `overflow_clip_commands` of the box when it has `clips`.
+    clip_owners:Arc<[(usize,(NodeId,Option<css::PseudoElement>))]>,
+    hazards:usize,
+    /// The container unit records of size containers inside the box.
+    containers:Arc<[ContainerUnitRecord]>,
+    order_advance:u64,
 }
 
 #[derive(Clone,Copy)]
@@ -17696,12 +17760,14 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         // `finish_background_indices` usually replaces this command with the
         // final one, and its record with that command's.
         let previous = self.images.map(|images| images.set_paint_only(true));
+        let mark = self.images.map_or(0, |images| images.pending_mark());
         let (paint, deferred) = self.deferred_background_paint(rect, coverage, style, layer, layer_index, None, sizing);
         let command = background_command_with_fragment_sizing(
             rect,coverage,style,layer,layer_index,&paint,self.viewport,None,self.images,sizing,
         );
         if let (Some(images), Some(previous)) = (self.images, previous) {
             images.set_paint_only(previous);
+            if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, mark, false); }
         }
         if let (Some(deferred), Some(geometry)) = (deferred, self.geometry.as_deref_mut()) {
             geometry.deferred_images.push(deferred);
@@ -17790,6 +17856,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 Command::FillBackground(_) => {
                     if let Some((layer_index, layer)) = layers.next() {
                         let previous = self.images.map(|images| images.set_paint_only(true));
+                        let mark = self.images.map_or(0, |images| images.pending_mark());
                         let (paint, deferred) = deferred_background_paint(self.images, self.geometry.is_some(), self.viewport, rect, coverage, style, &layer, layer_index, local_padding_area, sizing);
                         let replacement = background_command_with_fragment_sizing(
                             rect,coverage,style,&layer,layer_index,&paint,self.viewport,
@@ -17797,6 +17864,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                         );
                         if let (Some(images), Some(previous)) = (self.images, previous) {
                             images.set_paint_only(previous);
+                            if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, mark, false); }
                         }
                         if let Some(geometry) = self.geometry.as_deref_mut() {
                             geometry.deferred_images.retain(|record| !paint_command_holds(command, &record.placeholder));
@@ -32949,6 +33017,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 .any(|frame| frame.scroll_container)
         {
             self.scroll_hazards = self.scroll_hazards.saturating_add(1);
+            self.unretainable_hazards = self.unretainable_hazards.saturating_add(1);
         }
         for port in &mut geometry.scroll_ports {
             if port.owner_hit.is_some_and(|index| hits.contains(&index)) {
@@ -36395,6 +36464,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.correct_positioned_clip_scopes()?;
         self.commands.shrink_to_fit();
         if let Some(geometry) = self.geometry.as_deref_mut() {
+            for lookup in self.img_lookups.take() { geometry.note_lookup(lookup, true); }
             let commands = &self.commands;
             geometry.paint_sources.retain(|source| commands.get(source.command).is_some_and(paint_source_command));
             geometry.paint_sources.sort_by_key(|source| (source.command, source.node.key()));
@@ -37565,6 +37635,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         if has_layer_attachment(&style, css::BackgroundAttachment::Fixed) {
             self.scroll_hazards += 1;
+            self.unretainable_hazards += 1;
             self.root_scroll_hazards += 1;
         }
         if matches!(
@@ -38766,11 +38837,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             _ => return None,
         };
         // Keep the retained path narrow: in-flow block-level boxes (block,
-        // list item, flow root, flex and grid containers, statically or
+        // list item, flow root, flex, grid and table containers, statically or
         // relatively positioned, transformed or not) in a block container
         // (block, list item, flow root, inline block, table cell or caption)
         // or as flex and grid items, whose used size is in their style.
-        // Inline-level and table boxes, out-of-flow boxes and scroll
+        // Inline-level boxes, table parts, out-of-flow boxes and scroll
         // containers stay on the normal layout path and can still reuse safe
         // descendants. A box whose own paint records (stacking contexts,
         // z-index order, escapes) reach outside it is retained with them, in
@@ -38780,7 +38851,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         if depth == 0
             || matches!(name.as_str(), "html" | "body")
             || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption | Display::Flex | Display::Grid)
-            || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid)
+            || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid | Display::Table)
             || !matches!(style.position, Position::Static | Position::Relative)
             || style.float != Float::None
             || style.overflow_clip
@@ -38813,8 +38884,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             sticky_bounds: self.sticky_bounds,
             // No `scroll_hazards`: it counts hazards laid out before the box,
             // and a fragment is retained only when its own layout adds none
-            // (see `stable` in `box_for_with_children_output`), so scroll
-            // containers inside it compare equal counts wherever it replays.
+            // but those of absolutely positioned descendants, which its replay
+            // adds again (see `stable` in `box_for_with_children_output`), so
+            // scroll containers inside it compare equal counts wherever it
+            // replays.
             transform_depth: self.transform_depth,
             svg_geometry_capture: self.svg_geometry_capture,
             source_capture: self.source_capture_depth != 0,
@@ -39084,6 +39157,37 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     if !is_surface{entry.8=self.next_paint_order.checked_add(entry.8).ok_or(LayoutError::CommandLimit)?;}output.push(entry);
                 }
             }
+            if self.positioned_flow_paints.len().saturating_add(phases.positioned.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            self.positioned_flow_paints.try_reserve(phases.positioned.len()).map_err(|_|LayoutError::CommandLimit)?;
+            for paint in phases.positioned.iter(){
+                self.positioned_flow_paints.push(PositionedFlowPaint{order:self.next_paint_order.checked_add(paint.order).ok_or(LayoutError::CommandLimit)?,
+                    commands:rebase_range(paint.commands.clone(),command_base)?,hits:rebase_range(paint.hits.clone(),hit_base)?});
+            }
+            if self.positioned_clip_policies.len().saturating_add(phases.clips.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            self.positioned_clip_policies.try_reserve(phases.clips.len()).map_err(|_|LayoutError::CommandLimit)?;
+            for policy in phases.clips.iter(){
+                self.positioned_clip_policies.push(PositionedClipPolicy{source:policy.source,containing_block:policy.containing_block,
+                    commands:rebase_range(policy.commands.clone(),command_base)?,hits:rebase_range(policy.hits.clone(),hit_base)?});
+            }
+            if self.overflow_clip_commands.len().saturating_add(phases.clip_owners.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            for &(index,owner) in phases.clip_owners.iter(){
+                self.overflow_clip_commands.insert(command_base.checked_add(index).ok_or(LayoutError::CommandLimit)?,owner);
+            }
+            self.scroll_hazards=self.scroll_hazards.saturating_add(phases.hazards);
+            if let Some(geometry)=self.geometry.as_deref_mut(){
+                for record in phases.containers.iter(){
+                    let key=record.node.key();
+                    match geometry.container_unit_index.get(&key).copied() {
+                        Some(index) if index<geometry.container_units.len() => geometry.container_units[index]=*record,
+                        _ => {
+                            if geometry.container_units.len()>=MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+                            geometry.container_units.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                            geometry.container_unit_index.insert(key,geometry.container_units.len());
+                            geometry.container_units.push(*record);
+                        }
+                    }
+                }
+            }
             self.next_paint_order=self.next_paint_order.checked_add(phases.order_advance).ok_or(LayoutError::CommandLimit)?;
         }
         self.collapsed_top = fragment.collapsed_top;
@@ -39134,7 +39238,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         advance: f32,
         overflow: OverflowMetrics,
         has_text: bool,
-        paint_starts:(usize,usize,usize,usize,u64),
+        paint_starts:(usize,usize,usize,usize,u64,usize,usize,usize,usize),
         paint_source_start: usize,
     ) -> Option<RetainedFragment> {
         let geometry = self.geometry.as_deref()?;
@@ -39249,7 +39353,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_boxes.as_deref().unwrap_or(&[]),
             rendered_table_members.as_deref().unwrap_or(&[]),
         )?;
-        let (context_start,completed_start,escape_start,surface_start,order_start)=paint_starts;
+        let (context_start,completed_start,escape_start,surface_start,order_start,positioned_start,clip_start,hazard_start,container_start)=paint_starts;
         let mut contexts=Vec::new();
         for context in self.paint_contexts.get(context_start..)? {
             let mut context=*context;
@@ -39273,12 +39377,44 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let escapes=relative_sources(self.pending_escapes.get(escape_start..)?,false)?;
         let surfaces=relative_sources(self.surface_records.get(surface_start..)?,true)?;
+        // The box's own `position: relative` records, and those of
+        // descendants its block walks left for an outer walk to order.
+        let local=|range:&Range<usize>,base:usize|Some(range.start.checked_sub(base)?..range.end.checked_sub(base)?);
+        let mut positioned=Vec::new();
+        for paint in self.positioned_flow_paints.get(positioned_start..)?{
+            positioned.try_reserve(1).ok()?;
+            positioned.push(PositionedFlowPaint{order:paint.order.checked_sub(order_start)?,
+                commands:local(&paint.commands,command_start)?,hits:local(&paint.hits,hit_start)?});
+        }
+        let mut clips=Vec::new();
+        for policy in self.positioned_clip_policies.get(clip_start..)?{
+            clips.try_reserve(1).ok()?;
+            clips.push(PositionedClipPolicy{source:policy.source,containing_block:policy.containing_block,
+                commands:local(&policy.commands,command_start)?,hits:local(&policy.hits,hit_start)?});
+        }
+        let hazards=self.scroll_hazards.checked_sub(hazard_start)?;
+        // Size containers inside the box answer container queries from their
+        // records; the replay records them again.
+        let containers:Vec<ContainerUnitRecord>=geometry.container_units.get(container_start..)?.to_vec();
+        // The clip correction for those descendants finds the overflow clips
+        // around them by their commands.
+        let mut clip_owners=Vec::new();
+        if !clips.is_empty() {
+            for (&index,&owner) in self.overflow_clip_commands.range(command_start..){
+                clip_owners.try_reserve(1).ok()?;clip_owners.push((index-command_start,owner));
+            }
+        }
         let phase_bytes=core::mem::size_of::<RetainedPaintPhases>()
+            .checked_add(positioned.len().checked_mul(core::mem::size_of::<PositionedFlowPaint>())?)?
+            .checked_add(clips.len().checked_mul(core::mem::size_of::<PositionedClipPolicy>())?)?
+            .checked_add(containers.len().checked_mul(core::mem::size_of::<ContainerUnitRecord>())?)?
+            .checked_add(clip_owners.len().checked_mul(core::mem::size_of::<(usize,(NodeId,Option<css::PseudoElement>))>())?)?
             .checked_add(contexts.len().checked_mul(core::mem::size_of::<PaintContext>())?)?
             .checked_add(completed.len().checked_mul(core::mem::size_of::<usize>())?)?
             .checked_add(escapes.len().checked_add(surfaces.len())?.checked_mul(core::mem::size_of::<StackingEscape>())?)?;
-        let paint_phases=(!contexts.is_empty() || !escapes.is_empty() || !surfaces.is_empty()).then(||Arc::new(RetainedPaintPhases{
-            contexts:contexts.into(),completed:completed.into(),escapes:escapes.into(),surfaces:surfaces.into(),order_advance:self.next_paint_order-order_start,
+        let paint_phases=(!contexts.is_empty() || !escapes.is_empty() || !surfaces.is_empty() || !positioned.is_empty() || !clips.is_empty() || hazards != 0 || !containers.is_empty()).then(||Arc::new(RetainedPaintPhases{
+            contexts:contexts.into(),completed:completed.into(),escapes:escapes.into(),surfaces:surfaces.into(),positioned:positioned.into(),
+            clips:clips.into(),clip_owners:clip_owners.into(),hazards,containers:containers.into(),order_advance:self.next_paint_order-order_start,
         }));
         let bytes=bytes.checked_add(if paint_phases.is_some(){phase_bytes.checked_add(core::mem::size_of::<usize>()*10)?}else{0})?;
         let bytes = bytes.checked_add(overflow_bytes)?.checked_add(paint_source_bytes)?;
@@ -39855,7 +39991,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
 
         let command_start = self.commands.len();
-        let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order);
+        let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order,self.positioned_flow_paints.len(),self.positioned_clip_policies.len(),self.scroll_hazards,
+            self.geometry.as_deref().map_or(0,|geometry|geometry.container_units.len()));
         let text_uses_before = self.text_uses.get();
         let block_basis_before = self.intrinsics.block_basis_reads.get();
         let pending_mark = self.images.map_or(0, |images| images.pending_mark());
@@ -39886,6 +40023,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let pending_before = key.as_ref().filter(|_| self.pending_escapes.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.pending_escapes.clone());
         let positioned_before = key.as_ref().filter(|_| self.positioned_flow_paints.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.positioned_flow_paints.clone());
         let clip_policies_before=self.positioned_clip_policies.len();
+        let clips_before = key.as_ref().filter(|_| clip_policies_before <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.positioned_clip_policies.clone());
+        let unretainable_before = self.unretainable_hazards;
         let stacking_before = key.as_ref().map(|_| self.stacking_roots.clone());
         let hazards_before = self.scroll_hazards;
         let root_hazards_before = self.root_scroll_hazards;
@@ -39985,15 +40124,38 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             // Timeline-bearing fragments are sampled by the current source
             // operation. Retain unrelated fragments, without freezing rare
             // descendant map matrices or allocating per-fragment provenance.
-            let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && self.positioned_clip_policies.len()==clip_policies_before && self.floats.len() == floats_before
-                && self.scroll_hazards == hazards_before
+            // Absolutely positioned descendants are retained with the box when
+            // their containing block is inside it: their clip policies and
+            // scroll hazards are replayed, and their overflow reaches no box
+            // outside the fragment.
+            let inside = |node: Option<NodeId>| {
+                let mut current = node;
+                for _ in 0..=512 {
+                    let Some(at) = current else { return false };
+                    if at == id { return true; }
+                    current = match self.document.composed_parent(at) { Ok(parent) => parent, Err(_) => return false };
+                }
+                false
+            };
+            let clips_kept = match clips_before.as_ref() {
+                Some(before) => self.positioned_clip_policies.starts_with(before)
+                    && self.positioned_clip_policies[before.len()..].iter().all(|policy| policy.commands.start >= command_start
+                        && policy.hits.start >= starts.0 && inside(policy.containing_block)),
+                None => self.positioned_clip_policies.len() == clip_policies_before && self.scroll_hazards == hazards_before,
+            };
+            let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && clips_kept && self.floats.len() == floats_before
+                && self.unretainable_hazards == unretainable_before
                 && self.root_scroll_hazards == root_hazards_before
                 && match pending_before.as_ref() {
                     Some(before) => self.pending_escapes.starts_with(before),
                     None => self.outer_paint_edits == outer_before.0 && self.pending_escapes.len() >= outer_before.1,
                 }
+                // The box may add records of its own, within its commands, for
+                // an outer block walk to order; the fragment keeps them.
                 && match positioned_before.as_ref() {
-                    Some(before) => *before == self.positioned_flow_paints,
+                    Some(before) => self.positioned_flow_paints.starts_with(before)
+                        && self.positioned_flow_paints[before.len()..].iter()
+                            .all(|paint| paint.commands.start >= command_start && paint.hits.start >= starts.0),
                     None => self.outer_paint_edits == outer_before.0 && self.positioned_flow_paints.len() == outer_before.2,
                 }
                 && stacking_before.as_ref() == Some(&self.stacking_roots)
@@ -40270,6 +40432,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             };
             if out_of_flow || style.position == Position::Sticky {
                 self.scroll_hazards += 1;
+                if style.position != Position::Absolute { self.unretainable_hazards += 1; }
             }
             // The physical-width margin equation below owns only a
             // horizontal containing block's inline axis. A vertical parent's
@@ -41107,8 +41270,14 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         // arriving (see `ImageResolver::set_paint_only`).
         let sized_img=style.width.is_some()&&style.height.is_some()&&crate::forms::html_element_local_name(self.document,id)==Some("img");
         let previous=if sized_img{self.images.map(|images|images.set_paint_only(true))}else{None};
+        let mark=self.images.map_or(0,|images|images.pending_mark());
         let presentation=self.html_image_presentation_with_dimensions(id,attributes,style.width.is_some()||style.height.is_some());
-        if let (Some(images),Some(previous))=(self.images,previous){images.set_paint_only(previous);}
+        if let (Some(images),Some(previous))=(self.images,previous){
+            images.set_paint_only(previous);
+            if self.geometry.is_some() && images.pending_mark()!=mark {
+                self.img_lookups.borrow_mut().extend(images.pending_since(mark).into_iter().map(|(lookup,_)|lookup).take(4097));
+            }
+        }
         presentation
     }
     /// Whether an `<img>` can present its alternative text, which needs its
@@ -42136,6 +42305,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             // A scrolling ancestor must relayout so fixed layers keep their
             // viewport positioning area while the element's clip moves.
             self.scroll_hazards += 1;
+            self.unretainable_hazards += 1;
             self.root_scroll_hazards += 1;
         }
         if style.display.is_table() {
@@ -42369,6 +42539,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             let paint_only_image = tag == "img" && replacement_source.is_none() && source.is_some()
                 && specified_width.is_some() && specified_height.is_some();
             let previous_paint_only = if paint_only_image { self.images.map(|images| images.set_paint_only(true)) } else { None };
+            let paint_only_mark = self.images.map_or(0, |images| images.pending_mark());
             let mut poster_source: Option<&str> = None;
             let procedural_replacement=if let Some(source)=replacement_source.as_deref() {
                 let image=css::computed_image_source(source,style.color);
@@ -42456,6 +42627,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
             if let (Some(images), Some(previous)) = (self.images, previous_paint_only) {
                 images.set_paint_only(previous);
+                if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, paint_only_mark, true); }
             }
             // A blank canvas is still a replaced element: its bitmap dimensions
             // size the box even when no renderer bitmap has been allocated.
@@ -44887,6 +45059,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         self.cull = saved_cull;
         if column_fragment_count > 1 {
             self.scroll_hazards += 1;
+            self.unretainable_hazards += 1;
         }
         if let Some(index) = clip_index {
             let padding = Rect {
@@ -63553,6 +63726,45 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         let third = retained_frame(&document, &mut cache);
         assert!(cache.stats().hits >= 3);
         assert_same_frame(&third, &fresh_frame(&document));
+    }
+
+    const RETAINED_POSITIONED_PAGE: &str = "<!doctype html><style>html,body{margin:0}div,table{width:200px}\
+        #abs,#escaped{position:absolute;left:5px;top:5px;width:30px;height:30px;background:red}#clip{overflow:hidden;width:20px;height:20px}</style>\
+        <div id=rel style='position:relative;left:3px'>moved <b>text</b></div>\
+        <div id=cb style='position:relative;height:40px'><div id=abs></div>kept</div>\
+        <table id=t><tr><td>one</td><td>two</td></tr></table>\
+        <div id=outer style='position:relative;height:30px'><div id=clip><div id=escaped></div></div></div>\
+        <div id=z style='height:10px'></div>";
+
+    #[test]
+    fn retained_relative_absolute_and_table_boxes_replay_beside_a_change() {
+        let mut document = crate::html::parse(RETAINED_POSITIONED_PAGE, 64).unwrap();
+        let z = retained_node(&document, "#z");
+        let mut cache = RetainedLayoutCache::default();
+        let first = retained_frame(&document, &mut cache);
+        assert_same_frame(&first, &fresh_frame(&document));
+        // The relative box, the box holding an absolute child, the table and
+        // the box whose absolute child escapes an overflow clip all replay.
+        document.set_attribute(z, "style", "height:30px").unwrap();
+        cache.invalidate_changed(&document, &[z], &[], &[], &|_| false);
+        let second = retained_frame(&document, &mut cache);
+        assert!(cache.stats().hits >= 4, "{:?}", cache.stats());
+        assert_same_frame(&second, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_positioned_boxes_moved_by_a_change_above_match_a_fresh_layout() {
+        let source = RETAINED_POSITIONED_PAGE.replace("<div id=rel", "<div id=top style='height:10px'></div><div id=rel");
+        let mut document = crate::html::parse(&source, 64).unwrap();
+        let top = retained_node(&document, "#top");
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        for height in ["35px", "2px"] {
+            document.set_attribute(top, "style", &alloc::format!("height:{height}")).unwrap();
+            cache.invalidate_changed(&document, &[top], &[], &[], &|_| false);
+            let frame = retained_frame(&document, &mut cache);
+            assert_same_frame(&frame, &fresh_frame(&document));
+        }
     }
 
     #[test]
