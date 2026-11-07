@@ -26899,7 +26899,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             return Ok((empty, empty));
         }
         let bidi = self.paragraph_bidi(paragraph,&paragraph.text,style)?;
-        self.prepare_inline_shaping(paragraph,&bidi,false)?;
+        // The min-content size measures every segment between break
+        // opportunities: one shaping of the paragraph answers them all from its
+        // retained cluster advances, instead of shaping each word again.
+        self.prepare_inline_shaping(paragraph,&bidi,want_minimum)?;
         let mut maximum_width = 0.0f32;
         let mut minimum_width = 0.0f32;
         for (paragraph_index, bidi_paragraph) in bidi.paragraphs.iter().enumerate() {

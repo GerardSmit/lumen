@@ -1217,6 +1217,10 @@ pub struct InvalidationStats {
     pub intrinsics_reused: u64,
     /// Times every retained fragment was dropped.
     pub fragment_clears: u64,
+    /// Times every retained intrinsic size was dropped, by cause: images
+    /// replaced, a full restyle, a new style epoch without one, a container
+    /// query pass.
+    pub intrinsic_clears: [u64; 4],
     /// Full restyles by cause: generated counter/quote/list context, a
     /// mutation which is not local, sibling-dependent rules, a new
     /// environment, a rule change, any other cause.
@@ -6892,6 +6896,7 @@ impl RenderSession {
                 && !matches!((cached.image_generation, images), (Some(painted), Some(images)) if images.arrivals_only_since(painted))
         });
         if unversioned_pending || images_replaced {
+            self.invalidation_stats.intrinsic_clears[0] += 1;
             self.layout_cache.clear_intrinsics();
         }
         if unversioned_pending || self.cached.as_ref().is_some_and(|cached| {
@@ -7108,6 +7113,7 @@ impl RenderSession {
         let rules = self.rules.as_ref().expect("stylesheets initialized");
         let style_epoch = self.style_cache.borrow().epoch();
         if self.intrinsic_style_epoch != Some(style_epoch) {
+            self.invalidation_stats.intrinsic_clears[if full_restyle { 1 } else { 2 }] += 1;
             self.layout_cache.clear_intrinsics();
             self.intrinsic_style_epoch = Some(style_epoch);
         }
@@ -7290,6 +7296,7 @@ impl RenderSession {
                         styles.begin_frame();
                         rules.prestyle(&self.document, &mut styles, text);
                         self.intrinsic_style_epoch = Some(styles.epoch());
+                        self.invalidation_stats.intrinsic_clears[3] += 1;
                         self.layout_cache.clear_intrinsics();
                         changed = true;
                     }
