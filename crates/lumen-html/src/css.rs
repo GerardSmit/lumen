@@ -29801,6 +29801,7 @@ fn restyle_one(
     node: NodeId,
     forced_parent: Option<&Arc<Style>>,
     paint: Option<&mut Vec<RestyledPaint>>,
+    keep_sharing: bool,
 ) -> Result<(StyleDamage, Option<Arc<Style>>, Option<Arc<Style>>), CssError> {
     let old = cache.node_entry(node).cloned();
     let old_pseudos: Vec<(PseudoElement, Option<GeneratedStyle>)> = if cache.selected.is_some() { Vec::new() } else {
@@ -29809,7 +29810,7 @@ fn restyle_one(
             .map(|entry| (entry.pseudo, entry.generated.clone()))
             .collect())
     };
-    cache.drop_node(node);
+    if keep_sharing { cache.forget_node_entry(node); } else { cache.drop_node(node); }
     cache.refresh_bloom(document, node);
     let Some((_, token, _, old_style)) = old else {
         return Ok((StyleDamage::Layout, None, None));
@@ -29920,7 +29921,12 @@ pub(crate) fn restyle_nodes(
     // rules change no selector analysis bounds) is a full restyle that keeps
     // the layout of boxes whose styles come out the same: nothing cheaper
     // remains to fall back to.
-    let mut budget = if targets.len() >= cache.styled_count() { usize::MAX } else { document.node_count() / 2 + 256 };
+    let full = targets.len() >= cache.styled_count();
+    let mut budget = if full { usize::MAX } else { document.node_count() / 2 + 256 };
+    // Sharing describes the document as styles were computed. A bounded
+    // restyle follows mutations, so each node drops it; a full one drops it
+    // once, and the styles it computes share with each other.
+    if full { cache.reset_sharing(); }
     let mut damage: alloc::collections::BTreeMap<u128, (NodeId, StyleDamage)> = alloc::collections::BTreeMap::new();
     let mut done: alloc::collections::BTreeSet<u128> = alloc::collections::BTreeSet::new();
     let mut pending: Vec<(NodeId, Arc<Style>, Arc<Style>)> = Vec::new();
@@ -29933,7 +29939,7 @@ pub(crate) fn restyle_nodes(
             continue;
         }
         done.insert(node.key());
-        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None, paint.as_deref_mut())?;
+        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None, paint.as_deref_mut(), full)?;
         record(&mut damage, node, level);
         if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
             pending.push((node, new_style, old_style));
@@ -29985,7 +29991,7 @@ pub(crate) fn restyle_nodes(
                 }
                 budget -= 1;
                 done.insert(child.key());
-                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent), paint.as_deref_mut())?;
+                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent), paint.as_deref_mut(), full)?;
                 record(&mut damage, child, level);
                 if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
                     pending.push((child, new_style, old_style));
