@@ -1393,7 +1393,7 @@ const MAX_RENDERED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// Largest charge for one retained fragment.
 const MAX_RETAINED_FRAGMENT_BYTES: usize = 1 * 1024 * 1024;
 const DEFAULT_RETAINED_ENTRIES: usize = 16384;
-const DEFAULT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 /// Styles shared between neighbouring retained fragments.
 const RETAINED_STYLE_POOL: usize = 32;
 
@@ -4760,6 +4760,11 @@ struct Layout<'a> {
     /// In-flow `position: relative; z-index: auto` subtrees, kept with the
     /// nearest block walk so later positioned siblings can retain tree order.
     positioned_flow_paints: Vec<PositionedFlowPaint>,
+    /// Counts every rewrite, removal or drain of entries already in
+    /// `pending_escapes` or `positioned_flow_paints` (appends are not counted),
+    /// so a retained box over many outer records sees that its layout left
+    /// them alone without copying them.
+    outer_paint_edits: u64,
     positioned_clip_policies: Vec<PositionedClipPolicy>,
     overflow_clip_commands: BTreeMap<usize,(NodeId,Option<css::PseudoElement>)>,
     content_range_fragments: BTreeMap<FlowContentRanges,Vec<FlowContentRanges>>,
@@ -5026,6 +5031,7 @@ impl<'a> Layout<'a> {
         pending_escapes: Vec::new(),
         negative_source_order: None,
         positioned_flow_paints: Vec::new(),
+        outer_paint_edits: 0,
         positioned_clip_policies: Vec::new(),
         overflow_clip_commands: BTreeMap::new(),
         content_range_fragments: BTreeMap::new(),
@@ -8432,6 +8438,7 @@ impl Layout<'_> {
     }
 
     fn discard_positioned_flow_in(&mut self, commands: Range<usize>, hits: Range<usize>) {
+        self.outer_paint_edits = self.outer_paint_edits.wrapping_add(1);
         self.positioned_flow_paints.retain(|paint| {
             !(paint.commands.start >= commands.start
                 && paint.commands.end <= commands.end
@@ -16253,8 +16260,9 @@ fn raised_index(index: usize, moved: &core::ops::Range<usize>, end: usize) -> us
     range.start
 }
 
-/// Paint records pending outside a retained box are compared before and after
-/// its layout; more than this many make that comparison too costly.
+/// Paint records pending outside a retained box are copied and compared before
+/// and after its layout up to this many; past it the copy would cost more than
+/// the layout, and `outer_paint_edits` with the lengths decide instead.
 const RETAINED_OUTER_PAINT_RECORDS: usize = 256;
 
 /// Slack around everything a retained fragment emitted, for ink the
@@ -33010,6 +33018,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             let hit=Self::inline_filter_projected_extent(hits,context.prefix.1,context.end.1)?;
             context.prefix=(command.0,hit.0);context.end=(command.1,hit.1);
         }
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         for values in [&mut self.pending_escapes,&mut self.surface_records] {
             let mut result=Vec::new();
             for value in values.iter() {
@@ -37903,6 +37912,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 raise_range(command_range, commands.start, commands.end, command_end);
                 raise_range(hit_range, hits.start, hits.end, hit_end);
             }
+            self.outer_paint_edits = self.outer_paint_edits.wrapping_add(1);
             for entry in &mut self.pending_escapes {
                 let mut range = entry.2..entry.3;
                 raise_range(&mut range, commands.start, commands.end, command_end);
@@ -38300,6 +38310,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // Ranking rewrites the order field, so parts are found by identity.
         let reach_key=|entry:&StackingEscape|(entry.7.0.key(),entry.7.1.map(|pseudo|pseudo.generated_source_order()),entry.2,entry.4);
         let mut reaches:Vec<((u128,Option<u8>,usize,usize),(usize,usize))>=Vec::new();
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         for entry in self.pending_escapes.drain(..){
             let parts=Self::transparent_stacking_parts(entry,ownership.get(&(entry.8,entry.2,entry.4)).map_or(&[],Vec::as_slice))?;
             if sources.len().saturating_add(parts.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
@@ -38381,6 +38392,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // this final step. Published retained payloads and geometry are remapped
         // once by the shared scope-aware permutation below.
         self.completed_stacking_contexts.clear();self.paint_contexts.clear();
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         self.positioned_flow_paints.clear();self.content_range_fragments.clear();
         self.flow_content_ranges=None;self.last_box_content_ranges=None;
         self.permute_stacking_ranges(&ranges)?;
@@ -38629,19 +38641,21 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             NodeKind::Element { name, .. } => name,
             _ => return None,
         };
-        // Keep the retained path narrow: ordinary block-level boxes (block,
-        // list item, flow root, flex and grid containers) in a block container
-        // (block, list item, flow root, inline block, table cell or caption).
-        // Flex and grid items, inline-level and table boxes, positioned boxes
-        // and scroll containers stay on the normal layout path and can still
-        // reuse safe descendants.
+        // Keep the retained path narrow: in-flow block-level boxes (block,
+        // list item, flow root, flex and grid containers, statically or
+        // relatively positioned) in a block container (block, list item, flow
+        // root, inline block, table cell or caption) or as flex and grid
+        // items, whose used size is in their style. Inline-level and table
+        // boxes, out-of-flow boxes and scroll containers stay on the normal
+        // layout path and can still reuse safe descendants. A box whose own
+        // paint records (stacking contexts, escapes) reach outside it is
+        // retained with them, in `RetainedPaintPhases`.
         if depth == 0
             || matches!(name.as_str(), "html" | "body")
-            || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption)
+            || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption | Display::Flex | Display::Grid)
             || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid)
-            || style.position != Position::Static
+            || !matches!(style.position, Position::Static | Position::Relative)
             || style.float != Float::None
-            || style.paints_as_group()
             || style.z_index.is_some()
             || style.has_transform()
             || style.overflow_clip
@@ -38657,8 +38671,6 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     .any(|item| *item != css::BackgroundAttachment::Scroll)
             })
             || self.transform_depth != 0
-            || self.pending_escapes.len() > RETAINED_OUTER_PAINT_RECORDS
-            || self.positioned_flow_paints.len() > RETAINED_OUTER_PAINT_RECORDS
             || (self.geometry.is_none() && !self.measures_from_retained())
         {
             return None;
@@ -39745,11 +39757,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             )
         });
         let retained_capture = key.as_ref().map(|_| (computed.clone(), self.typographic_origins.len(), self.positioned_uses));
-        let pending_before = key.as_ref().map(|_| self.pending_escapes.clone());
-        let positioned_before = key.as_ref().map(|_| self.positioned_flow_paints.clone());
+        // Up to `RETAINED_OUTER_PAINT_RECORDS` outer records are copied and
+        // compared; past that, the edit count and the lengths stand in.
+        let outer_before = (self.outer_paint_edits, self.pending_escapes.len(), self.positioned_flow_paints.len());
+        let pending_before = key.as_ref().filter(|_| self.pending_escapes.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.pending_escapes.clone());
+        let positioned_before = key.as_ref().filter(|_| self.positioned_flow_paints.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.positioned_flow_paints.clone());
         let clip_policies_before=self.positioned_clip_policies.len();
         let stacking_before = key.as_ref().map(|_| self.stacking_roots.clone());
-        let next_paint_before = self.next_paint_order;
         let hazards_before = self.scroll_hazards;
         let root_hazards_before = self.root_scroll_hazards;
 
@@ -39849,11 +39863,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             // operation. Retain unrelated fragments, without freezing rare
             // descendant map matrices or allocating per-fragment provenance.
             let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && self.positioned_clip_policies.len()==clip_policies_before && self.floats.len() == floats_before
-                && self.next_paint_order == next_paint_before
                 && self.scroll_hazards == hazards_before
                 && self.root_scroll_hazards == root_hazards_before
-                && pending_before.as_ref() == Some(&self.pending_escapes)
-                && positioned_before.as_ref() == Some(&self.positioned_flow_paints)
+                && match pending_before.as_ref() {
+                    Some(before) => self.pending_escapes.starts_with(before),
+                    None => self.outer_paint_edits == outer_before.0 && self.pending_escapes.len() >= outer_before.1,
+                }
+                && match positioned_before.as_ref() {
+                    Some(before) => *before == self.positioned_flow_paints,
+                    None => self.outer_paint_edits == outer_before.0 && self.positioned_flow_paints.len() == outer_before.2,
+                }
                 && stacking_before.as_ref() == Some(&self.stacking_roots)
                 && self.parent_height == key.parent_height
                 && self.containing_block == key.containing_block
@@ -63464,7 +63483,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         for _ in 0..8 { markup.push_str("<div>row</div>"); }
         let document = crate::html::parse(&markup, 64).unwrap();
         let mut cache = RetainedLayoutCache::default();
-        assert_eq!(RetainedLayoutBudget::default(), RetainedLayoutBudget { max_entries: 16384, max_bytes: 8 * 1024 * 1024 });
+        assert_eq!(RetainedLayoutBudget::default(), RetainedLayoutBudget { max_entries: 16384, max_bytes: 32 * 1024 * 1024 });
         cache.set_budget(RetainedLayoutBudget { max_entries: 3, max_bytes: 8 * 1024 * 1024 });
         let first = retained_frame(&document, &mut cache);
         assert!(cache.stats().entries <= 3, "{:?}", cache.stats());

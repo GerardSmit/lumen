@@ -1106,6 +1106,42 @@ diff!(
 );
 
 diff!(
+    flex_and_grid_items_replay_beside_changed_siblings,
+    "<style>body{margin:0}.row{display:flex;gap:4px;align-items:flex-start}.col{display:flex;flex-direction:column}\
+     .grid{display:grid;grid-template-columns:repeat(3,1fr)}.item{flex:1;padding:2px;border:1px solid}\
+     .tall{height:40px}.rel{position:relative;top:3px}.fade{opacity:.5}.z{position:relative;z-index:2}</style>\
+     <div class=row><div id=a class=item>a<p>a1</p></div><div id=b class=item>b<p>b1</p></div><div id=c class='item rel'>c<b class=z>z</b></div></div>\
+     <div class=col><div id=d class=item>d</div><div id=e class='item fade'>e<p>e1</p></div><div id=f class=item>f</div></div>\
+     <div class=grid><div id=g>g</div><div id=h class=rel>h<p>h1</p></div><div id=i>i</div><div id=j>j</div></div>",
+    [
+        |s| attr(s, "#a", "class", "item tall"),
+        |s| attr(s, "#e", "class", "item fade tall"),
+        |s| attr(s, "#g", "class", "tall"),
+        |s| attr(s, "#c", "class", "item"),
+        |s| attr(s, "#b", "style", "flex:2"),
+        |s| attr(s, "#h", "class", "z"),
+        |s| unattr(s, "#a", "class"),
+        |s| del(s, "#d"),
+        |s| attr(s, "#i", "style", "grid-column:span 2"),
+    ]
+);
+
+diff!(
+    relative_and_group_boxes_replay_inside_flex_rows,
+    "<style>body{margin:0}.row{display:flex}.cell{flex:1;position:relative}.cell span{position:absolute;right:0;top:0;z-index:1}\
+     .glass{opacity:.8}.big{height:60px}</style>\
+     <div class=row><div id=r1 class=cell>one<span>x</span></div><div id=r2 class='cell glass'>two<span>y</span></div><div id=r3 class=cell>three</div></div>\
+     <div class=row><div id=s1 class=cell>four</div><div id=s2 class=cell>five<span>z</span></div></div>",
+    [
+        |s| attr(s, "#r1", "class", "cell big"),
+        |s| attr(s, "#s2", "class", "cell glass"),
+        |s| attr(s, "#r3", "class", "cell big"),
+        |s| attr(s, "#r2", "class", "cell"),
+        |s| del(s, "#s1"),
+    ]
+);
+
+diff!(
     stacking_escapes_with_floats,
     "<style>body{margin:0}#hd{position:sticky;top:0;z-index:2;height:30px}#fl{float:left;width:90px;height:70px}\
      p{margin:2px;height:20px}.zc{position:relative;z-index:3;display:block;height:10px}.tall{height:50px}</style>\
@@ -1139,6 +1175,19 @@ fn assert_reuse(mut session: RenderSession, n: usize, target: &str) {
     let laid_out = after.boxes_laid_out - before.boxes_laid_out;
     assert!(laid_out < (n / 3) as u64, "boxes laid out: {laid_out} of {n} paragraphs");
     assert!(after.fragments_replayed > before.fragments_replayed, "no fragment was replayed");
+}
+
+#[test]
+fn leaf_toggle_in_a_flex_column_reuses_its_sibling_items() {
+    let n = 300;
+    let source = format!(
+        "<style>body{{margin:0}}#w{{display:flex;flex-direction:column}}p{{margin:1px;height:14px}}.on{{height:30px;background:#eee}}</style><div id=w>{}</div>",
+        paras(n)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    assert_reuse(session, n, "#p150");
 }
 
 #[test]
