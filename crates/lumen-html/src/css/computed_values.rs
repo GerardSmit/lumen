@@ -35,6 +35,25 @@ pub struct ComputedValueContext<'a> {
     pub independent_border_widths: bool,
 }
 
+impl Style {
+    /// Whether the resolved value of `name` for this style depends on layout,
+    /// for a property [`needs_layout`] lists. Blink's `IsLayoutDependent` in the
+    /// same spirit: a `transform` matrix needs the reference box only for a
+    /// percentage translation or a relative expression, so any other transform
+    /// (and `none`) resolves without laying the document out.
+    pub fn resolved_value_needs_layout(&self, name: &str) -> bool {
+        match name {
+            "transform" => {
+                self.relative_expressions.iter().any(|expression| expression.slot == 59)
+                    || self.transforms.as_deref().is_some_and(|values| {
+                        values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))
+                    })
+            }
+            _ => needs_layout(name),
+        }
+    }
+}
+
 pub fn needs_layout(name: &str) -> bool {
     matches!(
         name,

@@ -34,10 +34,19 @@ impl DomStyle {
             let property = if !name.starts_with("--") && name.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 std::borrow::Cow::Owned(name.to_ascii_lowercase())
             } else { std::borrow::Cow::Borrowed(name) };
-            let needs_layout = resolved && css::computed_values::needs_layout(&property);
             let pending_fonts=if computed_font_property(&property) {
                 Some(super::canvas::realm_font_source(&self.realm)?)
             } else {super::canvas::initialized_realm_font_source(&self.realm)?};
+            // A property whose resolved value can use layout lays the document
+            // out only when this element's value does: a `transform` without a
+            // percentage translation reads the up-to-date style alone. Container
+            // queries can change the style itself, so they always lay out.
+            let needs_layout = resolved && css::computed_values::needs_layout(&property) && {
+                let mut session = self.realm.session.borrow_mut();
+                property != "transform" || session.has_container_queries()
+                    || self.resolved_style(&mut session, pending_fonts.as_ref())
+                        .map_or(true, |style| style.resolved_value_needs_layout(&property))
+            };
             let needs_container_context = if needs_layout { false } else {
                 let mut session = self.realm.session.borrow_mut();
                 if session.has_container_queries() { true } else {
@@ -812,6 +821,32 @@ mod tests {
         fn shape(&self, _: &str, _: f32) -> Result<lumen_html::paint::ShapedRun, ()> { Err(()) }
         fn ascent(&self, size: f32) -> f32 { size * 0.8 }
         fn line_height(&self, size: f32) -> f32 { size * 1.2 }
+    }
+
+    #[test]
+    fn computed_transform_lays_out_only_for_percentage_translations() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<div id=target style='width:200px;height:100px'></div><div id=other></div>",64).unwrap();
+        let layouts=Rc::new(std::cell::Cell::new(0));
+        let count=layouts.clone();
+        realm.set_layout_flusher(Rc::new(move|session|{count.set(count.get()+1);session.display_list(400,300,super::super::canvas::canvas_fallback_fonts())
+            .map(|_|()).map_err(|error|format!("{error:?}"))}));
+        let read=|engine:&mut Engine,source:&str,expected:&str|{
+            let check=format!("(()=>{{const value=(()=>{{{source}}})();if(value!=={expected:?})throw Error('transform '+value);return true}})()");
+            assert!(matches!(engine.eval_value(&check).unwrap().ok().expect("transform read"),Value::Bool(true)));
+        };
+        realm.flush_layout().unwrap();
+        let before=layouts.get();
+        // Each write dirties the layout; a read that needs no reference box must
+        // not lay the document out, and still resolves to the same matrix.
+        read(&mut engine,"target.style.transform='translate(10px, 5px) rotate(90deg)';other.style.width='10px';return getComputedStyle(target).transform",
+            "matrix(0, 1, -1, 0, 10, 5)");
+        read(&mut engine,"target.style.transform='scale(2)';other.style.width='20px';return getComputedStyle(target).transform","matrix(2, 0, 0, 2, 0, 0)");
+        read(&mut engine,"target.style.transform='none';other.style.width='30px';return getComputedStyle(target).transform","none");
+        assert_eq!(layouts.get(),before,"absolute transforms resolve from style alone");
+        read(&mut engine,"target.style.transform='translate(50%, 10%)';other.style.width='40px';return getComputedStyle(target).transform",
+            "matrix(1, 0, 0, 1, 100, 10)");
+        assert!(layouts.get()>before,"a percentage translation reads the laid-out reference box");
     }
 
     #[test]
