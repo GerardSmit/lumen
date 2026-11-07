@@ -2883,7 +2883,8 @@ impl RenderSession {
         }
         *lease.text.borrow_mut() = text;
         self.rebase_stylesheet_import_leases(node, &[], imports);
-        self.invalidate_paint();
+        // A deferred rebuild has not bounded its changes yet.
+        if deferred { self.invalidate_paint(); } else { self.invalidate_for_rules(); }
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
@@ -2971,7 +2972,7 @@ impl RenderSession {
         self.reclaim_stale_stylesheet_sources();
         self.stylesheet_owned_write = previous_owned_write;
         self.rebase_stylesheet_import_leases(node, &[], imports);
-        self.invalidate_paint();
+        self.invalidate_for_rules();
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
@@ -2997,7 +2998,7 @@ impl RenderSession {
             return Err(error);
         }
         self.rebase_stylesheet_import_leases(node, &[], imports);
-        self.invalidate_paint();
+        self.invalidate_for_rules();
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
@@ -3052,7 +3053,7 @@ impl RenderSession {
             return Err(error);
         }
         self.rebase_stylesheet_import_leases(node, path, imports);
-        self.invalidate_paint();
+        self.invalidate_for_rules();
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
@@ -5094,6 +5095,15 @@ impl RenderSession {
                         self.snapshot_rule_subjects.extend(subjects.iter().map(|&(node,_)|node)),
                     _ => self.snapshot_rules_unbounded=true,
                 }
+                // A change no selector analysis bounds restyles every retained
+                // style against the new rules, like a bounded one: only boxes
+                // whose styles change lay out again.
+                let subjects = subjects.or_else(|| {
+                    if self.rules_reset || fonts_changed { return None; }
+                    let all = self.style_cache.borrow().styled_nodes()?;
+                    self.invalidation_stats.full_restyle_causes[4] += 1;
+                    Some(all.into_iter().map(|node| (node, false)).collect())
+                });
                 match subjects {
                     Some(subjects) => self.rule_subjects.get_or_insert_with(Vec::new).extend(subjects),
                     None => {
@@ -6616,11 +6626,21 @@ impl RenderSession {
                 self.invalidation_stats.bails[2] += 1;
                 return;
             }
-            let Some(mutation_targets) = rules.mutation_restyle_targets(&self.document, mutations) else {
-                self.invalidation_stats.bails[3] += 1;
-                return;
+            // Mutations no selector analysis bounds restyle every retained
+            // style instead; only boxes whose styles change lay out again.
+            targets = match rules.mutation_restyle_targets(&self.document, mutations) {
+                Some(targets) => targets,
+                None => match self.style_cache.borrow().styled_nodes() {
+                    Some(all) => {
+                        self.invalidation_stats.bails[3] += 1;
+                        all
+                    }
+                    None => {
+                        self.invalidation_stats.bails[3] += 1;
+                        return;
+                    }
+                },
             };
-            targets = mutation_targets;
             for mutation in mutations {
                 match &mutation.kind {
                     MutationKind::CharacterData => structural.push((mutation.target, None, None, true)),
@@ -11452,6 +11472,30 @@ mod tests {
         let child = fresh.document().first_child(find(fresh.document(), "#b")).unwrap().unwrap();
         fresh.document_mut().replace_data(child, "bb").unwrap();
         assert_eq!(&list, fresh.display_list_with_images(200, 400, &Mono, &images).unwrap());
+    }
+
+    #[test]
+    fn unbounded_rule_changes_keep_the_layout_of_unchanged_boxes() {
+        let mut source = String::from("<style id=sheet>body{margin:0;font:10px/10px sans-serif}p{margin:0}</style>");
+        for index in 0..200 { source.push_str(&alloc::format!("<p id=p{index}>row {index}</p>")); }
+        let document = crate::html::parse(&source, 1 << 16).unwrap();
+        let sheet = find(&document, "#sheet");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(200, 400, &Mono).unwrap();
+        // The first generated content changes an index gate, which no
+        // selector analysis bounds; the other edits are bounded.
+        for text in ["body{margin:0;font:10px/10px sans-serif}p{margin:0}#p5{margin-top:3px}",
+            "body{margin:0;font:10px/10px sans-serif}p{margin:0}#p3::before{content:'x'}",
+            "body{margin:0;font:10px/10px sans-serif}p{margin:0}#p3::before{content:'x'}#p5{margin-top:4px}",
+            "body{margin:0;font:10px/10px sans-serif}p{margin:0}"] {
+            let replayed = session.invalidation_stats().fragments_replayed;
+            session.replace_stylesheet_text(sheet, text).unwrap();
+            session.display_list(200, 400, &Mono).unwrap();
+            assert!(session.invalidation_stats().fragments_replayed > replayed + 100, "unchanged rows replay after {text}");
+        }
+        assert!(session.invalidation_stats().full_restyle_causes[4] > 0, "the gate change is unbounded");
+        assert_eq!(session.invalidation_stats().verify_mismatches, 0);
     }
 
     #[test]

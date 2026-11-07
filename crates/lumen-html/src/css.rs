@@ -28830,6 +28830,18 @@ impl StyleCache {
         *self = Self::default();self.selected=selected;self.epoch=epoch;
     }
     pub(crate) fn epoch(&self) -> u64 { self.epoch }
+    /// Every node with a retained style, for restyling them all against new
+    /// rules (`restyle_nodes`); `None` while a selected-node cache holds them.
+    pub(crate) fn styled_nodes(&self) -> Option<Vec<NodeId>> {
+        if self.selected.is_some() { return None; }
+        let mut nodes: Vec<NodeId> = self.nodes.iter().chain(&self.previous_nodes).flatten().map(|(node, ..)| *node).collect();
+        nodes.sort_unstable_by_key(|node| node.key());
+        nodes.dedup();
+        Some(nodes)
+    }
+    fn styled_count(&self) -> usize {
+        self.nodes.iter().filter(|entry| entry.is_some()).count()
+    }
     fn begin_viewport_window(&mut self) -> (u64, u64) {
         self.window_depth += 1;
         (viewport_reads(), media_reads())
@@ -29904,7 +29916,11 @@ pub(crate) fn restyle_nodes(
         cache.computed = 0;
     }
     let targets: alloc::collections::BTreeSet<u128> = order.iter().map(|(_, node)| node.key()).collect();
-    let mut budget = document.node_count() / 2 + 256;
+    // Restyling every retained style (`StyleCache::styled_nodes`, after a
+    // rules change no selector analysis bounds) is a full restyle that keeps
+    // the layout of boxes whose styles come out the same: nothing cheaper
+    // remains to fall back to.
+    let mut budget = if targets.len() >= cache.styled_count() { usize::MAX } else { document.node_count() / 2 + 256 };
     let mut damage: alloc::collections::BTreeMap<u128, (NodeId, StyleDamage)> = alloc::collections::BTreeMap::new();
     let mut done: alloc::collections::BTreeSet<u128> = alloc::collections::BTreeSet::new();
     let mut pending: Vec<(NodeId, Arc<Style>, Arc<Style>)> = Vec::new();
