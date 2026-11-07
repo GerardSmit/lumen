@@ -38,9 +38,7 @@ pub fn is_resource_element(local: &str) -> bool {
 }
 
 pub fn local_name(name: &Name) -> &str {
-    crate::xml::split_qname(name.as_str())
-        .map(|(_, local)| local)
-        .unwrap_or_else(|| name.as_str())
+    crate::xml::local_part(name.as_str())
 }
 
 pub fn parse_view_box(input: &str) -> Option<ViewBox> {

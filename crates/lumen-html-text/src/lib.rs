@@ -779,6 +779,73 @@ fn shape_input(face: &rustybuzz::Face<'_>, text: &str, rtl: bool, script: Script
 /// shape plans compiled for them. Parsing a face reads and indexes its layout
 /// tables and compiling a plan maps its features to lookups; layout shapes the
 /// same face at a few sizes many times per frame.
+/// Which Basic Multilingual Plane code points a face maps to a glyph, read
+/// from its cmap once: font fallback asks per cluster and would otherwise
+/// parse the face's tables for every question.
+struct BmpCoverage {
+    // 0: not built, 1: being built, 2: `bits` is ready, 3: the cmap does not parse.
+    state: AtomicU8,
+    bits: UnsafeCell<Vec<u64>>,
+}
+
+impl BmpCoverage {
+    const fn new() -> Self {
+        Self { state: AtomicU8::new(0), bits: UnsafeCell::new(Vec::new()) }
+    }
+
+    /// Whether `ch` maps to a non-zero glyph, or `None` while another thread
+    /// builds the table or for a code point outside the plane.
+    fn covers(&self, bytes: &[u8], ch: char) -> Option<bool> {
+        let codepoint = ch as u32;
+        if codepoint >= 0x1_0000 {
+            return None;
+        }
+        let mut state = self.state.load(Ordering::Acquire);
+        if state == 0 && self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            state = match Self::build(bytes) {
+                Some(bits) => {
+                    // SAFETY: state 1 gives this thread the only access to `bits`.
+                    unsafe { *self.bits.get() = bits };
+                    2
+                }
+                None => 3,
+            };
+            self.state.store(state, Ordering::Release);
+        }
+        match state {
+            // SAFETY: `bits` is never written again once the state is 2.
+            2 => Some(unsafe { &*self.bits.get() }[codepoint as usize / 64] >> (codepoint % 64) & 1 != 0),
+            3 => Some(false),
+            _ => None,
+        }
+    }
+
+    fn build(bytes: &[u8]) -> Option<Vec<u64>> {
+        let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(0x1_0000 / 64).ok()?;
+        bits.resize(0x1_0000 / 64, 0u64);
+        for subtable in face.tables().cmap?.subtables {
+            if !subtable.is_unicode() {
+                continue;
+            }
+            subtable.codepoints(|codepoint| {
+                // `Face::glyph_index` decides, so the table answers as it would.
+                if codepoint < 0x1_0000
+                    && char::from_u32(codepoint).and_then(|ch| face.glyph_index(ch)).is_some_and(|glyph| glyph.0 != 0)
+                {
+                    bits[codepoint as usize / 64] |= 1 << (codepoint % 64);
+                }
+            });
+        }
+        Some(bits)
+    }
+}
+
+// SAFETY: `bits` is written only by the thread that moved the state to 1 and
+// read only once the state is 2 (see `BmpCoverage::covers`).
+unsafe impl Sync for BmpCoverage {}
+
 struct ShaperCache {
     busy: AtomicBool,
     entries: UnsafeCell<Vec<ShaperEntry>>,
@@ -2457,6 +2524,7 @@ pub struct FontFace {
     // The CSS ch/ic probes share the immutable face's maintained cmap
     // admission; metrics lookup must not reparse every font table per style.
     metric_glyph_coverage:u8,
+    bmp_coverage: BmpCoverage,
     primary_character_widths: Option<PrimaryCharacterWidths>,
     classic_mac_ascent: bool,
     rectilinear_face: AtomicU8,
@@ -2839,6 +2907,7 @@ impl FontFace {
             strike,
             metrics,
             metric_glyph_coverage,
+            bmp_coverage: BmpCoverage::new(),
             primary_character_widths,
             classic_mac_ascent: false,
             rectilinear_face: AtomicU8::new(0),
@@ -2990,9 +3059,8 @@ variation_advances: VariationGlyphCache::new(),
         ranges: Option<&[(u32, u32)]>,
         default_ignorable: &[(u32, u32)],
     ) -> bool {
-        let cmap=if matches!(cluster,"0"|"水"){None}else{
-            match ttf_parser::Face::parse(&self.bytes,0){Ok(face)=>Some(face),Err(_)=>return false}
-        };
+        // Parsed only for a code point the BMP table cannot answer.
+        let mut cmap=None;
         cluster.chars().all(|ch| {
             let codepoint = ch as u32;
             ch.is_control()
@@ -3014,7 +3082,10 @@ variation_advances: VariationGlyphCache::new(),
                 }) && match ch {
                     '0'=>self.metric_glyph_coverage&1!=0,
                     '水'=>self.metric_glyph_coverage&2!=0,
-                    _=>cmap.as_ref().is_some_and(|face|face.glyph_index(ch).is_some_and(|glyph|glyph.0!=0)),
+                    _=>self.bmp_coverage.covers(&self.bytes,ch).unwrap_or_else(||{
+                        let face=cmap.get_or_insert_with(||ttf_parser::Face::parse(&self.bytes,0).ok());
+                        face.as_ref().is_some_and(|face|face.glyph_index(ch).is_some_and(|glyph|glyph.0!=0))
+                    }),
                 })
         })
     }
@@ -4551,6 +4622,23 @@ pub static TEST_FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans
 #[cfg(all(test, feature = "bundled-fonts"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bmp_coverage_answers_like_the_parsed_cmap() {
+        let face = FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap();
+        let parsed = ttf_parser::Face::parse(DEFAULT_FONT_BYTES, 0).unwrap();
+        let mut covered = 0;
+        for codepoint in (0..0x3000).chain(0xfff0..0x1_0000) {
+            let Some(ch) = char::from_u32(codepoint) else { continue };
+            let expected = parsed.glyph_index(ch).is_some_and(|glyph| glyph.0 != 0);
+            assert_eq!(face.bmp_coverage.covers(&face.bytes, ch), Some(expected), "U+{codepoint:04X}");
+            covered += usize::from(expected);
+        }
+        assert!(covered > 90, "the default face covers ASCII");
+        assert_eq!(face.bmp_coverage.covers(&face.bytes, '\u{1F600}'), None, "astral code points parse the face");
+        assert!(face.covers_cluster_with_properties("Ab", None, &[]));
+        assert!(!face.covers_cluster_with_properties("A\u{10FFFD}", None, &[]));
+    }
 
     #[test]
     fn cached_faces_and_plans_shape_like_a_freshly_parsed_face() {

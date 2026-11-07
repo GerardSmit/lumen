@@ -1745,8 +1745,17 @@ struct ShapeQuery<'q> {
 impl ShapeQuery<'_> {
     fn hash(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        // A word at a time: runs are hashed on every shaping question.
         let mut mix = |bytes: &[u8]| {
-            for &byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3); }
+            let mut word = |value: u64| hash = (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+            let mut chunks = bytes.chunks_exact(8);
+            for chunk in &mut chunks {
+                word(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+            }
+            let rest = chunks.remainder();
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            word(u64::from_le_bytes(tail) ^ (bytes.len() as u64) << 56);
         };
         mix(&[self.kind as u8, u8::from(self.rtl)]);
         mix(&self.size.to_bits().to_le_bytes());
@@ -1755,6 +1764,12 @@ impl ShapeQuery<'_> {
         mix(&self.font.weight.to_le_bytes());
         mix(&self.font.weight_fraction.to_le_bytes());
         mix(&self.font.stretch.to_bits().to_le_bytes());
+        // The family list's address, not its names: a rule's list is shared by
+        // every style it reaches, so different families get different buckets
+        // and an equal list meets `Arc`'s pointer test in `matches` instead of
+        // comparing names. An equal list in another allocation only misses.
+        let families = self.font.families.as_ref().map_or(0, |families| Arc::as_ptr(families).cast::<u8>() as usize);
+        mix(&(families as u64).to_le_bytes());
         mix(self.language.map_or(&[0xff][..], str::as_bytes));
         mix(self.text.as_bytes());
         hash
@@ -5103,7 +5118,7 @@ fn is_css_box_namespace(namespace: &Namespace) -> bool {
 
 fn css_layout_tag<'a>(name: &'a str, namespace: &Namespace) -> &'a str {
     if matches!(namespace, Namespace::Other(_)) { "" } else {
-        crate::xml::split_qname(name).map(|(_, local)| local).unwrap_or(name)
+        crate::xml::local_part(name)
     }
 }
 
