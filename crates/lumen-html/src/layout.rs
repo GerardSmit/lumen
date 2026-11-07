@@ -27130,8 +27130,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let main_from_measure = item_style.flex_basis.is_none() && !item_style.flex_basis_content
             && item_style.flex_basis_intrinsic.is_none();
         let mut text_minimum = None;
+        let block_measurable = !row && !absolute && !container_style.flex_wrap
+            && self.multicol_depth == 0
+            && anonymous_text.is_none()
+            && item_style.writing_mode == css::WritingMode::HorizontalTb
+            && item_style.aspect_ratio.is_none()
+            && item_style.intrinsic_size_keywords(true).iter().all(Option::is_none)
+            && item_style.intrinsic_size_keywords(false).iter().all(Option::is_none)
+            && !self.is_sized_replaced_element(node)
+            && !self.object_replaced(node)
+            && !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select");
+        let height_needed = item_style.height.is_none()
+            && (main_from_measure || minimum_needed || item_style.flex_basis_content);
+        // A stretched column item whose height is measured below at its used
+        // width needs no max-content measurement: its cross size is that width.
+        let measured_at_stretch = block_measurable && height_needed && stretches_cross && item_style.width.is_none();
         let (w, h) = if shortcuts && !absolute && !main_from_measure && flex_ignores_measured_cross(container_style, row) {
             (0.0, 0.0)
+        } else if shortcuts && measured_at_stretch {
+            (used_content_width(&item_style, width) + box_edges(&item_style, true), 0.0)
         } else if shortcuts && !absolute && minimum_needed && anonymous_text.is_some()
             && if row { item_style.width.is_none() } else { item_style.height.is_none() } {
             let paragraph = anonymous_text.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -27146,16 +27163,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             self.flex_intrinsic_size(node, stretched.as_ref().unwrap_or(&item_style), anonymous_text.as_ref(), depth + 1, false)?
         };
-        let block_measurable = !row && !absolute && !container_style.flex_wrap
-            && self.multicol_depth == 0
-            && anonymous_text.is_none()
-            && item_style.writing_mode == css::WritingMode::HorizontalTb
-            && item_style.aspect_ratio.is_none()
-            && item_style.intrinsic_size_keywords(true).iter().all(Option::is_none)
-            && item_style.intrinsic_size_keywords(false).iter().all(Option::is_none)
-            && !self.is_sized_replaced_element(node)
-            && !self.object_replaced(node)
-            && !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select");
         let mut w = w;
         let inline_size = if !block_measurable {
             None
@@ -27178,8 +27185,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Some(fit)
             }
         };
-        let height_needed = item_style.height.is_none()
-            && (main_from_measure || minimum_needed || item_style.flex_basis_content);
         let stretched_height = match inline_size.filter(|_| height_needed) {
             Some(inline_size) => Some(self.column_flex_item_height(
                 node, &item_style, container_style, width, inline_size, depth,
@@ -63602,7 +63607,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         cache.intrinsics_measured().0
     }
 
-    const FLEX_SHORTCUT_PAGES: [&str; 6] = [
+    const FLEX_SHORTCUT_PAGES: [&str; 8] = [
         "<style>html,body{margin:0}.f{display:flex;width:300px}.f>div{flex:1 1 20px}p{margin:0}</style>\
          <div class=f><div><p>aa bb cc</p><p>dd ee</p></div><div style='display:flex'><p>ff gg</p><p>hh ii jj</p></div></div>",
         "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:120px;height:200px}.f>*{flex:1 1 30px}</style>\
@@ -63615,6 +63620,12 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
          <div class=f><div>wrapped one</div><div>wrapped <b>two</b> words</div><div>three</div></div>",
         "<style>html,body{margin:0}.f{display:flex;min-height:80px;width:260px}.f>div{flex:0 0 90px;border:1px solid red}</style>\
          <div class=f><div>tall <i>item</i></div><div style='position:absolute'>abs</div><div>last one</div></div>",
+        "<style>html,body{margin:0}body{display:flex;flex-direction:column;min-height:100px}main{flex:1}p{margin:0}</style>\
+         <header style='padding:4px;max-width:150px'><p>head words that wrap at the width</p></header><main><table><tr><td>cell one</td><td>cell two</td></tr></table></main>\
+         <footer style='border:2px solid;min-width:50px'><p>foot</p><p>more foot text</p></footer>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:180px}p{margin:0}</style>\
+         <div class=f><div style='margin:0 10px'><p>stretched with margins and words</p></div><div style='align-self:start'>start</div>\
+         <div style='box-sizing:border-box;padding:0 20px'><p>padded words to wrap</p></div></div>",
     ];
 
     #[test]
@@ -63641,6 +63652,14 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
             assert!(shortcut <= full, "shortcut {shortcut}, full {full}: {markup}");
         }
+    }
+
+    #[test]
+    fn stretched_column_flex_items_skip_their_max_content_measurement() {
+        let document = crate::html::parse(FLEX_SHORTCUT_PAGES[6], 4096).unwrap();
+        let shortcut = measured_in_first_frame(&document);
+        let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+        assert!(shortcut < full, "shortcut {shortcut}, full {full}");
     }
 
     #[test]
