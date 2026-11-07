@@ -49,8 +49,23 @@ impl Style {
                         values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))
                     })
             }
+            // As in Blink (`IsLayoutDependent`), a fixed margin, padding or
+            // min/max size resolves to its computed value; percentages,
+            // relative expressions and `auto` margins take the used value.
+            _ if name.starts_with("margin") => self.margin_auto.contains(&true) || self.has_relative_slots(39..43),
+            _ if name.starts_with("padding") => self.has_relative_slots(43..47),
+            "min-width" | "max-width" | "min-height" | "max-height" | "min-inline-size" | "max-inline-size"
+            | "min-block-size" | "max-block-size" => self.has_relative_slots(23..25) || self.has_relative_slots(51..53),
+            // A statically positioned box's insets resolve to their computed values.
+            "top" | "right" | "bottom" | "left" => self.position != Position::Static,
+            _ if name.starts_with("inset") => self.position != Position::Static,
             _ => needs_layout(name),
         }
+    }
+
+    fn has_relative_slots(&self, slots: core::ops::Range<usize>) -> bool {
+        self.relative_lengths.iter().any(|(slot, _)| slots.contains(slot))
+            || self.relative_expressions.iter().any(|expression| slots.contains(&expression.slot))
     }
 }
 

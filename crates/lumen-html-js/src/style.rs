@@ -39,11 +39,12 @@ impl DomStyle {
             } else {super::canvas::initialized_realm_font_source(&self.realm)?};
             // A property whose resolved value can use layout lays the document
             // out only when this element's value does: a `transform` without a
-            // percentage translation reads the up-to-date style alone. Container
+            // percentage translation, or a fixed margin, padding, min/max size
+            // or static inset, reads the up-to-date style alone. Container
             // queries can change the style itself, so they always lay out.
             let needs_layout = resolved && css::computed_values::needs_layout(&property) && {
                 let mut session = self.realm.session.borrow_mut();
-                property != "transform" || session.has_container_queries()
+                session.has_container_queries()
                     || self.resolved_style(&mut session, pending_fonts.as_ref())
                         .map_or(true, |style| style.resolved_value_needs_layout(&property))
             };
@@ -847,6 +848,36 @@ mod tests {
         read(&mut engine,"target.style.transform='translate(50%, 10%)';other.style.width='40px';return getComputedStyle(target).transform",
             "matrix(1, 0, 0, 1, 100, 10)");
         assert!(layouts.get()>before,"a percentage translation reads the laid-out reference box");
+    }
+
+    #[test]
+    fn computed_box_values_lay_out_only_when_they_use_the_box() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<div id=wrap style='width:400px'><div id=target style='width:200px;height:100px'></div></div><div id=other></div>",64).unwrap();
+        let layouts=Rc::new(std::cell::Cell::new(0));
+        let count=layouts.clone();
+        realm.set_layout_flusher(Rc::new(move|session|{count.set(count.get()+1);session.display_list(400,300,super::super::canvas::canvas_fallback_fonts())
+            .map(|_|()).map_err(|error|format!("{error:?}"))}));
+        let read=|engine:&mut Engine,source:&str,expected:&str|{
+            let check=format!("(()=>{{const value=(()=>{{{source}}})();if(value!=={expected:?})throw Error(value);return true}})()");
+            let result=engine.eval_value(&check).unwrap().unwrap_or_else(|error|panic!("{source}: {}",engine.ctx().coerce_string(&error).map(|text|text.to_string()).unwrap_or_default()));
+            assert!(matches!(result,Value::Bool(true)));
+        };
+        realm.flush_layout().unwrap();
+        let before=layouts.get();
+        read(&mut engine,"target.style.margin='3px 4px';other.style.width='10px';return getComputedStyle(target).marginLeft","4px");
+        read(&mut engine,"target.style.padding='5px';other.style.width='20px';return getComputedStyle(target).paddingTop","5px");
+        read(&mut engine,"target.style.minWidth='7px';other.style.width='30px';return getComputedStyle(target).minWidth","7px");
+        read(&mut engine,"target.style.top='9px';other.style.width='40px';return getComputedStyle(target).top","9px");
+        assert_eq!(layouts.get(),before,"fixed values resolve from style alone");
+        read(&mut engine,"target.style.marginLeft='10%';other.style.width='50px';return getComputedStyle(target).marginLeft","40px");
+        assert!(layouts.get()>before,"a percentage margin reads the laid-out containing block");
+        let before=layouts.get();
+        read(&mut engine,"target.style.margin='0 auto';other.style.width='60px';return getComputedStyle(target).marginLeft","95px");
+        assert!(layouts.get()>before,"an auto margin reads its used value");
+        let before=layouts.get();
+        read(&mut engine,"target.style.position='relative';target.style.left='10%';other.style.width='70px';return getComputedStyle(target).left","40px");
+        assert!(layouts.get()>before,"a positioned inset reads its used value");
     }
 
     #[test]
