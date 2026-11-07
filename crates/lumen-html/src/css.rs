@@ -28812,6 +28812,11 @@ impl StyleCache {
     /// Replace an owner-validated read snapshot after query-context resolution.
     /// Shared cascade entries remain raw, so other nodes resolve in their own context.
     pub(crate) fn replace_snapshot_style(&mut self, document: &Document, node: NodeId, style: Style) -> Arc<Style> {
+        // A read that resolves the same style again changes nothing that was
+        // laid out with it, so it keeps the entry and the epoch.
+        if let Some(existing) = self.node_entry(node).map(|(_, _, _, existing)| existing.clone()).filter(|existing| **existing == style) {
+            return existing;
+        }
         let style = Arc::new(style);
         let box_parent=self.cached_box_parent(document,node).unwrap_or_default();
         self.store_unattributed(document, node, box_parent, &style);

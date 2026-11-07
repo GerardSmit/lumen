@@ -6537,6 +6537,23 @@ impl RenderSession {
         targets
     }
 
+    /// The elements whose paint an SVG resource may reach: every outermost
+    /// `<svg>` (fill, stroke, markers and clips inside it) and every element
+    /// with a clip path, mask image or filter. `None` while a selected-node
+    /// style cache holds the styles.
+    fn svg_resource_clients(&self) -> Option<Vec<NodeId>> {
+        let styles = self.style_cache.borrow();
+        let nodes = styles.styled_nodes()?;
+        Some(nodes.into_iter().filter(|&node| {
+            let outer_svg = matches!(self.document.kind(node), Ok(NodeKind::Element { namespace: crate::Namespace::Svg, name, .. })
+                if crate::svg::local_name(name) == "svg")
+                && !self.document.composed_parent(node).ok().flatten().is_some_and(|parent|
+                    matches!(self.document.kind(parent), Ok(NodeKind::Element { namespace: crate::Namespace::Svg, .. })));
+            outer_svg || styles.node_entry(node).is_some_and(|(_, _, _, style)|
+                style.svg_clip_path.is_some() || style.mask_images.is_some() || style.filters.is_some())
+        }).collect())
+    }
+
     /// Whether a change at `touched` or of `structural` shows outside the
     /// fragments of the changed nodes: it lies in an SVG resource definition,
     /// which `url()` references reach from anywhere, or in what a `<use>`
@@ -6707,12 +6724,22 @@ impl RenderSession {
                 return;
             }
         };
+        // A restyle inside an SVG resource (an inherited color reaching a
+        // gradient or a clip path, say) repaints the elements that may reference
+        // it; a restyle in what a `<use>` renders still restyles everything.
+        let mut resource_clients = Vec::new();
         if subjects_taken || mutated > 0 {
             let restyled_candidates: Vec<NodeId> = restyled.iter().map(|&(node, _)| node).chain(forced_subjects.iter().copied()).collect();
-            if self.svg_change_not_local(&restyled_candidates, &[]) {
-                self.invalidation_stats.bails[5] += 1;
-                self.rules_reset = true;
-                return;
+            if restyled_candidates.iter().any(|&node| in_svg(&self.document, node)) {
+                let clients = if self.svg_use_affected(&restyled_candidates, &[]) { None }
+                    else if restyled_candidates.iter().any(|&node| in_svg_resource(&self.document, node)) { self.svg_resource_clients() }
+                    else { Some(Vec::new()) };
+                let Some(clients) = clients else {
+                    self.invalidation_stats.bails[5] += 1;
+                    self.rules_reset = true;
+                    return;
+                };
+                resource_clients = clients;
             }
         }
         let custom_rebases = self.style_cache.borrow_mut().take_custom_rebases();
@@ -6797,8 +6824,9 @@ impl RenderSession {
         }
         self.invalidation_stats.partial_restyles += 1;
         self.invalidation_stats.invalidated_styles += targets.len() as u64;
-        let paint_patched = paint_patchable && changed.is_empty() && !paint.is_empty()
+        let paint_patched = paint_patchable && changed.is_empty() && !paint.is_empty() && resource_clients.is_empty()
             && !paint_damage_custom && self.patch_frame_restyles(&paint_restyles);
+        paint.extend(resource_clients);
         if !changed.is_empty() || !subtrees.is_empty() || !paint.is_empty() {
             let styles = self.style_cache.borrow();
             let size_boundary = |node: NodeId| styles.node_style(node).is_some_and(|style| style.is_intrinsic_size_boundary());
@@ -6872,7 +6900,11 @@ impl RenderSession {
         }
         self.invalidate_for_mutations(width, height, text, version);
         if !self.patch_arrived_images(version, width, height, images, &arrivals) && !arrivals.is_empty() {
-            self.invalidate_paint();
+            // The arrivals size nothing (`resolve_bitmap_arrivals`): only the
+            // fragments that painted their placeholders lay out again.
+            self.discard_frame();
+            self.layout_cache.invalidate_changed(&self.document, &[], &[], &arrivals, &|_| false);
+            self.paint_revision = self.paint_revision.wrapping_add(1);
             self.frame_id = self.frame_id.wrapping_add(1);
         }
         // A layout which fails leaves the previous frame's pending state.
@@ -7992,7 +8024,7 @@ mod tests {
     }
 
     #[test]
-    fn selector_reached_svg_resources_bail_only_when_their_style_changes() {
+    fn selector_reached_svg_resources_repaint_their_clients_when_their_style_changes() {
         let markup="<!doctype html><style>body[pending] rect{stroke-width:1} body.dark rect{fill:green}</style>\
             <body pending><svg width=40 height=20><defs><clipPath id=c><rect width=10 height=10 /></clipPath></defs>\
             <rect width=20 height=20 fill=blue clip-path='url(#c)' /></svg><p id=text>x</p></body>";
@@ -8009,7 +8041,7 @@ mod tests {
         assert_eq!(changed,fresh(&session));
         session.document_mut().set_attribute(body,"class","dark").unwrap();
         let changed=session.display_list(100,80,&NoText).unwrap().clone();
-        assert_eq!(session.invalidation_stats().bails[5],bails+1,"the clip path's rect changed fill");
+        assert_eq!(session.invalidation_stats().bails[5],bails,"the clip path's rect changed fill: its clients repaint");
         assert_eq!(changed,fresh(&session));
     }
 
@@ -11502,6 +11534,45 @@ mod tests {
             assert!(session.invalidation_stats().fragments_replayed > replayed + 100, "unchanged rows replay after {text}");
         }
         assert!(session.invalidation_stats().full_restyle_causes[4] > 0, "the gate change is unbounded");
+        assert_eq!(session.invalidation_stats().verify_mismatches, 0);
+    }
+
+    #[test]
+    fn a_restyle_inside_an_svg_resource_repaints_its_clients_only() {
+        let mut source = String::from("<style>body{margin:0;font:10px/10px sans-serif;color:blue}body.dark svg{color:red}p{margin:0}</style>\
+            <svg width=0 height=0><defs><linearGradient id=g><stop offset=0 style=stop-color:currentColor /></linearGradient></defs></svg>\
+            <svg width=20 height=10><rect width=20 height=10 fill=url(#g) /></svg>");
+        for index in 0..200 { source.push_str(&alloc::format!("<p>row {index}</p>")); }
+        let document = crate::html::parse(&source, 1 << 16).unwrap();
+        let body = find(&document, "body");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(200, 400, &Mono).unwrap();
+        for class in ["dark", ""] {
+            let replayed = session.invalidation_stats().fragments_replayed;
+            session.document_mut().set_attribute(body, "class", class).unwrap();
+            session.display_list(200, 400, &Mono).unwrap();
+            assert!(session.invalidation_stats().fragments_replayed > replayed + 100, "rows replay after class {class:?}");
+        }
+        assert_eq!(session.invalidation_stats().bails[5], 0, "the gradient's restyle stays local to its clients");
+        assert_eq!(session.invalidation_stats().verify_mismatches, 0);
+    }
+
+    #[test]
+    fn an_unpatched_paint_only_bitmap_arrival_keeps_the_other_fragments() {
+        let mut source = String::from("<style>body{margin:0;font:10px/10px sans-serif}p{margin:0}</style><div><img id=i src=a.png width=10 height=10></div>");
+        for index in 0..200 { source.push_str(&alloc::format!("<p>row {index}</p>")); }
+        let document = crate::html::parse(&source, 1 << 16).unwrap();
+        let image = find(&document, "#i");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(200, 400, &Mono).unwrap();
+        let replayed = session.invalidation_stats().fragments_replayed;
+        let bitmap = Arc::new(ImageData { width: 10, height: 10, pixels: alloc::vec![255; 400].into() });
+        session.set_node_bitmap(image, Some(bitmap)).unwrap();
+        let list = session.display_list(200, 400, &Mono).unwrap().clone();
+        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { .. })), "the arrived bitmap paints");
+        assert!(session.invalidation_stats().fragments_replayed > replayed + 100, "rows replay around the arrival");
         assert_eq!(session.invalidation_stats().verify_mismatches, 0);
     }
 
