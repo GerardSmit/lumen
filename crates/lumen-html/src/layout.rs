@@ -1972,7 +1972,9 @@ pub(crate) struct IntrinsicSizes {
 }
 
 /// A measurement of a table cell's content box (`measure_table_cell_size`),
-/// valid for an equal cell, styles, table axes, inline size and context.
+/// valid for an equal cell, styles, table axes, inline size and context, or
+/// of its max-content (mode 1) or min-content (mode 2) size
+/// (`intrinsic_table_cell_size`), valid for an equal intrinsic context too.
 struct CellMeasure {
     node: u128,
     origin: Arc<Style>,
@@ -1981,6 +1983,8 @@ struct CellMeasure {
     inline: u32,
     depth: usize,
     context: CellMeasureContext,
+    mode: u8,
+    intrinsic: Option<IntrinsicContext>,
     provenance: IntrinsicProvenance,
     result: ((f32, f32), Option<FlowBaselines>),
 }
@@ -18596,8 +18600,8 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 } else { match &source {
                     TableCellContent::Node { node, .. } => {
                         let content = computed.intrinsic_measurement_style(axes.horizontal(true));
-                        let (width, height) = axes.flow.logical(self.intrinsic_size_mode_with_origin(*node, &content, source.style(), depth + 1, false)?);
-                        let minimum = axes.flow.logical(self.intrinsic_size_mode_with_origin(*node, &content, source.style(), depth + 1, true)?).0;
+                        let (width, height) = axes.flow.logical(self.intrinsic_table_cell_size(*node, &content, source.style(), depth + 1, false)?);
+                        let minimum = axes.flow.logical(self.intrinsic_table_cell_size(*node, &content, source.style(), depth + 1, true)?).0;
                         // Store unconstrained canonical content metrics. The
                         // winning collapsed half-borders are not known yet;
                         // width/min/max offsets are applied once after conflict
@@ -20540,6 +20544,97 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// The content size and baselines of a cell laid out at `inline`. A
     /// measurement is reused, in this and later frames, for an equal cell,
     /// styles and measuring context until a change inside the cell drops it.
+    /// `intrinsic_size_mode_with_origin` of a table cell, kept with its content
+    /// measurements: each table that encloses a nested table measures and lays
+    /// it out again, and every layout of a table measures all of its cells.
+    fn intrinsic_table_cell_size(&self, node: NodeId, content: &Style, origin: &Style, depth: usize, minimum: bool)
+        -> Result<(f32, f32), LayoutError> {
+        let uncached = || self.intrinsic_size_mode_with_origin(node, content, origin, depth, minimum);
+        if self.measurement_glyphs.as_ref().is_some_and(|glyphs| !glyphs.is_empty()) {
+            return uncached();
+        }
+        let Some(intrinsic) = self.cell_intrinsic_context() else { return uncached() };
+        let context = CellMeasureContext {
+            percentage_basis: self.percentage_basis,
+            multicol_depth: self.multicol_depth,
+            export_block_table_baselines: self.export_block_table_baselines,
+            container_units: self.container_units.get().into(),
+        };
+        let mode = 1 + u8::from(minimum);
+        let slot = node.index() * 2 + usize::from(minimum);
+        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.mode == mode && entry.depth == depth
+            && entry.context == context && *entry.used == *content && *entry.origin == *origin
+            && entry.intrinsic.as_ref().is_some_and(|stored| stored.same_for_slot(&intrinsic, slot));
+        let intrinsics = &*self.intrinsics;
+        {
+            let cells = intrinsics.cells.borrow();
+            if let Some(entry) = cells.get(&node.index()).and_then(|entries| entries.iter().find(|entry| matches(entry))) {
+                let provenance = &entry.provenance;
+                let images_current = match (provenance.pending.as_deref(), self.images) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(pending), Some(images)) => {
+                        let generation = images.generation();
+                        generation != 0 && generation == provenance.pending_generation
+                            || pending.iter().all(|(lookup, _)| images.still_pending(lookup))
+                    }
+                };
+                if images_current {
+                    if let (Some(pending), Some(images)) = (provenance.pending.as_deref(), self.images) {
+                        images.replay_pending(pending);
+                    }
+                    intrinsics.viewport_read((), provenance.axes);
+                    intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
+                    self.text_uses.set(self.text_uses.get().wrapping_add(1));
+                    return Ok(entry.result.0);
+                }
+            }
+        }
+        let mark = self.intrinsic_mark();
+        let size = uncached()?;
+        let mut axes_read = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes_read |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes_read = 3; }
+        let pending = match (self.images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
+        };
+        let mut cells = intrinsics.cells.borrow_mut();
+        let entries = cells.entry(node.index()).or_default();
+        entries.retain(|entry| !matches(entry));
+        if entries.len() >= CELL_MEASURE_WAYS { entries.pop(); }
+        if entries.try_reserve(1).is_ok() {
+            entries.insert(0, CellMeasure {
+                node: node.key(),
+                origin: Arc::new(origin.clone()),
+                used: Arc::new(content.clone()),
+                axes: ((false, false, false), [0; 4]),
+                inline: 0,
+                depth,
+                context,
+                mode,
+                intrinsic: Some(intrinsic),
+                provenance: IntrinsicProvenance {
+                    frame: intrinsics.frame.get(),
+                    axes: axes_read,
+                    context: None,
+                    pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+                    pending: pending.map(|(lookups, _)| lookups),
+                },
+                result: (size, None),
+            });
+        }
+        Ok(size)
+    }
+
     fn measure_table_cell_size(&self, source: &TableCellContent,
         children: &[Option<FlattenedBoxChild>], style: &Style, axes: TableAxes, inline: f32, depth: usize)
         -> Result<((f32, f32), Option<FlowBaselines>), LayoutError> {
@@ -20557,7 +20652,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         };
         let axes_key = ((axes.flow.vertical, axes.flow.reverse_block, axes.flow.reverse_inline), axes.sides);
         let inline_key = inline.to_bits();
-        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.inline == inline_key && entry.depth == depth
+        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.mode == 0 && entry.inline == inline_key && entry.depth == depth
             && entry.axes == axes_key && entry.context == context && *entry.used == *style && *entry.origin == *origin;
         let intrinsics = &*self.intrinsics;
         {
@@ -20616,6 +20711,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 inline: inline_key,
                 depth,
                 context,
+                mode: 0,
+                intrinsic: None,
                 provenance: IntrinsicProvenance {
                     frame: intrinsics.frame.get(),
                     axes: axes_read,
@@ -22819,9 +22916,17 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// viewport, whose reads are counted. None when it depends on state that
     /// is not compared, such as floats placed outside the measured box.
     fn intrinsic_context(&self) -> Option<IntrinsicContext> {
-        if !self.floats.is_empty() || self.paragraph_column_flow.is_some()
-            || self.rendered_table_context.is_some() || self.table_cell_projection.is_some()
-            || self.timeline_values.is_some() {
+        if self.rendered_table_context.is_some() || self.table_cell_projection.is_some() {
+            return None;
+        }
+        self.cell_intrinsic_context()
+    }
+
+    /// `intrinsic_context` for measuring the cells of a table: the rendered
+    /// text context and the projection of an enclosing cell being laid out
+    /// tag that cell's own geometry and box, not what a measurement returns.
+    fn cell_intrinsic_context(&self) -> Option<IntrinsicContext> {
+        if !self.floats.is_empty() || self.paragraph_column_flow.is_some() || self.timeline_values.is_some() {
             return None;
         }
         Some(IntrinsicContext {
