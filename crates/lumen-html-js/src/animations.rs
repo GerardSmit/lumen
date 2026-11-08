@@ -222,6 +222,36 @@ struct FlushKey {
     mutations: u64,
     now: u64,
     epoch: lumen_html::session::TransitionInputEpoch,
+    /// What progress timelines sample: the layout they read, the scroll offsets
+    /// of their sources and the samples already taken (`progress_fingerprint`).
+    progress: u64,
+}
+
+/// Everything a progress timeline sample of `realm` reads: its records' bindings
+/// and samples, the scroll offsets of their sources, and the layout they are
+/// sampled from (the display list identity, and whether it is current). Zero
+/// when the realm has none.
+fn progress_fingerprint(state:&AnimationHub,realm:&Rc<DomRealm>)->u64 {
+    let mut hash=0u64;
+    let mut mix=|value:u64|hash=(hash.rotate_left(5)^value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let session=realm.session.borrow();
+    let mut any=false;
+    for (id,record) in state.records.iter() {
+        let Some(binding)=record.progress_timeline.as_ref() else{continue};
+        if record.realm.upgrade().is_none_or(|owner|!Rc::ptr_eq(&owner,realm)) {continue;}
+        any=true;
+        mix(u64::from(*id)|u64::from(record.cancelled)<<32|u64::from(state.progress_sampled.contains(id))<<33);
+        mix(binding.sampled_time.map_or(u64::MAX,f64::to_bits));
+        mix(binding.source.map_or(u64::MAX,|source|{
+            let (x,y)=session.scroll_offset(source);
+            u64::from(x.to_bits())|u64::from(y.to_bits())<<32
+        }));
+        mix(binding.source.map_or(0,|node|node.key() as u64)^binding.subject.map_or(0,|node|(node.key() as u64).rotate_left(17)));
+    }
+    if !any {return 0;}
+    mix(session.frame_id());
+    mix(u64::from(session.completed_geometry_is_stale()));
+    hash|1
 }
 
 impl FlushMemo {
@@ -2104,12 +2134,10 @@ pub(crate) fn flush_css_transitions_for_property(ctx:&mut Ctx,realm:&Rc<DomRealm
     // covered would publish the same styles again.
     let key=|hub:&Rc<RefCell<AnimationHub>>|->OpResult<Option<FlushKey>> {
         let state=hub.borrow();
-        // Progress timelines sample layout (scroll), which no key input covers.
-        if state.records.values().any(|record|record.progress_timeline.is_some()) {return Ok(None);}
         let epoch=realm.session.borrow_mut().transition_input_epoch().map_err(|error|OpError::new("InvalidStateError",format!("{error:?}")))?;
         Ok(Some(FlushKey{realm:Rc::as_ptr(realm) as usize,
             mutations:hub_mutations()^(u64::from(state.next_id)<<32)^state.transition_generation.rotate_left(16),
-            now:realm.timeline_sample.get().to_bits(),epoch}))
+            now:realm.timeline_sample.get().to_bits(),epoch,progress:progress_fingerprint(&state,realm)}))
     };
     let before=key(&hub)?;
     let carried=match (&hub.borrow().flush_memo,before) {
