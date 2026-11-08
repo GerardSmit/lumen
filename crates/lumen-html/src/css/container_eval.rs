@@ -861,6 +861,7 @@ impl PartialEq for CustomRef {
 /// sizes along the axes its `container-type` contains.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
+    node: NodeId,
     names: Vec<Arc<str>>,
     kind: ContainerType,
     vertical: bool,
@@ -931,6 +932,19 @@ impl Oracle {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// The containers whose answers differ from `previous`'s: those added,
+    /// removed or measured differently. Only their subtrees query them.
+    pub fn changed_containers(&self, previous: &Oracle) -> Vec<NodeId> {
+        let mut changed = Vec::new();
+        for (key, entry) in &self.0 {
+            if previous.0.get(key) != Some(entry) { changed.push(entry.node); }
+        }
+        for (key, entry) in &previous.0 {
+            if !self.0.contains_key(key) { changed.push(entry.node); }
+        }
+        changed
+    }
 }
 
 /// Records every element that is a query container: one with a `container-type`
@@ -983,6 +997,7 @@ pub fn build_oracle(
             _ => (None, None),
         };
         entries.insert(node.key(), Entry {
+            node,
             names,
             kind,
             vertical,
@@ -1103,12 +1118,19 @@ impl StyleIndex {
 
     /// Installs the containers a layout measured; `true` when they differ from the previous ones.
     pub fn replace_container_oracle(&self, oracle: Oracle) -> bool {
+        self.replace_container_oracle_reporting(oracle).is_some()
+    }
+
+    /// `replace_container_oracle`, returning the containers whose answers
+    /// changed when it replaced the oracle.
+    pub fn replace_container_oracle_reporting(&self, oracle: Oracle) -> Option<Vec<NodeId>> {
         if **self.containers.oracle.borrow() == oracle {
-            return false;
+            return None;
         }
+        let changed = oracle.changed_containers(&self.containers.oracle.borrow());
         *self.containers.oracle.borrow_mut() = Arc::new(oracle);
         self.containers.epoch.fetch_add(1, Ordering::Relaxed);
-        true
+        Some(changed)
     }
 
     pub(super) fn container_rule_matches(
@@ -1244,6 +1266,7 @@ mod tests {
 
     fn entry(kind: ContainerType, vertical: bool, width: f32, height: f32) -> Entry {
         Entry {
+            node: NodeId { document: 0, index: 0, generation: 0 },
             names: Vec::new(),
             kind,
             vertical,

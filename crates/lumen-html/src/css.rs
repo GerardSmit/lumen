@@ -29144,6 +29144,23 @@ impl StyleCache {
         self.drop_node(node);
         self.epoch = self.epoch.wrapping_add(1);
     }
+    /// Forget the styles of `roots` and their flat-tree descendants.
+    pub(crate) fn invalidate_subtrees(&mut self, document: &Document, roots: &[NodeId]) {
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(node) = stack.pop() {
+            self.forget_node_entry(node);
+            let mut child = document.first_child(node).ok().flatten();
+            while let Some(id) = child {
+                stack.push(id);
+                child = document.next_sibling(id).ok().flatten();
+            }
+            if let Ok(Some(root)) = document.shadow_root(node) {
+                stack.push(root);
+            }
+        }
+        self.reset_sharing();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
     /// The nodes whose retained style passes `test`; `None` when a retained
     /// pseudo-element style does, or a node holds more than one variant.
     pub(crate) fn nodes_with_style(&self, test: impl Fn(&Style) -> bool) -> Option<Vec<NodeId>> {

@@ -1390,6 +1390,9 @@ struct SnapshotBasis {
 
 const READ_DIRTY_LIMIT: usize = 4096;
 /// Layouts one frame may repeat while `@container` conditions still change with container sizes.
+/// Changed query containers whose subtrees restyle alone; with more, the
+/// whole document restyles.
+const CONTAINER_RESTYLE_ROOTS: usize = 256;
 const MAX_CONTAINER_PASSES: u8 = 10;
 const MAX_DAMAGE_RECTS: usize = 64;
 
@@ -7305,6 +7308,7 @@ impl RenderSession {
         let mut sampled_timelines=false;
         let mut timeline_corrected=false;
         let mut container_passes = 0u8;
+        let mut container_restyled: Option<Vec<NodeId>> = None;
         let mut pending_images = self.images_pending;
         let mut pending_lookups: Vec<(layout::PendingLookup, bool)>;
         let mut culled_images: Vec<NodeId>;
@@ -7463,24 +7467,34 @@ impl RenderSession {
                             rules.environment,
                             Some(text),
                         );
-                        rules.replace_container_oracle(oracle)
+                        rules.replace_container_oracle_reporting(oracle)
                     };
-                    self.container_oracle_stable = if installed { None } else { Some(oracle_key) };
-                    if installed {
+                    self.container_oracle_stable = if installed.is_some() { None } else { Some(oracle_key) };
+                    if let Some(containers) = installed {
                         container_passes += 1;
                         let mut styles = self.style_cache.borrow_mut();
-                        styles.clear();
+                        // Only a changed container's subtree queries it: those
+                        // restyle and lay out again, the rest is kept.
+                        if containers.len() <= CONTAINER_RESTYLE_ROOTS {
+                            styles.invalidate_subtrees(&self.document, &containers);
+                            container_restyled = Some(containers);
+                        } else {
+                            styles.clear();
+                            self.invalidation_stats.intrinsic_clears[3] += 1;
+                            self.layout_cache.clear_intrinsics();
+                        }
                         styles.begin_frame();
                         rules.prestyle(&self.document, &mut styles, text);
                         self.intrinsic_style_epoch = Some(styles.epoch());
-                        self.invalidation_stats.intrinsic_clears[3] += 1;
-                        self.layout_cache.clear_intrinsics();
                         changed = true;
                     }
                 }
             }
             if !changed {break (list,geometry);}
-            self.layout_cache.clear();
+            match container_restyled.take() {
+                Some(containers) => self.layout_cache.invalidate_changed(&self.document, &[], &containers, &[], &|_| false),
+                None => self.layout_cache.clear(),
+            }
             self.layout_cache.begin_frame();
             pending_images = false;
         };
@@ -9977,6 +9991,25 @@ mod tests {
         let (positioned, positioned_list) = measured("position:relative");
         assert_eq!(positioned, plain, "a positioned ancestor must not defeat the measurement cache");
         assert_eq!(positioned_list, plain_list);
+    }
+
+    #[test]
+    fn container_query_passes_restyle_only_the_changed_containers() {
+        let mut source = alloc::string::String::from("<style>body{margin:0}p{margin:0;height:2px;background:gray}\
+            .c{container-type:inline-size}#a{width:50%}#b{width:100px}.x{height:3px;background:red}\
+            @container (min-width:300px){.x{background:blue;height:5px}}</style><body>");
+        for _ in 0..200 { source.push_str("<p></p>"); }
+        source.push_str("<div class=c id=a><div class=x></div></div><div class=c id=b><div class=x></div></div>");
+        let mut session = RenderSession::new(crate::html::parse(&source, 1024).unwrap());
+        session.display_list(400, 800, &NoText).unwrap();
+        let replayed = session.invalidation_stats().fragments_replayed;
+        assert!(replayed >= 200, "the container pass replays the paragraphs: {replayed}");
+        for width in [800, 400, 700] {
+            let retained = alloc::format!("{:?}", session.display_list(width, 800, &NoText).unwrap().0);
+            let mut fresh = RenderSession::new(crate::html::parse(&source, 1024).unwrap());
+            let expected = alloc::format!("{:?}", fresh.display_list(width, 800, &NoText).unwrap().0);
+            assert_eq!(retained, expected, "{width}");
+        }
     }
 
     #[test]
