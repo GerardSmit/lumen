@@ -22906,6 +22906,15 @@ pub struct FontFaceDescriptors {
     pub line_gap_override: Option<f32>,
 }
 
+impl FontFaceDescriptors {
+    /// Whether `sources[index]` may be fetched: its `format()` hint, if any,
+    /// names a container this engine decodes. Like Chrome, a loader skips the
+    /// others (`embedded-opentype`, `svg`) without requesting them.
+    pub fn source_loadable(&self, index: usize) -> bool {
+        self.source_suffixes.get(index).is_none_or(|suffix| font_face_source::format_loadable(suffix))
+    }
+}
+
 impl Default for FontFaceDescriptors {
     fn default() -> Self {
         Self {
