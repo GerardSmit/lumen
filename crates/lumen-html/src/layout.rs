@@ -39020,7 +39020,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || style.overflow_clip
             || style.overflow_x != css::Overflow::Visible
             || style.overflow_y != css::Overflow::Visible
-            || css::columns::active(&style)
+            // A multicol container outside any column flow lays out its
+            // columns inside its own fragment and is retained with them;
+            // inside an enclosing flow its lines feed the outer plan.
+            || css::columns::active(&style) && self.paragraph_column_flow.is_some()
             || self.paragraph_column_flow.as_ref().is_some_and(|flow|flow.pending || !flow.wrappers.is_empty())
             || style.sibling_position_dependent
             || style.background_attachment.as_ref().is_some_and(|items| {
@@ -45231,9 +45234,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
         }
         self.cull = saved_cull;
+        // Column fragments move with their container; only scroll replay
+        // of a suffix must lay them out again.
         if column_fragment_count > 1 {
             self.scroll_hazards += 1;
-            self.unretainable_hazards += 1;
         }
         if let Some(index) = clip_index {
             let padding = Rect {

@@ -7691,6 +7691,28 @@ mod tests {
     }
 
     #[test]
+    fn retained_multicol_containers_match_a_fresh_session() {
+        let source = "<style>body{margin:0}.cols{column-count:3;column-gap:4px}.cols div{height:5px;background:red;break-inside:avoid}\
+            .rule{columns:2;column-rule:1px solid blue}.rule p{margin:0;height:7px;background:green}\
+            .span h{display:block;column-span:all;height:3px;background:navy}#grow{height:2px;background:gray}</style>\
+            <div id=grow></div><div class=cols><div></div><div></div><div style=height:9px></div><div></div><div></div></div>\
+            <div class='rule span'><p></p><h></h><p></p><p></p></div><div class=cols style=height:8px><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div>";
+        let heights = ["2px", "11px", "11px", "4px"];
+        let mut session = RenderSession::new(crate::html::parse(source, 256).unwrap());
+        session.display_list(120, 200, &NoText).unwrap();
+        let grow = crate::selector::get_element_by_id(session.document(), session.document().root(), "grow").unwrap().unwrap();
+        for height in heights {
+            session.document_mut().set_attribute(grow, "style", &alloc::format!("height:{height}")).unwrap();
+            let retained = alloc::format!("{:?}", session.display_list(120, 200, &NoText).unwrap().0);
+            let mut fresh = RenderSession::new(session.document().clone_document(true).unwrap());
+            let expected = alloc::format!("{:?}", fresh.display_list(120, 200, &NoText).unwrap().0);
+            assert_eq!(retained, expected, "{height}");
+        }
+        // The multicol containers keep their fragments across relayouts.
+        assert!(session.invalidation_stats().fragments_replayed > 0);
+    }
+
+    #[test]
     fn resize_retained_intrinsic_sizes_match_a_fresh_session() {
         let source = "<style>html,body{margin:0;height:100%}#ratio{display:inline-block;height:20%}#ratio div{height:100%;aspect-ratio:1;background:lime}.fill{height:3px;background:red}\
             #float{float:left}#float div{width:10vh;height:2px;background:blue}\
