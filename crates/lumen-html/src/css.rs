@@ -2418,6 +2418,27 @@ struct FontLengthUnits {
     root: FontUnitBases,
 }
 
+/// The font families (`font_family_bit`s) whose metrics ever resolved a
+/// font-relative length for a style index without a sink of its own.
+static FONT_METRIC_FAMILIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The families a style computed without a sink may have read font metrics
+/// from. It only grows: a cached style may still hold such a read.
+pub(crate) fn font_metric_families() -> u64 {
+    FONT_METRIC_FAMILIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A computed style resolved a value that may use a font metric: the
+/// families of the element's, its parent's and the root's fonts count, in
+/// the index's sink or else the process-wide set.
+fn note_font_metric_read(index: Option<&StyleIndex>, style: &Style, parent: Option<&Style>) {
+    let families = style.font_spec().family_bits()
+        | parent.map_or(0, |parent| parent.font_spec().family_bits())
+        | style.root_font_units.as_deref().map_or(0, |root| root.spec.family_bits());
+    index.and_then(|index| index.font_metric_sink.as_deref()).unwrap_or(&FONT_METRIC_FAMILIES)
+        .fetch_or(families, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn font_unit_bases(
     text: Option<&dyn TextShaper>,
     size: f32,
@@ -5098,6 +5119,7 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
     fn resolve_from_font_adjust(&mut self, text: Option<&dyn TextShaper>) {
         let Some(adjust) = self.font.size_adjust.filter(|adjust| matches!(adjust.value, FontSizeAdjustValue::FromFont)) else { return; };
         if self.font_query_context_pending() { return; }
+        if text.is_some() { note_font_metric_read(None, self, None); }
         let Some(metric) = text.and_then(|text| text.first_available_font_metric(self.font_spec(), adjust.metric)) else { return; };
         self.font.size_adjust = metric.filter(|value| value.is_finite() && *value >= 0.0)
             .map(|value| FontSizeAdjust { metric: adjust.metric, value: FontSizeAdjustValue::Number(value) });
@@ -5109,6 +5131,9 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
     /// Resolve current-font consumers using actual backend metrics when supplied.
     pub fn resolve_query_context_with_text(&mut self, query: ContainerUnitContext, text:Option<&dyn TextShaper>) -> bool {
         let query = query.for_writing_mode(self.writing_mode);
+        if text.is_some() && (self.registered_query.is_some() || !self.relative_expressions.is_empty()) {
+            note_font_metric_read(None, self, None);
+        }
         if let Some(pending) = self.registered_query.clone() {
             // Unknown layout stays pending; it is not an invalid registered
             // declaration and must not acquire an invented percentage basis.
@@ -7639,6 +7664,10 @@ impl TransitionCandidates {
 
 pub struct StyleIndex {
     pub environment: MediaEnvironment,
+    /// Where styles computed with this index note the font families whose
+    /// metrics they may have read (`note_font_metric_read`); without one,
+    /// the process-wide set.
+    pub(crate) font_metric_sink: Option<Arc<core::sync::atomic::AtomicU64>>,
     /// Any parsed rule declares `z-index`; gates the stacking pre-pass.
     pub(crate) has_z_index: bool,
     /// Content declarations on `::before`/`::after` may create virtual boxes.
@@ -8661,6 +8690,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
         } = flags;
         let uses_ancestor_bloom = ancestor_masks.iter().any(|mask| !mask.is_empty());
         Self {
+            font_metric_sink: None,
             environment: MediaEnvironment::default(),
             children_state_dependent,
             has_z_index,
@@ -31911,6 +31941,8 @@ fn compute_for_named_registered_inner(
     let mut blocked_registered = Vec::new();
     // Raw sources feed query replay (eligibility present) and font-cycle detection; the latter
     // asks for them on demand, so the common cascade can share the inherited map by pointer.
+    // Registered custom properties resolve their lengths with font metrics.
+    if !registrations.is_empty() && text.is_some() { note_font_metric_read(Some(index), &style, parent); }
     let initial_context: CustomContext = (style_length_context(if registrations.is_empty() { None } else { text }, &style, index.environment, None), query, style.resolved_source_color(1, style.color));
     let raw_source_context = (!registrations.is_empty() && eligibility.is_some()).then(|| initial_context.clone());
     let memoizable = eligibility.is_none();
@@ -32071,8 +32103,10 @@ fn compute_for_named_registered_inner(
             }
         }};
         ($raw:expr) => {{
+            let metric = raw_may_use_font_metrics($raw);
+            if metric && text.is_some() { note_font_metric_read(Some(index), &style, parent); }
             match resolved_length_context {
-                Some(context) if !length_metrics_pending || !raw_may_use_font_metrics($raw) => context,
+                Some(context) if !length_metrics_pending || !metric => context,
                 _ => length_context!(),
             }
         }};
@@ -32378,6 +32412,9 @@ fn compute_for_named_registered_inner(
                 } else if let Value::GeneratedContent(GeneratedContent::Items(items)) =
                     &declaration.value
                 {
+                    if text.is_some() && raw_may_use_font_metrics(&serialize_generated_content_items(items)) {
+                        note_font_metric_read(Some(index), &style, parent);
+                    }
                     style.generated_content = Some(resolve_generated_content_items(
                         items,
                         source_url.as_deref(),
@@ -32512,6 +32549,7 @@ fn compute_for_named_registered_inner(
                         else {style.animation[3]=Some(Arc::from(transition_controls::serialize_timings(Some(&values))));}
                     }
                 } else if let Value::FontFeatureSettings(settings) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = matches!(settings.as_deref(),Some(FontFeatureSettings::Expressions(values))
                         if values.iter().any(|value| parent_font_expression_pending(parent,&value.value)));
@@ -32531,6 +32569,7 @@ fn compute_for_named_registered_inner(
                         });
                     }
                 } else if let Value::FontStretchExpression(expression) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = parent_font_expression_pending(parent,expression);
                     if let Some(resolved) = (!pending_parent).then(|| resolve_font_width(expression, Some(length), ContainerUnitContext::default())).flatten() {
@@ -32547,6 +32586,7 @@ fn compute_for_named_registered_inner(
                         }
                     }
                 } else if let Value::FontStyleExpression(expression) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = parent_font_expression_pending(parent,expression);
                     if let Some(resolved) = (!pending_parent).then(|| resolve_font_angle(expression, Some(length), ContainerUnitContext::default())).flatten() {
@@ -32595,6 +32635,7 @@ fn compute_for_named_registered_inner(
                     let percent = Some(if font_pass { parent.map_or(16.0, |parent| parent.font_size) }
                         else if slot == 13 { style.font_size } else { 0.0 });
                     let metric_text = if raw_may_use_font_metrics(raw) { text } else { None };
+                    if metric_text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let context = if pass >= 5 {
                         let base = if metric_text.is_some() { length_context!() }
                             else { resolved_length_context.expect("font and line-height phases completed") };

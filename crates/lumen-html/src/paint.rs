@@ -637,7 +637,28 @@ impl SpacingTrim {
     }
 }
 
+/// The bit a named font family takes in a family set (`FontSpec::family_bits`):
+/// families match ASCII case-insensitively, so equal names share a bit. A set
+/// may hold false positives, never false negatives.
+pub fn font_family_bit(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    1 << (hash % 64)
+}
+
 impl FontSpec {
+    /// The named families this font may select a face from, as a set of
+    /// `font_family_bit`s. Generic families never select a document's
+    /// `@font-face` faces, so they take no bit.
+    pub fn family_bits(&self) -> u64 {
+        self.families.as_deref().map_or(0, |families| {
+            families.iter().filter_map(FontFamily::named).fold(0, |bits, name| bits | font_family_bit(name))
+        })
+    }
+
     pub fn weight_milli(&self) -> u32 {
         u32::from(self.weight) * 1000 + u32::from(self.weight_fraction)
     }
@@ -767,6 +788,12 @@ pub trait TextShaper {
     /// Identity/generation of the immutable font configuration used for layout.
     fn generation(&self) -> u64 {
         0
+    }
+    /// The set of `font_family_bit`s of the fonts shaped with, which layout
+    /// reads and resets to learn which families a box's text used. None when
+    /// this shaper does not record them.
+    fn family_record(&self) -> Option<&core::cell::Cell<u64>> {
+        None
     }
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()>;
     fn shape_directional(&self, text: &str, size: f32, _rtl: bool) -> Result<ShapedRun, ()> {

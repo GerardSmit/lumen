@@ -1628,6 +1628,9 @@ struct RetainedFragment {
     /// Layout of this subtree consulted the text shaper, so its commands and
     /// geometry depend on loaded fonts.
     has_text: bool,
+    /// The font families (`font_family_bit`s) the box's text was shaped with,
+    /// apart from text inside retained fragments of its own.
+    own_families: u64,
     /// A box inside resolved a size against a block size, which the parent's
     /// definite height (`key.parent_height`) can supply.
     reads_block_basis: bool,
@@ -1650,6 +1653,8 @@ struct CountingShaper<'a> {
     inner: &'a dyn TextShaper,
     uses: core::cell::Cell<u64>,
     memo: RefCell<ShapeMemo>,
+    /// The families of the fonts shaped with (`TextShaper::family_record`).
+    families: core::cell::Cell<u64>,
 }
 
 const MAX_SHAPE_MEMO_ENTRIES: usize = 8192;
@@ -1792,8 +1797,13 @@ impl CountingShaper<'_> {
         self.uses.set(self.uses.get().wrapping_add(1));
     }
 
+    fn note(&self, font: &FontSpec) {
+        self.families.set(self.families.get() | font.family_bits());
+    }
+
     fn memoized<T: ShapeMemoResult>(&self, query: ShapeQuery<'_>, compute: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
         self.bump();
+        self.note(query.font);
         if query.text.len() > MAX_SHAPE_MEMO_TEXT { return compute(); }
         let hash = query.hash();
         let hit = self.memo.borrow().entries.get(&hash)
@@ -1848,6 +1858,9 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
     fn generation(&self) -> u64 {
         self.inner.generation()
     }
+    fn family_record(&self) -> Option<&core::cell::Cell<u64>> {
+        Some(&self.families)
+    }
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()> {
         self.bump();
         self.inner.shape(text, size)
@@ -1895,22 +1908,27 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
     }
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
+        self.note(font);
         self.inner.underline_metrics_styled(size, font)
     }
     fn strike_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
+        self.note(font);
         self.inner.strike_metrics_styled(size, font)
     }
     fn font_unit_metrics_styled(&self, size: f32, font: &FontSpec, vertical: bool, upright_zero: bool) -> crate::paint::FontUnitMetrics {
         self.bump();
+        self.note(font);
         self.inner.font_unit_metrics_styled(size, font, vertical, upright_zero)
     }
     fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> FontRelativeMetrics {
         self.bump();
+        self.note(font);
         self.inner.font_relative_metrics_styled(size, font)
     }
     fn primary_character_widths_styled(&self, size: f32, font: &FontSpec) -> Option<crate::paint::PrimaryCharacterWidths> {
         self.bump();
+        self.note(font);
         self.inner.primary_character_widths_styled(size, font)
     }
     fn ascent(&self, size: f32) -> f32 {
@@ -2437,6 +2455,10 @@ pub(crate) struct RetainedLayoutCache {
     /// the new one and is otherwise equal.
     custom_rebases: Vec<css::CustomRebase>,
     last_successful: anchor_layout::LastSuccessful,
+    /// Font families (`font_family_bit`s) of text no retained fragment owns:
+    /// laid out outside every retained box, or owned by a fragment evicted
+    /// while boxes that replay it stay. A load of one of them drops all text.
+    orphan_families: u64,
 }
 
 fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
@@ -2658,6 +2680,7 @@ impl RetainedLayoutCache {
 
     fn clear_fragments(&mut self) {
         if !self.entries.is_empty() { self.clears += 1; }
+        self.orphan_families = 0;
         self.custom_rebases.clear();
         self.entries = Vec::new();
         self.index.clear();
@@ -2699,6 +2722,7 @@ impl RetainedLayoutCache {
     /// their descendants' commands.
     pub(crate) fn invalidate_fonts(&mut self) {
         self.generated_current = false;
+        self.orphan_families = 0;
         self.intrinsics.clear();
         if !self.entries.iter().any(|entry| entry.has_text) {
             return;
@@ -2753,6 +2777,44 @@ impl RetainedLayoutCache {
                 .any(|target| document_is_ancestor(document, entry.key.node, *target))
         });
         self.rebuild_indexes();
+    }
+
+    /// Drops what text shaped with a font of `families` (`font_family_bit`s)
+    /// went into: the fragments owning such text and those replaying them
+    /// (their ancestors), and the intrinsic sizes inside and around the
+    /// owners. Fragments inside an owner own none of that text and validate
+    /// themselves. Whether anything was dropped; None when some such text
+    /// has no owner, and `invalidate_fonts` must drop all text instead.
+    pub(crate) fn invalidate_font_families(&mut self, document: &Document, families: u64) -> Option<bool> {
+        if families == 0 { return Some(false); }
+        if self.orphan_families & families != 0 { return None; }
+        let owners: BTreeSet<RetainedNodeKey> = self.entries.iter()
+            .filter(|entry| entry.own_families & families != 0)
+            .map(|entry| retained_node_key(entry.key.node)).collect();
+        if owners.is_empty() { return Some(false); }
+        let mut doomed: BTreeSet<RetainedNodeKey> = owners.clone();
+        // Owners inside no other owner; intrinsic sizes go around each.
+        let mut roots: Vec<NodeId> = Vec::new();
+        for entry in &self.entries {
+            let key = retained_node_key(entry.key.node);
+            if !owners.contains(&key) || roots.contains(&entry.key.node) { continue; }
+            let mut nested = false;
+            let mut current = document.composed_parent(entry.key.node).ok().flatten();
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                let ancestor = retained_node_key(id);
+                nested |= owners.contains(&ancestor);
+                doomed.insert(ancestor);
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() { return None; }
+            if !nested { roots.push(entry.key.node); }
+        }
+        self.generated_current = false;
+        if !self.drop_intrinsics_around(document, &roots, true) { self.intrinsics.clear(); }
+        self.entries.retain(|entry| !doomed.contains(&retained_node_key(entry.key.node)));
+        self.rebuild_indexes();
+        Some(true)
     }
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
@@ -2874,6 +2936,13 @@ impl RetainedLayoutCache {
             && self.same_style(&{ let mut retained = (*entry.parent_style).clone(); retained.height = parent_style.height; retained }, parent_style)
     }
 
+    /// Removes a fragment that boxes replaying it may outlive: its text's
+    /// families become orphans.
+    fn evict_slot(&mut self, slot: usize) {
+        self.orphan_families |= self.entries[slot].own_families;
+        self.remove_slot(slot);
+    }
+
     fn remove_slot(&mut self, slot: usize) {
         let removed = self.entries.swap_remove(slot);
         self.bytes = self.bytes.saturating_sub(removed.bytes);
@@ -2908,7 +2977,7 @@ impl RetainedLayoutCache {
                 continue;
             }
             if used >= limit { return false; }
-            self.remove_slot(slot);
+            self.evict_slot(slot);
             return true;
         }
     }
@@ -2956,15 +3025,16 @@ impl RetainedLayoutCache {
         bytes
     }
 
-    fn store(&mut self, mut fragment: RetainedFragment) {
+    /// Keeps the fragment; false when it is not retained.
+    fn store(&mut self, mut fragment: RetainedFragment) -> bool {
         let parent_style = self.intern_style(Arc::clone(&fragment.parent_style));
         let style = self.intern_style(Arc::clone(&fragment.style));
-        let (Some(parent_bytes), Some(style_bytes)) = (retained_style_bytes(&parent_style), retained_style_bytes(&style)) else { return };
-        let Some(owned) = fragment.bytes.checked_add(parent_bytes).and_then(|owned| owned.checked_add(style_bytes)) else { return };
+        let (Some(parent_bytes), Some(style_bytes)) = (retained_style_bytes(&parent_style), retained_style_bytes(&style)) else { return false };
+        let Some(owned) = fragment.bytes.checked_add(parent_bytes).and_then(|owned| owned.checked_add(style_bytes)) else { return false };
         fragment.parent_style = parent_style;
         fragment.style = style;
         let Some(charged) = owned.checked_add(RETAINED_INDEX_ENTRY_BYTES) else {
-            return;
+            return false;
         };
         if fragment.bytes == 0
             || charged > MAX_RETAINED_FRAGMENT_BYTES
@@ -2972,7 +3042,7 @@ impl RetainedLayoutCache {
             || self.budget.max_entries == 0
             || (self.min_commands > 0 && fragment.commands.len() <= self.min_commands)
         {
-            return;
+            return false;
         }
         let own_bytes = charged - parent_bytes - style_bytes;
         fragment.bytes = own_bytes;
@@ -2981,13 +3051,13 @@ impl RetainedLayoutCache {
         fragment.lru_stamp.set(self.clock);
         let node = retained_slot_key(&fragment.key);
         if let Some(&slot) = self.index.get(&node) {
-            self.remove_slot(slot);
+            self.evict_slot(slot);
         }
         // Past `RETAINED_WAYS` widths, the least recently used one goes.
         let ways: Vec<usize> = self.index.range(retained_node_slots(node.0)).map(|(_, &slot)| slot).collect();
         if ways.len() >= RETAINED_WAYS {
             if let Some(&oldest) = ways.iter().min_by_key(|&&slot| self.entries[slot].last_used.get()) {
-                self.remove_slot(oldest);
+                self.evict_slot(oldest);
             }
         }
         while self.entries.len() >= self.budget.max_entries
@@ -2999,11 +3069,11 @@ impl RetainedLayoutCache {
             // boxes laid out first are the descendants of those stored last,
             // which hold copies of them and go as soon as one inside changes.
             if !self.evict_oldest_before(self.frame_clock) {
-                return;
+                return false;
             }
         }
         if self.entries.try_reserve(1).is_err() {
-            return;
+            return false;
         }
         self.bytes += fragment.bytes;
         self.acquire_style(&fragment.parent_style, parent_bytes);
@@ -3011,6 +3081,7 @@ impl RetainedLayoutCache {
         self.index.insert(node, self.entries.len());
         self.lru.insert(fragment.lru_stamp.get(), node);
         self.entries.push(Rc::new(fragment));
+        true
     }
 
     fn rebuild_indexes(&mut self) {
@@ -4710,6 +4781,9 @@ struct Layout<'a> {
     document: &'a Document,
     text: &'a dyn TextShaper,
     text_uses: &'a core::cell::Cell<u64>,
+    /// The box whose retained fragment the last `RetainedLayoutCache::store`
+    /// kept, so the box's caller knows its text's families have an owner.
+    retained_owner: Option<NodeId>,
     rules: &'a StyleIndex,
     images: Option<&'a dyn ImageResolver>,
     commands: Vec<Command>,
@@ -5029,6 +5103,7 @@ impl<'a> Layout<'a> {
         document,
         text,
         text_uses,
+        retained_owner: None,
         rules,
         images,
         commands: Vec::new(),
@@ -36529,6 +36604,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn finish_display_list(&mut self) -> Result<DisplayList, LayoutError> {
+        // Text laid out outside every retained fragment has no owner.
+        let unowned = self.text.family_record().map_or(u64::MAX, core::cell::Cell::get);
+        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.orphan_families |= unowned; }
         self.elide_overflow_paint()?;
         self.correct_positioned_clip_scopes()?;
         self.commands.shrink_to_fit();
@@ -39553,6 +39631,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_bytes: geometry.rendered_text_bytes.checked_sub(rendered_bytes_start)?,
             rendered_table_context: self.rendered_table_context,
             has_text,
+            own_families: 0,
             reads_block_basis: true,
             pending_images: None,
             deferred_images: None,
@@ -39879,8 +39958,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let multicol = css::columns::active(&computed);
         if multicol { self.multicol_depth += 1; }
+        // The families this box shapes with are its own: a kept fragment
+        // records them, otherwise they belong to the enclosing box.
+        let families = self.text.family_record();
+        let enclosing_families = families.map(|record| record.replace(0));
         let result =
             self.box_for_baseline_scope(id, parent_style, Some(computed), x, y, available, depth, child_override, output_rect);
+        if let (Some(record), Some(enclosing)) = (families, enclosing_families) {
+            let owned = self.retained_owner.take() == Some(id);
+            record.set(if owned { enclosing } else { enclosing | record.get() });
+        }
         if multicol { self.multicol_depth -= 1; }
         self.export_block_table_baselines = saved_table_baselines;
         if let Some(saved) = saved_computed_parent { self.computed_parent = saved; }
@@ -40281,8 +40368,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                         fragment.bytes = fragment.bytes.saturating_add(deferred.len() * 512);
                         fragment.deferred_images = Some(Arc::from(deferred));
                     }
+                    fragment.own_families = self.text.family_record().map_or(u64::MAX, core::cell::Cell::get);
                     if let Some(cache) = self.retained_fragments.as_deref_mut() {
-                        cache.store(fragment);
+                        if cache.store(fragment) { self.retained_owner = Some(id); }
                     }
                     }
                 }
@@ -45786,6 +45874,7 @@ fn laid_out_display_list_once(
         inner: text,
         uses: core::cell::Cell::new(0),
         memo: RefCell::default(),
+        families: core::cell::Cell::new(0),
     };
     let mut layout = Layout::new(document, &counting, &counting.uses, rules, images,
         viewport, geometry, scrolls, style_cache, retained_fragments);
@@ -55763,7 +55852,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn counting_shaper_answers_repeated_queries_from_its_memo() {
         let inner = CallCountingText { shapes: core::cell::Cell::new(0), metrics: core::cell::Cell::new(0) };
-        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default() };
+        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default(), families: core::cell::Cell::new(0) };
         let font = FontSpec::default();
         let first = counting.shape_styled("one two", 16.0, false, &font).unwrap();
         let again = counting.shape_styled("one two", 16.0, false, &font).unwrap();
@@ -55823,6 +55912,56 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         assert_eq!(first, second);
         assert_eq!(layout.intrinsics.measured.get(), 0, "the next frame measures nothing again");
         assert!(layout.intrinsics.reused.get() > 0);
+    }
+
+    #[test]
+    fn a_loaded_font_lays_out_again_only_the_text_that_uses_its_family() {
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}p{margin:0;font-family:Body,serif}i::before{content:'x';font-family:Icons}</style>");
+        for index in 0..24 { markup.push_str(&alloc::format!("<section><p>paragraph {index}</p></section>")); }
+        markup.push_str("<div id=icons><span><i></i></span></div>");
+        let fresh = |markup: &str| {
+            let document = crate::html::parse(markup, 512).unwrap();
+            crate::session::RenderSession::new(document).display_list(200, 900, &FixedText).unwrap().clone()
+        };
+        let document = crate::html::parse(&markup, 512).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        session.display_list(200, 900, &FixedText).unwrap();
+        let laid_out = |session: &crate::session::RenderSession| session.invalidation_stats().boxes_laid_out;
+        let before = laid_out(&session);
+        session.invalidate_font_families(["icons"], FixedText.generation());
+        let targeted = session.display_list(200, 900, &FixedText).unwrap().clone();
+        let icons = laid_out(&session) - before;
+        assert_eq!(targeted, fresh(&markup));
+        assert!(icons > 0, "the icon's text is laid out again");
+
+        let before = laid_out(&session);
+        session.invalidate_font_families(["BODY"], FixedText.generation());
+        session.display_list(200, 900, &FixedText).unwrap();
+        let body = laid_out(&session) - before;
+        assert!(body > icons * 4, "every paragraph uses the body font: {body} vs {icons}");
+
+        let before = laid_out(&session);
+        session.invalidate_font_families(["Unused"], FixedText.generation());
+        session.display_list(200, 900, &FixedText).unwrap();
+        assert_eq!(laid_out(&session) - before, 0, "nothing uses the family");
+    }
+
+    #[test]
+    fn a_loaded_font_whose_metrics_a_style_read_computes_styles_again() {
+        let styles_after_load = |icon_style: &str, family: &str| {
+            let mut markup = alloc::format!("<!doctype html><style>p{{font-family:Body}}i::before{{content:'x';font-family:{family};{icon_style}}}</style>");
+            for _ in 0..16 { markup.push_str("<p>text <i></i></p>"); }
+            let document = crate::html::parse(&markup, 512).unwrap();
+            let mut session = crate::session::RenderSession::new(document);
+            session.display_list(200, 600, &FixedText).unwrap();
+            let before = session.invalidation_stats().styles_computed;
+            session.invalidate_font_families([family], FixedText.generation());
+            session.display_list(200, 600, &FixedText).unwrap();
+            session.invalidation_stats().styles_computed - before
+        };
+        let kept = styles_after_load("padding-left:2px", "Glyphs");
+        let recomputed = styles_after_load("padding-left:1ex", "Metrics");
+        assert!(recomputed > kept, "an ex length read the loaded font: {recomputed} vs {kept}");
     }
 
     #[test]

@@ -1032,6 +1032,9 @@ pub struct RenderSession {
     selection: Option<(crate::ranges::Boundary, crate::ranges::Boundary)>,
     frame_id: u64,
     font_generation: u64,
+    /// The font families whose metrics this document's styles may have read,
+    /// shared by every style index it builds (`StyleIndex::font_metric_sink`).
+    font_metric_families: Arc<core::sync::atomic::AtomicU64>,
     validity_generation: u64,
     interaction_generation: u64,
     /// Interaction state and top layer, target and form shape as of the last
@@ -1612,6 +1615,7 @@ impl RenderSession {
             selection: None,
             frame_id: 0,
             font_generation: 0,
+            font_metric_families: Arc::default(),
             validity_generation: 0,
             interaction_generation,
             synced_interaction: (document_interaction, document_shape),
@@ -5134,6 +5138,7 @@ impl RenderSession {
                 let previous_generation = self.rules_generation;
                 // SAFETY: the host promised the `StyleParallelism` contract in `set_style_parallelism`.
                 unsafe { rules.set_parallelism(self.style_parallelism.clone()); }
+                rules.font_metric_sink = Some(Arc::clone(&self.font_metric_families));
                 self.rules = Some(rules);
                 self.rules_generation = self.rules_generation.wrapping_add(1);
                 if let Some(delta) = &appended { self.extend_transition_caches(previous_generation, delta.from); }
@@ -5180,6 +5185,30 @@ impl RenderSession {
         self.discard_frame();
         self.style_cache.borrow_mut().clear();
         self.layout_cache.invalidate_fonts();
+        self.paint_revision = self.paint_revision.wrapping_add(1);
+        self.frame_id += 1;
+    }
+
+    /// The faces of `families` changed and the shaper is now at font
+    /// `generation`. Only text shaped with one of them is laid out again, and
+    /// styles are computed again only when a font-relative length may have
+    /// read one's metrics; anything not known to be unaffected goes as in
+    /// `invalidate_fonts`.
+    pub fn invalidate_font_families<'a>(&mut self, families: impl IntoIterator<Item = &'a str>, generation: u64) {
+        let bits = families.into_iter().fold(0, |bits, family| bits | crate::paint::font_family_bit(family));
+        self.font_generation = generation;
+        let metric_families = self.font_metric_families.load(core::sync::atomic::Ordering::Relaxed) | css::font_metric_families();
+        if bits & metric_families != 0 {
+            self.invalidate_fonts();
+            return;
+        }
+        match self.layout_cache.invalidate_font_families(&self.document, bits) {
+            // No text uses them: the frame stands.
+            Some(false) => return,
+            Some(true) => {}
+            None => self.layout_cache.invalidate_fonts(),
+        }
+        self.discard_frame();
         self.paint_revision = self.paint_revision.wrapping_add(1);
         self.frame_id += 1;
     }
