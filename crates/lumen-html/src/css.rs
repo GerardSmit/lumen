@@ -8877,6 +8877,57 @@ fn rule_media_matches(&self, order: usize) -> bool {
         Ok((style, eligibility))
     }
 
+    /// `compute_transition_snapshot_cached` for an element, shared with an
+    /// earlier element of the same snapshot whose cascade inputs are the same
+    /// as layout's style sharing tells them apart: share class, revalidated
+    /// selectors, box parent context and the very parent style. Their styles
+    /// and provenance are then equal, and repeated card or list markup is
+    /// cascaded once.
+    pub(crate) fn compute_transition_snapshot_shared(&self, document: &Document, node: NodeId,
+        parent: Option<&Arc<Style>>, text: Option<&dyn TextShaper>, cache: &mut StyleCache,
+        shares: &mut SnapshotShares) -> Result<(Arc<Style>, EffectEligibility), CssError> {
+        let kind = document.kind(node).map_err(|_| CssError { offset: 0, message: "invalid transition target" })?;
+        let auto_direction = match kind {
+            NodeKind::Element { namespace: Namespace::Html, name, .. } => crate::svg::local_name(name) == "bdi"
+                || document.get_attribute_ns_ref(node, None, "dir").ok().flatten().is_some_and(|value| value.eq_ignore_ascii_case("auto")),
+            _ => false,
+        };
+        let key = (matches!(kind, NodeKind::Element { .. }) && !auto_direction && document.host_gate.exact())
+            .then(|| self.style_sharing()).flatten().and_then(|keys| {
+                let class = cache.share.class_of(document, &keys, node);
+                cache.share.shareable(class).then(|| (class, keys.revalidate(self, document, node, kind)))
+            });
+        #[cfg(test)]
+        let key = key.filter(|_| !SNAPSHOT_SHARING_OFF.load(core::sync::atomic::Ordering::Relaxed));
+        let Some((class, dependent)) = key else {
+            return self.compute_transition_snapshot_cached(document, node, parent.map(|parent| &**parent), None, text, cache, false);
+        };
+        let box_parent = resolve_box_parent(document, node, parent.map(|parent| &**parent), self, cache, text)?;
+        let same_parent = |entry: &SnapshotShare| match (&entry.parent, parent) {
+            (None, None) => true,
+            (Some(cached), Some(parent)) => Arc::ptr_eq(cached, parent),
+            _ => false,
+        };
+        if let Some(entry) = shares.entries.iter().find(|entry| entry.class == class && entry.box_parent == box_parent
+            && entry.dependent == dependent && same_parent(entry)) {
+            shares.hits += 1;
+            cache.store_unattributed(document, node, box_parent, &entry.style);
+            return Ok((entry.style.clone(), entry.eligibility.clone()));
+        }
+        let (style, eligibility) = self.compute_transition_snapshot_cached(document, node, parent.map(|parent| &**parent), None, text, cache, false)?;
+        if !style.sibling_position_dependent && style.registered_query.is_none()
+            && !style.has_query_container_dependencies() && !style.has_inherited_query_container_dependencies() {
+            let entry = SnapshotShare { class, dependent, box_parent, parent: parent.cloned(), style: style.clone(), eligibility: eligibility.clone() };
+            if shares.entries.len() < style_sharing::SHARED_STYLES {
+                shares.entries.push(entry);
+            } else {
+                shares.entries[shares.next] = entry;
+                shares.next = (shares.next + 1) % style_sharing::SHARED_STYLES;
+            }
+        }
+        Ok((style, eligibility))
+    }
+
     /// The after-change style without effect provenance, for snapshot entries
     /// no running or future effect replays.
     pub(crate) fn compute_transition_style_plain(&self, document: &Document, node: NodeId,
@@ -20636,6 +20687,39 @@ fn animation_values(name: &str, raw: &str) -> Option<Vec<(usize, String)>> {
 }
 
 pub fn transition_property_longhands(name:&str)->Vec<Arc<str>> { transition_controls::longhands(name) }
+/// Whether a transition of `name` can change a value descendants inherit or
+/// whether they are rendered: an inherited longhand, a custom or unknown
+/// property, `all`, or display-like properties.
+impl StyleIndex {
+    /// Whether an animation named `name` can change what descendants inherit:
+    /// some `@keyframes` of that name sets a property a transition of which
+    /// would (see `transition_reaches_descendants`). A name without keyframes
+    /// animates nothing.
+    pub(crate) fn keyframes_reach_descendants(&self,name:&str)->bool {
+        let name=name.trim_matches(|c:char|c=='"'||c=='\''||c.is_whitespace());
+        self.keyframes.iter().filter(|rule|rule.name==name).any(|rule|rule.rules.iter().any(|keyframe|
+            keyframe.style.split(';').any(|declaration|{
+                let declaration=declaration.trim();
+                if declaration.is_empty() {return false;}
+                match declaration.split_once(':') {
+                    Some((property,_))=>{
+                        let property=property.trim().to_ascii_lowercase();
+                        property!="animation-timing-function" && property!="animation-composition" && transition_reaches_descendants(&property)
+                    },
+                    None=>true,
+                }
+            })))
+    }
+}
+pub(crate) fn transition_reaches_descendants(name:&str)->bool {
+    if name.trim().eq_ignore_ascii_case("none") {return false;}
+    let longhands=transition_controls::longhands(name);
+    longhands.is_empty() || longhands.iter().any(|longhand| {
+        let ids=slots(longhand);
+        longhand.starts_with("--") || ids.is_empty() || ids.iter().any(|id|inherited_property(*id))
+            || matches!(longhand.as_ref(),"display"|"content-visibility"|"overlay"|"visibility")
+    })
+}
 
 /// The properties `transition-property: all` expands to, without allocating names.
 pub fn transition_all_longhands() -> impl Iterator<Item = &'static str> {
@@ -26887,6 +26971,28 @@ impl RegisteredQuerySources {
     }
 }
 
+#[cfg(test)]
+pub(crate) static SNAPSHOT_SHARING_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Styles one transition snapshot computed with provenance, for elements
+/// that share them (see `StyleIndex::compute_transition_snapshot_shared`).
+#[derive(Default)]
+pub(crate) struct SnapshotShares {
+    entries: Vec<SnapshotShare>,
+    next: usize,
+    pub(crate) hits: u64,
+}
+
+struct SnapshotShare {
+    class: u32,
+    dependent: Vec<u32>,
+    box_parent: BoxParentContext,
+    // Held so that no later parent style can take its address.
+    parent: Option<Arc<Style>>,
+    style: Arc<Style>,
+    eligibility: EffectEligibility,
+}
+
 /// Compact provenance retained only by transition snapshots. Normal computed
 /// styles carry no extra mask or custom-name allocation.
 #[derive(Clone, Debug)]
@@ -27038,24 +27144,14 @@ impl Value {
     /// Values of numbers, keywords and colors only: applying one allocates
     /// nothing a style retains, so their provenance charge is zero.
     fn holds_no_heap_payload(&self)->bool{
+        // Only values stored in `Style`'s own fields: one kept in its extras
+        // can allocate them (an unset text decoration color does).
         matches!(self,
-            Value::Appearance(_)|Value::FieldSizing(_)|Value::TransformBox(_)
-            |Value::WhiteSpace(_)|Value::TextTransform(_)|Value::WordBreak(_)|Value::OverflowWrap(_)|Value::TextAlign(_)
-            |Value::LetterSpacing(_)|Value::Direction(_)|Value::UnicodeBidi(_)|Value::ScrollBehavior(_)|Value::TextOverflow(_)
-            |Value::TextDecoration(_)|Value::TextDecorationStyle(_)|Value::TextDecorationColor(_)|Value::TextUnderlinePosition(_)
-            |Value::BackgroundImageNone|Value::MinHeight(_)|Value::MinHeightAuto|Value::MaxHeight(_)|Value::Order(_)
-            |Value::FlexWrapReverse(_)|Value::FlexWrapReverseBalance(_)|Value::MarginAuto(_)|Value::Position(_)|Value::Float(_)
-            |Value::Clear(_)|Value::Offset(..)|Value::MarginSide(..)|Value::PaddingSide(..)|Value::ListStylePosition(_)
-            |Value::Display(_)|Value::Opacity(_)|Value::Color(_)|Value::Background(_)|Value::Width(_)|Value::MinWidth(_)
-            |Value::MinWidthAuto|Value::MaxWidth(_)|Value::Height(_)|Value::Margin(_)|Value::Padding(_)|Value::FontSize(_)
-            |Value::FontSizeKeyword(_)|Value::FontWeight(_)|Value::FontStretch(_)|Value::FontVariantCaps(_)
-            |Value::FontSynthesisSmallCaps(_)|Value::SvgStrokeWidth(_)|Value::SvgFillOpacity(_)|Value::SvgStrokeOpacity(_)
-            |Value::SvgFillRule(_)|Value::SvgClipRule(_)|Value::SvgStopColor(_)|Value::SvgStopOpacity(_)|Value::SvgFloodColor(_)
-            |Value::SvgFloodOpacity(_)|Value::BorderRadius(_)|Value::BorderWidth(_)|Value::BorderColor(_)|Value::BorderStyle(_)
-            |Value::OverflowAxis(..)|Value::FlexDirection(_)|Value::FlexWrap(_)|Value::Gap(_)|Value::FlexGrow(_)
-            |Value::FlexShrink(_)|Value::FlexBasis(_)|Value::FlexBasisContent|Value::BoxSizing(_)|Value::TableFixed(_)
-            |Value::BorderSpacing(_)|Value::AspectRatio(..)|Value::ZIndex(_)|Value::GridAutoFlow(_)|Value::GridDisplay{..}
-            |Value::DisplayComponents{..}|Value::DisplayRuby{..}|Value::GridLanesPack(_))
+            Value::Display(_)|Value::Opacity(_)|Value::Color(_)|Value::Background(_)|Value::Width(_)|Value::MinWidth(_)
+            |Value::MaxWidth(_)|Value::Height(_)|Value::Margin(_)|Value::Padding(_)|Value::MarginSide(..)|Value::PaddingSide(..)
+            |Value::FontSize(_)|Value::BorderRadius(_)|Value::BorderWidth(_)|Value::BorderColor(_)|Value::BorderStyle(_)
+            |Value::FlexDirection(_)|Value::FlexWrap(_)|Value::Gap(_)|Value::FlexGrow(_)|Value::FlexShrink(_)
+            |Value::FlexBasis(_)|Value::BoxSizing(_)|Value::TableFixed(_)|Value::BorderSpacing(_))
     }
 }
 

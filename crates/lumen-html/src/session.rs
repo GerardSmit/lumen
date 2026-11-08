@@ -1248,6 +1248,12 @@ pub struct InvalidationStats {
     pub transition_styles_reused: u64,
     /// Snapshot styles taken from the layout's retained styles instead of computed.
     pub transition_styles_from_layout: u64,
+    /// Snapshot styles computed with effect provenance, and those of them
+    /// that only an ancestor's effect asked for.
+    pub transition_styles_with_provenance: u64,
+    pub transition_styles_with_inherited_provenance: u64,
+    /// Snapshot styles with provenance shared with an equal earlier element.
+    pub transition_styles_shared: u64,
     /// Stylesheet graphs and texts parsed, and reused from an earlier parse
     /// by a rules rebuild or an installation check.
     pub stylesheets_parsed: u64,
@@ -1353,6 +1359,18 @@ fn style_declares_effect(style:&Style)->bool {
     let nonzero=|times:&Option<Arc<[css::typed_numeric::NumericValue]>>|times.as_deref().is_some_and(|times|times.iter().any(|time|time.value!=0.0));
     nonzero(&style.transition_duration) || nonzero(&style.transition_delay)
         || style.animation[0].as_deref().is_some_and(|names|names.split(',').any(|name|{let name=name.trim();!name.is_empty() && !name.eq_ignore_ascii_case("none")}))
+}
+
+/// Whether an effect a style declares can change what its descendants
+/// inherit, so they need provenance too: any animation, and a transition of
+/// an inherited, custom, unknown or display-like property (or of `all`). A
+/// transition of opacity or transform alone changes nothing below.
+fn style_effects_reach_descendants(style:&Style,rules:&css::StyleIndex)->bool {
+    let animated=style.animation[0].as_deref().is_some_and(|names|names.split(',').any(|name|{
+        let name=name.trim();
+        !name.is_empty() && !name.eq_ignore_ascii_case("none") && rules.keyframes_reach_descendants(name)
+    }));
+    animated || style.transition_property().is_none_or(|properties|properties.iter().any(|property|css::transition_reaches_descendants(property)))
 }
 
 /// The document version, text shaper and effect state of the last whole
@@ -4682,6 +4700,8 @@ impl RenderSession {
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
         let mut forced_nodes=alloc::collections::BTreeSet::<u128>::new();
         let (mut computed_styles,mut reused_styles)=(0u64,0u64);
+        let (mut heavy_styles,mut inherited_heavy_styles)=(0u64,0u64);
+        let mut shares=css::SnapshotShares::default();
         let layout_current=lean && self.effect_override_nodes.is_empty() && self.layout_styles_current(text);
         let mut layout_reused=0u64;
         // Replaying an old style needs provenance only for elements an effect
@@ -4738,7 +4758,11 @@ impl RenderSession {
                                 node,parent:input.pseudo.map_or(inherited_parent,|_|Some(node)),pseudo:input.pseudo,style:input.style.clone(),
                                 rendered:Cell::new(pseudo_rendered),eligibility:input.eligibility.clone()},quota_exceeded)?;
                         }
-                        if needs_provenance {if let Some(scope)=lean_scope.as_mut() {scope.heavy.insert(node.key());}}
+                        if let Some(scope)=lean_scope.as_mut() {
+                            if needs_provenance && (scope.hinted(node,inherited_parent) || style_effects_reach_descendants(&earlier[0].style,rules)) {
+                                scope.heavy.insert(node.key());
+                            }
+                        }
                         reused_styles+=1;
                         carried=true;
                     }
@@ -4778,9 +4802,14 @@ impl RenderSession {
                     let (computed,eligible)=match plain {
                         Some(plain)=>plain,
                         None=>{
-                            if let Some(scope)=lean_scope.as_mut() {scope.heavy.insert(id.key());}
-                            rules.compute_transition_snapshot_cached(&self.document,id,parent.as_deref(),None,text,
-                                &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?
+                            heavy_styles+=1;
+                            if lean_scope.as_ref().is_some_and(|scope|scope.hinted(id,parent_key)) {inherited_heavy_styles+=1;}
+                            let computed=rules.compute_transition_snapshot_shared(&self.document,id,parent.as_ref(),text,
+                                &mut cache,&mut shares).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?;
+                            if let Some(scope)=lean_scope.as_mut() {
+                                if scope.hinted(id,parent_key) || style_effects_reach_descendants(&computed.0,rules) {scope.heavy.insert(id.key());}
+                            }
+                            computed
                         }
                     };
                     parent_key=Some(id);
@@ -4847,6 +4876,9 @@ impl RenderSession {
         self.invalidation_stats.transition_styles_computed+=computed_styles;
         self.invalidation_stats.transition_styles_reused+=reused_styles;
         self.invalidation_stats.transition_styles_from_layout+=layout_reused;
+        self.invalidation_stats.transition_styles_with_provenance+=heavy_styles;
+        self.invalidation_stats.transition_styles_with_inherited_provenance+=inherited_heavy_styles;
+        self.invalidation_stats.transition_styles_shared+=shares.hits;
         Ok(Arc::new(TransitionSnapshot {epoch,nodes}))
     }
 
@@ -7785,6 +7817,48 @@ mod tests {
         let snapshot=session.transition_snapshot_sparse(None,None,&[target]).unwrap();
         let kept=snapshot.nodes.iter().find(|input|input.node==target).unwrap();
         assert!(!kept.eligibility.is_light(),"the target of a running transition keeps provenance");
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_keeps_descendants_light_below_transitions_they_cannot_inherit() {
+        let spans=|rules:&str|{
+            let (mut session,_)=sparse_snapshot_session(rules,"<div id=target></div>");
+            let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+            let light=|name:&str|snapshot.nodes.iter().filter(|input|input.pseudo.is_none()
+                && matches!(session.document().kind(input.node),Ok(NodeKind::Element{name:element,..}) if element==name))
+                .map(|input|input.eligibility.is_light()).collect::<Vec<_>>();
+            (light("p"),light("span"))
+        };
+        for rules in ["p{transition:opacity 1s,transform 1s}","@keyframes a{from{opacity:0;transform:scale(.5)}to{opacity:1}}p{animation:a 1s}"] {
+            let (paragraphs,spans_below)=spans(rules);
+            assert!(!paragraphs.is_empty() && paragraphs.iter().all(|light|!light),"{rules}: declaring elements keep provenance");
+            assert!(spans_below.iter().all(|light|*light),"{rules}: opacity and transform reach no descendant");
+        }
+        for rules in ["p{transition:color 1s}","p{transition:all 1s}","p{transition:--x 1s}","p{transition:1s}",
+            "@keyframes a{to{color:red}}p{animation:a 1s}","@keyframes a{50%{--x:1}}p{animation:a 1s}","p{transition:display 1s allow-discrete}"] {
+            let (_,spans_below)=spans(rules);
+            assert!(spans_below.iter().all(|light|!light),"{rules}: descendants keep provenance");
+        }
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_shares_provenance_between_equal_elements() {
+        let cards="<article class=card><a class=link href=#><span class=icon>i</span><b>t</b></a></article>".repeat(40);
+        let source=alloc::format!("<style>.link{{transition:color 1s}}.card{{transition:opacity 1s}}.icon{{color:red}}</style><main>{cards}</main>{}","<p>x</p>".repeat(400));
+        let snapshot=|sharing:bool|{
+            let mut session=RenderSession::new(crate::html::parse(&source,1<<20).unwrap());
+            css::SNAPSHOT_SHARING_OFF.store(!sharing,core::sync::atomic::Ordering::Relaxed);
+            let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+            css::SNAPSHOT_SHARING_OFF.store(false,core::sync::atomic::Ordering::Relaxed);
+            (snapshot,session.invalidation_stats().transition_styles_shared)
+        };
+        let ((shared,hits),(unshared,_))=(snapshot(true),snapshot(false));
+        assert!(hits>40,"{hits} shared styles");
+        assert_eq!(shared.nodes.len(),unshared.nodes.len());
+        for (a,b) in shared.nodes.iter().zip(unshared.nodes.iter()) {
+            assert_eq!((a.node.index(),a.pseudo,a.parent.map(|node|node.index())),(b.node.index(),b.pseudo,b.parent.map(|node|node.index())));
+            assert!(*a.style==*b.style && alloc::format!("{:?}",a.eligibility)==alloc::format!("{:?}",b.eligibility) && a.rendered.get()==b.rendered.get());
+        }
     }
 
     #[test]
