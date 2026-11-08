@@ -1040,29 +1040,61 @@ impl InvalidationSets {
         }
         let mut collector = self.collector(document);
         if self.state != 0 {
-            let state_reach = |collector: &mut Collector<'_>, node: NodeId| -> Option<()> {
-                let mut spread = Spread::default();
-                let reach = spread.narrow(self.state, Some(&self.state_subjects));
+            let mut spread = Spread::default();
+            let reach = spread.narrow(self.state, Some(&self.state_subjects));
+            // Every element of a chain spreads the same narrowed features over
+            // its subtree and those of its ancestors. Spread from each element
+            // once, and when descendants are spread, only from the outermost:
+            // its subtree holds every inner element's descendants and siblings.
+            let mut spread_from = BTreeSet::new();
+            let mut spread_order = Vec::new();
+            let mut note = |node: NodeId, order: &mut Vec<NodeId>| {
+                if spread_from.insert((node.document, node.index, node.generation)) {
+                    order.push(node);
+                }
+            };
+            let mut state_reach = |collector: &mut Collector<'_>, node: NodeId, order: &mut Vec<NodeId>| -> Option<()> {
                 collector.reach(node, reach)?;
-                collector.spread(node, &spread)?;
-                if reach & ANCESTORS != 0 && !spread.is_empty() {
+                if spread.is_empty() {
+                    return Some(());
+                }
+                note(node, order);
+                if reach & ANCESTORS != 0 {
                     let mut ancestor = document.composed_parent(node).ok().flatten();
                     while let Some(id) = ancestor {
-                        collector.spread(id, &spread)?;
+                        note(id, order);
                         ancestor = document.composed_parent(id).ok().flatten();
                     }
                 }
                 Some(())
             };
             for &node in nodes {
-                state_reach(&mut collector, node)?;
+                state_reach(&mut collector, node, &mut spread_order)?;
             }
             for &start in chains {
                 let mut current = Some(start);
                 while let Some(node) = current {
-                    state_reach(&mut collector, node)?;
+                    state_reach(&mut collector, node, &mut spread_order)?;
                     current = document.composed_parent(node).ok().flatten();
                 }
+            }
+            let noted: BTreeSet<_> = spread_order.iter().map(|node| (node.document, node.index, node.generation)).collect();
+            for &node in &spread_order {
+                if spread.subtree {
+                    let mut ancestor = document.composed_parent(node).ok().flatten();
+                    let mut covered = false;
+                    while let Some(id) = ancestor {
+                        if noted.contains(&(id.document, id.index, id.generation)) {
+                            covered = true;
+                            break;
+                        }
+                        ancestor = document.composed_parent(id).ok().flatten();
+                    }
+                    if covered {
+                        continue;
+                    }
+                }
+                collector.spread(node, &spread)?;
             }
         }
         Some(collector.nodes)

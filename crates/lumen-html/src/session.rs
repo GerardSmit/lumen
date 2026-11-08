@@ -2132,8 +2132,20 @@ impl RenderSession {
         {
             return;
         }
-        if has_selector_dependencies && !focus_ring_changed && !(validity_changed && self.has_auto_directionality_controls()) {
-            if let Some(targets) = self.state_change_targets(validity_changed, interaction_changed, interaction_before) {
+        if !shape_changed && !(validity_changed && self.has_auto_directionality_controls()) {
+            // The UA focus ring is applied to the `:focus-visible` element when
+            // its style is computed, not by a rule, so a moved ring restyles
+            // just its old and new element.
+            let targets = if has_selector_dependencies {
+                self.state_change_targets(validity_changed, interaction_changed, interaction_before)
+            } else {
+                Some(Vec::new())
+            };
+            if let Some(mut targets) = targets {
+                if focus_ring_changed {
+                    targets.extend(interaction_before.0.focus_visible);
+                    targets.extend(self.synced_interaction.0.focus_visible);
+                }
                 self.rule_subjects.get_or_insert_with(Vec::new).extend(targets.into_iter().map(|node| (node, true)));
                 self.animation_snapshot = None;
                 if !live_value_changed {
@@ -9891,6 +9903,61 @@ mod tests {
         assert!(session.frame_id() > frame);
         assert!(session.paint_revision() > paint_revision);
         assert_eq!(session.document().version(), document_version);
+    }
+
+    #[test]
+    fn focus_deep_in_a_wide_document_restyles_only_the_chain() {
+        let mut html = alloc::string::String::from("<style>body{margin:0}p{margin:0;height:1px}.a:focus-within p{background:red}button{display:block;width:4px;height:3px;padding:0;border:0}</style><body>");
+        for _ in 0..14 { html.push_str("<div class='a'>"); for _ in 0..10 { html.push_str("<p></p>"); } }
+        html.push_str("<button id='target'></button>");
+        for _ in 0..14 { html.push_str("</div>"); }
+        let document = crate::html::parse(&html, 2000).unwrap();
+        let target = crate::selector::get_element_by_id(&document, document.root(), "target")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(40, 600, &NoText).unwrap();
+        session
+            .document_mut()
+            .set_interaction_state(crate::interaction::InteractionState {
+                focused: Some(target),
+                focus_visible: Some(target),
+                ..Default::default()
+            });
+        session.synchronize_form_state();
+        assert!(session.rule_subjects.is_some(), "the state change must restyle its targets, not the document");
+        session.display_list(40, 600, &NoText).unwrap();
+        let first = crate::selector::query_selector(session.document(), session.document().root(), "p").unwrap().unwrap();
+        assert_eq!(session.computed_style(first).unwrap().background.r, 255);
+    }
+
+    #[test]
+    fn a_moved_focus_ring_restyles_only_its_elements() {
+        let mut html = alloc::string::String::from("<style>body{margin:0}p{margin:0;height:2px}button{display:block;width:4px;height:3px;padding:0;border:0}</style><body><button id='target'></button>");
+        for _ in 0..40 { html.push_str("<p></p>"); }
+        let document = crate::html::parse(&html, 200).unwrap();
+        let target = crate::selector::get_element_by_id(&document, document.root(), "target")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(40, 200, &NoText).unwrap();
+        let entries = session.layout_cache_stats().entries;
+        assert!(entries > 40);
+        session
+            .document_mut()
+            .set_interaction_state(crate::interaction::InteractionState {
+                focused: Some(target),
+                focus_visible: Some(target),
+                ..Default::default()
+            });
+        session.synchronize_form_state();
+        assert!(session.layout_cache_stats().entries > 40, "the ring must not drop every retained box");
+        session.display_list(40, 200, &NoText).unwrap();
+        assert_eq!(session.computed_style(target).unwrap().outline.style, css::OutlineStyle::Auto);
+        session.document_mut().set_interaction_state(Default::default());
+        session.synchronize_form_state();
+        session.display_list(40, 200, &NoText).unwrap();
+        assert_ne!(session.computed_style(target).unwrap().outline.style, css::OutlineStyle::Auto);
     }
 
     #[test]
