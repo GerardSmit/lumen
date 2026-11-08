@@ -354,3 +354,24 @@ fn siblings_with_identical_custom_property_rules_share_values_and_others_differ(
     assert_eq!(value(&mut session, ".s2 > .x", "--c"), one("9px"));
     assert_eq!(value(&mut session, ".s2 > .x", "--e"), None);
 }
+
+#[test]
+fn case_context_lookups_keep_the_inherited_styles_layout_cached() {
+    // A flex container with generated content collects the case context of
+    // `text-transform` text; that lookup once styled ancestors without their
+    // parents and replaced their cached styles with uninherited ones.
+    let mut source = String::from("<style>nav, .links { text-transform: uppercase; font-weight: bold }\
+        .bar { display: flex } .bar::after { content: '' }</style>\
+        <header><ul class=links><li><a href=/a>about</a></li><li><a href=/b>talks</a></li></ul></header>\
+        <nav class=bar><ul><li>x</li></ul></nav>");
+    for index in 0..300 { source += &alloc::format!("<p>paragraph {index} <a>link</a></p>"); }
+    let mut session = session_from(&source);
+    let (compared, _) = assert_parallel_matches(&mut session);
+    assert!(compared > 600, "{compared}");
+    let links = session.style_cache.borrow();
+    let item = elements(&session.document).into_iter()
+        .find(|&node| matches!(session.document.kind(node), Ok(NodeKind::Element { name, .. }) if name == "li"))
+        .and_then(|node| links.node_style(node))
+        .expect("the first list item has a cached style");
+    assert_eq!(item.text_transform, css::TextTransform::Uppercase);
+}

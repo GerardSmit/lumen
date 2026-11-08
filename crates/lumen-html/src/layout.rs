@@ -30256,7 +30256,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut root = self.document.flat_tree_parent(node).map_err(|_| LayoutError::InvalidTree)?.unwrap_or(node);
         for _ in 0..512 {
             if matches!(self.document.kind(root), Ok(NodeKind::Element { .. })) {
-                let style = self.computed_style(root, None).map_err(LayoutError::Css)?;
+                // Inherited values must come from the tree: a parentless
+                // computation would also replace the node's cached style.
+                let style = self.computed_style_from_tree(root)?;
                 if !style.is_inline_level() || style.is_atomic_inline() { return Ok(root); }
             }
             let Some(parent) = self.document.flat_tree_parent(root).map_err(|_| LayoutError::InvalidTree)? else { return Ok(root); };
@@ -36854,7 +36856,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let mut root=self.document.flat_tree_parent(node).map_err(|_|LayoutError::InvalidTree)?.unwrap_or(node);
         for _ in 0..512 {
             if matches!(self.document.kind(root),Ok(NodeKind::Element{..})) {
-                let computed=self.computed_style(root,None).map_err(LayoutError::Css)?;
+                let computed=self.computed_style_from_tree(root)?;
                 if !computed.is_inline_level() || computed.is_atomic_inline() {break;}
             }
             let Some(parent)=self.document.flat_tree_parent(root).map_err(|_|LayoutError::InvalidTree)? else {break;};
@@ -36874,7 +36876,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     if id==target {*range=Some(start..text.len());}return Ok(());
                 }
                 NodeKind::Element{name,namespace,..}=> {
-                    let style=layout.computed_style(id,None).map_err(LayoutError::Css)?;
+                    let style=layout.computed_style_from_tree(id)?;
                     if style.display==Display::None || style.display.is_table_column() || depth>0 && matches!(style.position,Position::Absolute|Position::Fixed) {return Ok(());}
                     if *namespace==Namespace::Html && matches!(name.as_str(),"img"|"input"|"textarea"|"canvas"|"iframe"|"audio"|"video"|"embed") && (name != "input" || crate::control_appearance::presentation(layout.document,id,&style).is_none_or(|control|control.replaced)) {
                         push_context(text,"\u{fffc}")?;return Ok(());
