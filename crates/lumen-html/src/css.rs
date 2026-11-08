@@ -26989,10 +26989,11 @@ impl EffectEligibility {
                 Value::TransformRaw(raw)|Value::TransformOriginRaw(raw)|Value::ShadowsRaw(raw)|Value::TextShadowsRaw(raw)|Value::TextIndentRaw(raw)
                 |Value::IndividualTransformRaw(_,raw)|Value::TransitionTimesRaw(_,raw)|Value::BackgroundImageRaw(raw)|Value::BackgroundPositionRaw(raw)|Value::BackgroundSizeRaw(raw)|Value::BorderImageRaw(_,raw)=>raw.capacity(),
                 Value::Default(..)|Value::Revert(_)|Value::RevertLayer(_)=>0,
-                value=>{
-                    let mut projected=Style::initial();value.apply(&mut projected);
-                    crate::layout::checked_style_retained_bytes(&projected)?.checked_sub(empty_style_bytes)?
+                value if value.holds_no_heap_payload()=>{
+                    debug_assert_eq!(projected_payload_bytes(value,empty_style_bytes),Some(0),"{value:?}");
+                    0
                 }
+                value=>projected_payload_bytes(value,empty_style_bytes)?,
             };
             bytes=bytes.checked_add(payload)?;
         }
@@ -27024,6 +27025,37 @@ impl EffectEligibility {
         let property = ascii_lower(property);
         let ids = slots(&property);
         !ids.is_empty() && ids.iter().all(|id| self.slots[*id / 64] & (1 << (*id % 64)) != 0)
+    }
+}
+
+/// What applying `value` adds to an initial style's retained charge.
+fn projected_payload_bytes(value:&Value,empty_style_bytes:usize)->Option<usize>{
+    let mut projected=Style::initial();value.apply(&mut projected);
+    crate::layout::checked_style_retained_bytes(&projected)?.checked_sub(empty_style_bytes)
+}
+
+impl Value {
+    /// Values of numbers, keywords and colors only: applying one allocates
+    /// nothing a style retains, so their provenance charge is zero.
+    fn holds_no_heap_payload(&self)->bool{
+        matches!(self,
+            Value::Appearance(_)|Value::FieldSizing(_)|Value::TransformBox(_)
+            |Value::WhiteSpace(_)|Value::TextTransform(_)|Value::WordBreak(_)|Value::OverflowWrap(_)|Value::TextAlign(_)
+            |Value::LetterSpacing(_)|Value::Direction(_)|Value::UnicodeBidi(_)|Value::ScrollBehavior(_)|Value::TextOverflow(_)
+            |Value::TextDecoration(_)|Value::TextDecorationStyle(_)|Value::TextDecorationColor(_)|Value::TextUnderlinePosition(_)
+            |Value::BackgroundImageNone|Value::MinHeight(_)|Value::MinHeightAuto|Value::MaxHeight(_)|Value::Order(_)
+            |Value::FlexWrapReverse(_)|Value::FlexWrapReverseBalance(_)|Value::MarginAuto(_)|Value::Position(_)|Value::Float(_)
+            |Value::Clear(_)|Value::Offset(..)|Value::MarginSide(..)|Value::PaddingSide(..)|Value::ListStylePosition(_)
+            |Value::Display(_)|Value::Opacity(_)|Value::Color(_)|Value::Background(_)|Value::Width(_)|Value::MinWidth(_)
+            |Value::MinWidthAuto|Value::MaxWidth(_)|Value::Height(_)|Value::Margin(_)|Value::Padding(_)|Value::FontSize(_)
+            |Value::FontSizeKeyword(_)|Value::FontWeight(_)|Value::FontStretch(_)|Value::FontVariantCaps(_)
+            |Value::FontSynthesisSmallCaps(_)|Value::SvgStrokeWidth(_)|Value::SvgFillOpacity(_)|Value::SvgStrokeOpacity(_)
+            |Value::SvgFillRule(_)|Value::SvgClipRule(_)|Value::SvgStopColor(_)|Value::SvgStopOpacity(_)|Value::SvgFloodColor(_)
+            |Value::SvgFloodOpacity(_)|Value::BorderRadius(_)|Value::BorderWidth(_)|Value::BorderColor(_)|Value::BorderStyle(_)
+            |Value::OverflowAxis(..)|Value::FlexDirection(_)|Value::FlexWrap(_)|Value::Gap(_)|Value::FlexGrow(_)
+            |Value::FlexShrink(_)|Value::FlexBasis(_)|Value::FlexBasisContent|Value::BoxSizing(_)|Value::TableFixed(_)
+            |Value::BorderSpacing(_)|Value::AspectRatio(..)|Value::ZIndex(_)|Value::GridAutoFlow(_)|Value::GridDisplay{..}
+            |Value::DisplayComponents{..}|Value::DisplayRuby{..}|Value::GridLanesPack(_))
     }
 }
 
