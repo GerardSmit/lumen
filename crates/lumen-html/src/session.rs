@@ -10013,6 +10013,21 @@ mod tests {
     }
 
     #[test]
+    fn column_flex_percentage_heights_follow_a_container_that_became_definite() {
+        let source = "<style>body{margin:0}.o{display:flex;flex-direction:column;height:200px;width:50px}\
+            .i{display:flex;flex-direction:column;flex:1;width:40px}.p{height:50%;width:10px;background:red;flex:none}\
+            .f{height:7px;width:10px;background:blue;flex:none}</style><body><div class=o><div class=i><div class=p></div><div class=f></div></div></div>";
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        let list = session.display_list(100, 300, &NoText).unwrap().clone();
+        let rect = |r: u8| list.0.iter().find_map(|command| match command {
+            crate::paint::Command::FillRect { rect, color } if color.r == r && color.a == 255 && rect.width == 10.0 => Some(*rect),
+            _ => None,
+        }).unwrap();
+        assert_eq!(rect(255).height, 100.0, "50% of the stretched 200px container");
+        assert_eq!(rect(0).y, 100.0);
+    }
+
+    #[test]
     fn focus_deep_in_a_wide_document_restyles_only_the_chain() {
         let mut html = alloc::string::String::from("<style>body{margin:0}p{margin:0;height:1px}.a:focus-within p{background:red}button{display:block;width:4px;height:3px;padding:0;border:0}</style><body>");
         for _ in 0..14 { html.push_str("<div class='a'>"); for _ in 0..10 { html.push_str("<p></p>"); } }

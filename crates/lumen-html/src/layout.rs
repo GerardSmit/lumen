@@ -2132,6 +2132,10 @@ struct StretchedFlexHeight {
     /// generation then; the height holds while they stay pending.
     pending: Option<(Arc<[(PendingLookup, bool)]>, u64)>,
     height: f32,
+    /// Whether the measurement resolved a size against a block size
+    /// (`Style::reads_block_basis`); one that did not holds whatever the
+    /// parent's definite height.
+    reads_block_basis: bool,
 }
 
 /// Nested column flex containers measure each item by laying it out, and
@@ -2409,8 +2413,9 @@ impl IntrinsicContext {
     /// `same_for_slot` for a measurement made in a fresh measurement layout
     /// (`Layout::measurement_layout`), which starts without the caller's
     /// containing blocks and sticky bounds, so they cannot change its result.
-    fn same_for_fresh_measurement(&self, other: &Self, slot: usize) -> bool {
+    fn same_for_fresh_measurement(&self, other: &Self, slot: usize, reads_block_basis: bool) -> bool {
         let positioned_free = |context: &Self| Self {
+            parent_height: if reads_block_basis { context.parent_height } else { None },
             containing_block: None,
             containing_block_node: None,
             fixed_containing_block: None,
@@ -27345,23 +27350,32 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let Some(context) = self.measurement_context() else { return measure(); };
         let intrinsics = &*self.intrinsics;
         let images = self.images;
+        // The parent's definite height reaches the item only through sizes
+        // resolved against it, as for retained fragments (`same_parent_style`).
+        let same_container = |entry: &StretchedFlexHeight| entry.container == *container
+            || !entry.reads_block_basis && container.writing_mode == css::WritingMode::HorizontalTb
+                && entry.container.height != container.height
+                && { let mut retained = entry.container.clone(); retained.height = container.height; retained == *container };
         let hit = intrinsics.stretched.borrow().entries(node).iter().find(|entry| entry.id == node
             && entry.width == container_width
             && entry.inline_size == inline_size
-            && entry.parent_height == self.parent_height
-            && entry.item == *item && entry.container == *container
-            && entry.context.same_for_fresh_measurement(&context, node.index() * 2)
+            && (entry.parent_height == self.parent_height || !entry.reads_block_basis)
+            && entry.item == *item && same_container(entry)
+            && entry.context.same_for_fresh_measurement(&context, node.index() * 2, entry.reads_block_basis)
             && entry.pending.as_ref().is_none_or(|(pending, generation)| images.is_some_and(|images|
                 *generation != 0 && images.generation() == *generation
                     || pending.iter().all(|(lookup, _)| images.still_pending(lookup)))))
-            .map(|entry| (entry.height, entry.axes, entry.pending.as_ref().map(|(pending, _)| pending.clone())));
-        if let Some((height, axes, pending)) = hit {
+            .map(|entry| (entry.height, entry.axes, entry.pending.as_ref().map(|(pending, _)| pending.clone()), entry.reads_block_basis));
+        if let Some((height, axes, pending, reads_block_basis)) = hit {
             if let (Some(pending), Some(images)) = (pending, images) { images.replay_pending(&pending); }
+            if reads_block_basis { self.note_block_basis_read(); }
             intrinsics.viewport_read((), axes);
             return Ok(height);
         }
         let mark = self.intrinsic_mark();
+        let block_basis_before = intrinsics.block_basis_reads.get();
         let height = measure()?;
+        let reads_block_basis = intrinsics.block_basis_reads.get() != block_basis_before;
         let mut axes = 0;
         for (axis, reads) in intrinsics.reads.iter().enumerate() {
             if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
@@ -27379,7 +27393,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         };
         intrinsics.stretched.borrow_mut().push(StretchedFlexHeight { id: node, width: container_width, inline_size,
             parent_height: self.parent_height, item: item.clone(), container: container.clone(),
-            context, axes, pending, height });
+            context, axes, pending, height, reads_block_basis });
         Ok(height)
     }
 
