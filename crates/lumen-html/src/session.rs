@@ -9928,6 +9928,21 @@ mod tests {
     }
 
     #[test]
+    fn column_flex_measurements_ignore_the_callers_containing_block() {
+        let measured = |outer: &str| {
+            let source = alloc::format!("<style>body{{margin:0}}.c{{display:flex;flex-direction:column;align-items:flex-start}}\
+                .c div{{height:3px;width:5px;background:red}}</style><body><div style='{outer}'><div class=c><div class=c><div class=c><div></div><div></div></div><div></div></div><div></div></div></div>");
+            let mut session = RenderSession::new(crate::html::parse(&source, 128).unwrap());
+            let list = alloc::format!("{:?}", session.display_list(60, 60, &NoText).unwrap().0);
+            (session.invalidation_stats().boxes_measured, list)
+        };
+        let (plain, plain_list) = measured("");
+        let (positioned, positioned_list) = measured("position:relative");
+        assert_eq!(positioned, plain, "a positioned ancestor must not defeat the measurement cache");
+        assert_eq!(positioned_list, plain_list);
+    }
+
+    #[test]
     fn focus_deep_in_a_wide_document_restyles_only_the_chain() {
         let mut html = alloc::string::String::from("<style>body{margin:0}p{margin:0;height:1px}.a:focus-within p{background:red}button{display:block;width:4px;height:3px;padding:0;border:0}</style><body>");
         for _ in 0..14 { html.push_str("<div class='a'>"); for _ in 0..10 { html.push_str("<p></p>"); } }

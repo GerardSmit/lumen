@@ -2403,9 +2403,30 @@ impl PartialEq for ComputedParent {
 
 impl IntrinsicContext {
     fn same_for_slot(&self, other: &Self, slot: usize) -> bool {
+        self == other && self.same_computed_parent_for_slot(other, slot)
+    }
+
+    /// `same_for_slot` for a measurement made in a fresh measurement layout
+    /// (`Layout::measurement_layout`), which starts without the caller's
+    /// containing blocks and sticky bounds, so they cannot change its result.
+    fn same_for_fresh_measurement(&self, other: &Self, slot: usize) -> bool {
+        let positioned_free = |context: &Self| Self {
+            containing_block: None,
+            containing_block_node: None,
+            fixed_containing_block: None,
+            fixed_containing_block_node: None,
+            sticky_bounds: None,
+            computed_parent: ComputedParent(None),
+            ..context.clone()
+        };
+        positioned_free(self) == positioned_free(other) && self.computed_parent == other.computed_parent
+            && self.same_computed_parent_for_slot(other, slot)
+    }
+
+    fn same_computed_parent_for_slot(&self, other: &Self, slot: usize) -> bool {
         let own = |context: &Self| context.computed_parent.0.as_ref()
             .filter(|(node, _)| node.index() == slot / 2).map(|(_, style)| style.clone());
-        self == other && own(self) == own(other)
+        own(self) == own(other)
     }
 }
 
@@ -27329,7 +27350,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             && entry.inline_size == inline_size
             && entry.parent_height == self.parent_height
             && entry.item == *item && entry.container == *container
-            && entry.context.same_for_slot(&context, node.index() * 2)
+            && entry.context.same_for_fresh_measurement(&context, node.index() * 2)
             && entry.pending.as_ref().is_none_or(|(pending, generation)| images.is_some_and(|images|
                 *generation != 0 && images.generation() == *generation
                     || pending.iter().all(|(lookup, _)| images.still_pending(lookup)))))
