@@ -1937,9 +1937,25 @@ fn retained_node_key(node: NodeId) -> RetainedNodeKey {
     (node.document, node.index, node.generation)
 }
 
+/// A retained fragment's slot: its node and the inline size it was laid
+/// out in. A box that a layout sizes at two widths each frame (a grid item
+/// measured at one and placed at another, say) keeps both fragments, up to
+/// `RETAINED_WAYS` of them.
+type RetainedSlotKey = (RetainedNodeKey, u32);
+
+const RETAINED_WAYS: usize = 2;
+
+fn retained_slot_key(key: &RetainedFragmentKey) -> RetainedSlotKey {
+    (retained_node_key(key.node), key.available.to_bits())
+}
+
+fn retained_node_slots(node: RetainedNodeKey) -> core::ops::RangeInclusive<RetainedSlotKey> {
+    (node, 0)..=(node, u32::MAX)
+}
+
 /// Bytes charged per entry for its slot-index and recency-index nodes.
 const RETAINED_INDEX_ENTRY_BYTES: usize =
-    2 * (core::mem::size_of::<(RetainedNodeKey, usize)>() + core::mem::size_of::<usize>() * 4);
+    2 * (core::mem::size_of::<(RetainedSlotKey, usize)>() + core::mem::size_of::<usize>() * 4);
 
 /// Retained intrinsic sizes each hold a full `Style`; bound them across frames.
 const MAX_RETAINED_INTRINSICS: usize = 8192;
@@ -2387,8 +2403,8 @@ struct GeneratedScan {
 pub(crate) struct RetainedLayoutCache {
     intrinsics: Rc<IntrinsicSizes>,
     entries: Vec<Rc<RetainedFragment>>,
-    index: BTreeMap<RetainedNodeKey, usize>,
-    lru: BTreeMap<u64, RetainedNodeKey>,
+    index: BTreeMap<RetainedSlotKey, usize>,
+    lru: BTreeMap<u64, RetainedSlotKey>,
     bytes: usize,
     budget: RetainedLayoutBudget,
     /// Fragments with at most this many commands are not retained.
@@ -2539,7 +2555,8 @@ impl RetainedLayoutCache {
                 return;
             }
         }
-        let mut victims: Vec<usize> = fragments.iter().filter_map(|key| self.index.get(key).copied()).collect();
+        let mut victims: Vec<usize> = fragments.iter()
+            .flat_map(|&key| self.index.range(retained_node_slots(key)).map(|(_, &slot)| slot)).collect();
         let intrinsics = Rc::clone(&self.intrinsics);
         let drop_slots = |index: usize| {
             for slot in [index * 2, index * 2 + 1] {
@@ -2558,7 +2575,7 @@ impl RetainedLayoutCache {
                 self.clear();
                 return;
             }
-            if let Some(&slot) = self.index.get(&retained_node_key(node)) { victims.push(slot); }
+            victims.extend(self.index.range(retained_node_slots(retained_node_key(node))).map(|(_, &slot)| slot));
             drop_slots(node.index());
             let mut child = document.first_child(node).ok().flatten();
             while let Some(id) = child {
@@ -2763,7 +2780,8 @@ impl RetainedLayoutCache {
     ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
         self.clock = self.clock.saturating_add(1);
         let mut reason = 0;
-        if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
+        if let Some(&slot) = self.index.get(&retained_slot_key(key))
+            .or_else(|| self.index.range(retained_node_slots(retained_node_key(key.node))).next().map(|(_, slot)| slot)) {
             let entry = &self.entries[slot];
             // A fragment that resolved no size against a block size does not
             // depend on its parent's definite height (`reads_block_basis`).
@@ -2805,7 +2823,8 @@ impl RetainedLayoutCache {
             counts[reason] = counts[reason].saturating_add(1);
             self.measured.set(counts);
         };
-        let Some(&slot) = self.index.get(&retained_node_key(key.node)) else {
+        let Some(&slot) = self.index.get(&retained_slot_key(key))
+            .or_else(|| self.index.range(retained_node_slots(retained_node_key(key.node))).next().map(|(_, slot)| slot)) else {
             count(1);
             return None;
         };
@@ -2860,10 +2879,10 @@ impl RetainedLayoutCache {
         self.bytes = self.bytes.saturating_sub(removed.bytes);
         self.release_style(&removed.parent_style);
         self.release_style(&removed.style);
-        self.index.remove(&retained_node_key(removed.key.node));
+        self.index.remove(&retained_slot_key(&removed.key));
         self.lru.remove(&removed.lru_stamp.get());
         if let Some(moved) = self.entries.get(slot) {
-            self.index.insert(retained_node_key(moved.key.node), slot);
+            self.index.insert(retained_slot_key(&moved.key), slot);
         }
     }
 
@@ -2960,9 +2979,16 @@ impl RetainedLayoutCache {
         self.clock = self.clock.saturating_add(1);
         fragment.last_used.set(self.clock);
         fragment.lru_stamp.set(self.clock);
-        let node = retained_node_key(fragment.key.node);
+        let node = retained_slot_key(&fragment.key);
         if let Some(&slot) = self.index.get(&node) {
             self.remove_slot(slot);
+        }
+        // Past `RETAINED_WAYS` widths, the least recently used one goes.
+        let ways: Vec<usize> = self.index.range(retained_node_slots(node.0)).map(|(_, &slot)| slot).collect();
+        if ways.len() >= RETAINED_WAYS {
+            if let Some(&oldest) = ways.iter().min_by_key(|&&slot| self.entries[slot].last_used.get()) {
+                self.remove_slot(oldest);
+            }
         }
         while self.entries.len() >= self.budget.max_entries
             || self.bytes.saturating_add(fragment.bytes).saturating_add(
@@ -2999,9 +3025,9 @@ impl RetainedLayoutCache {
                 self.acquire_style(style, retained_style_bytes(style).unwrap_or(0));
             }
             entry.lru_stamp.set(entry.last_used.get());
-            self.index.insert(retained_node_key(entry.key.node), slot);
+            self.index.insert(retained_slot_key(&entry.key), slot);
             self.lru
-                .insert(entry.last_used.get(), retained_node_key(entry.key.node));
+                .insert(entry.last_used.get(), retained_slot_key(&entry.key));
             self.bytes += entry.bytes;
         }
     }
