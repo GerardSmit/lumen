@@ -1952,17 +1952,20 @@ impl RenderSession {
             self.frame_id = self.frame_id.wrapping_add(1);
             return Ok(());
         }
-        if replaced && self.cached.is_some() && self.bitmap_arrivals.is_empty() {
-            // A new frame of a video or canvas, or another source: only the
-            // element and the boxes it sizes are laid out again.
-            self.discard_frame();
-            self.layout_cache.invalidate_changed(&self.document, &[node], &[], &[], &|_| false);
-            self.paint_revision = self.paint_revision.wrapping_add(1);
+        // A new frame of a video or canvas, another source, a removed image, or
+        // an arrival with no laid-out frame to decide against: only the element
+        // and the boxes it sizes lay out again, with those of the arrivals still
+        // undecided. Retained fragments and sizes elsewhere stay.
+        let mut changed = core::mem::take(&mut self.bitmap_arrivals);
+        if changed.try_reserve(1).is_err() {
+            self.invalidate_paint();
             self.frame_id = self.frame_id.wrapping_add(1);
             return Ok(());
         }
-        self.bitmap_arrivals.clear();
-        self.invalidate_paint();
+        changed.push(node);
+        self.discard_frame();
+        self.layout_cache.invalidate_changed(&self.document, &changed, &[], &[], &|_| false);
+        self.paint_revision = self.paint_revision.wrapping_add(1);
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
@@ -12535,6 +12538,26 @@ mod tests {
             "<body style='margin:0'><img src='fallback.png' srcset='big.png 2x' width=100 height=50 style='display:block'>", 64).unwrap()), ());
         let reference = fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
         assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn floated_flex_items_replay_when_a_sibling_item_changes() {
+        // A carousel: floated grid-system columns as the items of a flex track.
+        let mut source = String::from("<style>body{margin:0;font:10px/10px sans-serif}p{margin:0}\
+            .track{display:flex}.slide{float:left;position:relative;width:50px;flex-shrink:0}</style><div class=track>");
+        for index in 0..12 { source.push_str(&alloc::format!("<div class=slide id=s{index}>slide {index} text</div>")); }
+        source.push_str("</div>");
+        let document = crate::html::parse(&source, 1 << 12).unwrap();
+        let first = find(&document, "#s0");
+        let mut session = RenderSession::new(document);
+        session.set_verify_incremental(true);
+        session.display_list(400, 400, &Mono).unwrap();
+        let replayed = session.invalidation_stats().fragments_replayed;
+        session.document_mut().set_attribute(first, "style", "width:60px").unwrap();
+        session.display_list(400, 400, &Mono).unwrap();
+        let stats = session.invalidation_stats();
+        assert!(stats.fragments_replayed >= replayed + 11, "the other slides replay: {} misses {:?} laid {}", stats.fragments_replayed - replayed, stats.fragment_misses, stats.boxes_laid_out);
+        assert_eq!(stats.verify_mismatches, 0);
     }
 
     #[test]

@@ -23052,7 +23052,17 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// text context and the projection of an enclosing cell being laid out
     /// tag that cell's own geometry and box, not what a measurement returns.
     fn cell_intrinsic_context(&self) -> Option<IntrinsicContext> {
-        if !self.floats.is_empty() || self.paragraph_column_flow.is_some() || self.timeline_values.is_some() {
+        if !self.floats.is_empty() || self.paragraph_column_flow.is_some() {
+            return None;
+        }
+        self.measurement_context()
+    }
+
+    /// The context of a size measured in a fresh `measurement_layout`, which
+    /// starts without this layout's floats, column flow and table context, so
+    /// only what it carries over keys the result.
+    fn measurement_context(&self) -> Option<IntrinsicContext> {
+        if self.timeline_values.is_some() {
             return None;
         }
         Some(IntrinsicContext {
@@ -27222,7 +27232,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             layout.parent_height = self.parent_height;
             layout.box_for(node, container, Some(measured), 0.0, 0.0, container_width, depth)
         };
-        let Some(context) = self.intrinsic_context() else { return measure(); };
+        let Some(context) = self.measurement_context() else { return measure(); };
         let intrinsics = &*self.intrinsics;
         let images = self.images;
         let hit = intrinsics.stretched.borrow().entries(node).iter().find(|entry| entry.id == node
@@ -38911,7 +38921,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption | Display::Flex | Display::Grid)
             || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid | Display::Table)
             || !matches!(style.position, Position::Static | Position::Relative)
-            || style.float != Float::None
+            // A flex or grid item does not float, whatever its `float`.
+            || style.float != Float::None && !matches!(parent_style.display, Display::Flex | Display::Grid)
             || style.overflow_clip
             || style.overflow_x != css::Overflow::Visible
             || style.overflow_y != css::Overflow::Visible
