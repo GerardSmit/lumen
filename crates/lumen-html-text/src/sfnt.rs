@@ -23,13 +23,6 @@ pub(crate) fn write_be32(bytes: &mut [u8], at: usize, value: u32) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn checksum(bytes: &[u8]) -> u32 {
-    bytes.chunks(4).fold(0u32, |sum, word| {
-        let mut padded = [0; 4];
-        padded[..word.len()].copy_from_slice(word);
-        sum.wrapping_add(u32::from_be_bytes(padded))
-    })
-}
 
 /// A standalone sfnt: a table directory of known size followed by 4-byte aligned table data.
 pub(crate) struct SfntWriter {

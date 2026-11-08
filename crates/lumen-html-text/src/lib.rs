@@ -61,6 +61,12 @@ const MAX_REQUESTED_FAMILIES: usize = 64;
 const MAX_FAMILY_NAME_BYTES: usize = 256;
 const RASTERIZER_BLOCK_GLYPHS: u16 = 256;
 const RASTERIZER_CACHE_BLOCKS: usize = 8;
+/// Tables `fontdue_bytes_for_glyph_range` leaves out of its copy.
+const RASTERIZER_SKIPPED_TABLES: [[u8; 4]; 27] = [
+    *b"DSIG", *b"GSUB", *b"GPOS", *b"GDEF", *b"BASE", *b"JSTF", *b"MATH", *b"morx", *b"mort",
+    *b"kerx", *b"kern", *b"name", *b"post", *b"meta", *b"STAT", *b"CBDT", *b"CBLC", *b"sbix",
+    *b"SVG ", *b"COLR", *b"CPAL", *b"EBDT", *b"EBLC", *b"fpgm", *b"prep", *b"cvt ", *b"gvar",
+];
 /// Faces larger than this are never copied for a one-glyph rasterizer.
 const LARGE_FACE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -74,7 +80,7 @@ fn fontdue_bytes_for_glyph_range(
     first_glyph: u16,
     glyph_count: u16,
 ) -> Result<Vec<u8>, &'static str> {
-    use crate::sfnt::{be16 as read_u16, be32 as read_u32, checksum, write_be32 as write_u32};
+    use crate::sfnt::{be16 as read_u16, be32 as read_u32};
     fn small_cmap(first_glyph: u16, glyph_count: u16) -> Result<[u8; 44], &'static str> {
         if glyph_count == 0 || glyph_count > RASTERIZER_BLOCK_GLYPHS {
             return Err("invalid glyph block");
@@ -157,7 +163,10 @@ fn fontdue_bytes_for_glyph_range(
             .ok_or("invalid font table")?
             .try_into()
             .map_err(|_| "invalid font table")?;
-        if &tag == b"DSIG" {
+        // Tables a glyph-ID rasterization at the default instance never reads:
+        // layout, naming, hinting, bitmaps and color, and variation deltas
+        // (no coordinates are set). Leaving them out keeps the copy small.
+        if RASTERIZER_SKIPPED_TABLES.contains(&tag) {
             continue;
         }
         let offset = usize::try_from(read_u32(bytes, entry + 8).ok_or("invalid font table")?)
@@ -183,32 +192,22 @@ fn fontdue_bytes_for_glyph_range(
         records.len(),
     )?;
     let cmap = small_cmap(first_glyph, glyph_count)?;
-    let mut head_adjustment = None;
+    let mut has_head = false;
     for (index, record) in records.iter().enumerate() {
         let source = bytes
             .get(record.offset..record.offset + record.length)
             .ok_or("invalid font table")?;
-        let mut head;
-        let table = if index == cmap_index {
-            cmap.as_slice()
-        } else if &record.tag == b"head" {
-            if source.len() < 12 {
-                return Err("invalid font header");
-            }
-            head = source.to_vec();
-            head[8..12].fill(0);
-            head.as_slice()
-        } else {
-            source
-        };
-        let aligned = writer.push_table(index, record.tag, checksum(table), table)?;
+        let table = if index == cmap_index { cmap.as_slice() } else { source };
+        // The copy never leaves this process and its parser checks no
+        // checksum, so none is computed: that would read the face twice more.
+        writer.push_table(index, record.tag, 0, table)?;
         if &record.tag == b"head" {
-            head_adjustment = Some(aligned + 8);
+            has_head = true;
         }
     }
-    let adjustment = head_adjustment.ok_or("font has no header")?;
-    let check_sum_adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(writer.bytes()));
-    write_u32(writer.bytes_mut(), adjustment, check_sum_adjustment)?;
+    if !has_head {
+        return Err("font has no header");
+    }
     Ok(writer.into_bytes())
 }
 
@@ -2308,7 +2307,8 @@ impl<V: CachedValue,const SLOTS:usize,const BYTES:usize> RunCache<V,SLOTS,BYTES>
 struct RasterizerEntry {
     first_glyph: u16,
     last_used: u64,
-    font: alloc::sync::Arc<fontdue::Font>,
+    /// `None` while one thread builds the block; the others wait for it.
+    font: Option<alloc::sync::Arc<fontdue::Font>>,
 }
 
 // Blocks are shared between rasterizing threads and used outside the lock.
@@ -2317,14 +2317,12 @@ const _: fn() = || {
     shared::<fontdue::Font>();
 };
 
-/// Spins on the block list lock before treating contention as a miss. The
-/// lock covers only a lookup or an insert, never a parse or a rasterization.
-const RASTERIZER_LOCK_SPINS: usize = 1 << 12;
-
 /// Retains a bounded number of fontdue glyph blocks. A full fontdue parse
 /// reserves a glyph slot for every glyph even when only a few outlines are
 /// needed, so reuse the parsed face across nearby glyph IDs and evict the
-/// least recently used block when the cache is full.
+/// least recently used block when the cache is full. Raster bands ask for the
+/// same glyphs at once, so a block is built by one thread while the others
+/// wait for it rather than each building its own copy.
 struct RasterizerCache {
     busy: AtomicBool,
     clock: AtomicU64,
@@ -2333,6 +2331,12 @@ struct RasterizerCache {
 
 // SAFETY: entries are only read or changed while `busy` is held.
 unsafe impl Sync for RasterizerCache {}
+
+enum BlockState {
+    Ready(alloc::sync::Arc<fontdue::Font>),
+    Building,
+    Claimed,
+}
 
 impl RasterizerCache {
     const fn new() -> Self {
@@ -2343,25 +2347,47 @@ impl RasterizerCache {
         }
     }
 
-    /// Runs `locked` on the block list, or returns `None` if other threads keep it busy.
-    fn locked<R>(&self, locked: impl FnOnce(&mut Vec<RasterizerEntry>) -> R) -> Option<R> {
+    /// Runs `locked` on the block list. The lock covers only a lookup or an
+    /// insert, never a parse or a rasterization, so it is a spin lock.
+    fn locked<R>(&self, locked: impl FnOnce(&mut Vec<RasterizerEntry>) -> R) -> R {
         struct Release<'a>(&'a AtomicBool);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
                 self.0.store(false, Ordering::Release);
             }
         }
-        let mut spins = 0;
         while self.busy.swap(true, Ordering::Acquire) {
-            spins += 1;
-            if spins > RASTERIZER_LOCK_SPINS {
-                return None;
+            while self.busy.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
             }
-            core::hint::spin_loop();
         }
         let _release = Release(&self.busy);
         // SAFETY: `busy` grants exclusive access until Release drops.
-        Some(locked(unsafe { &mut *self.entries.get() }))
+        locked(unsafe { &mut *self.entries.get() })
+    }
+
+    /// The block's state, claiming it for the caller to build when no thread has.
+    fn claim(&self, first_glyph: u16, used: u64) -> Result<BlockState, &'static str> {
+        self.locked(|entries| {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.first_glyph == first_glyph) {
+                entry.last_used = used;
+                return Ok(entry.font.clone().map_or(BlockState::Building, BlockState::Ready));
+            }
+            if entries.len() >= RASTERIZER_CACHE_BLOCKS {
+                if let Some(oldest) = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.font.is_some())
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(index, _)| index)
+                {
+                    entries.remove(oldest);
+                }
+            }
+            entries.try_reserve(1).map_err(|_| "font allocation failed")?;
+            entries.push(RasterizerEntry { first_glyph, last_used: used, font: None });
+            Ok(BlockState::Claimed)
+        })
     }
 
     fn with_font<R>(
@@ -2370,73 +2396,59 @@ impl RasterizerCache {
         face_glyph_count: u16,
         glyph_id: u16,
         visit: impl Fn(&fontdue::Font)->R,
-    ) -> Result<Option<R>, &'static str> {
-        let first_glyph = (glyph_id / RASTERIZER_BLOCK_GLYPHS) * RASTERIZER_BLOCK_GLYPHS;
-        let used = self.clock.fetch_add(1, Ordering::Relaxed);
-        let Some(cached) = self.locked(|entries| {
-            entries.iter_mut().find(|entry| entry.first_glyph == first_glyph).map(|entry| {
-                entry.last_used = used;
-                entry.font.clone()
-            })
-        }) else {
-            return Ok(None);
-        };
-        if let Some(font) = cached {
-            return Ok(Some(visit(&font)));
+    ) -> Result<R, &'static str> {
+        /// Removes a claimed block that was not built, so waiters build it.
+        struct Unclaim<'a>(&'a RasterizerCache, u16, bool);
+        impl Drop for Unclaim<'_> {
+            fn drop(&mut self) {
+                if !self.2 {
+                    let first = self.1;
+                    self.0.locked(|entries| entries.retain(|entry| entry.first_glyph != first || entry.font.is_some()));
+                }
+            }
         }
-
+        let first_glyph = (glyph_id / RASTERIZER_BLOCK_GLYPHS) * RASTERIZER_BLOCK_GLYPHS;
         let glyphs_in_block = face_glyph_count
             .saturating_sub(first_glyph)
             .min(RASTERIZER_BLOCK_GLYPHS);
         if glyphs_in_block == 0 {
             return Err("glyph id out of range");
         }
-        // Parse outside the lock; a thread that built the same block first wins.
-        let subset = fontdue_bytes_for_glyph_range(bytes, first_glyph, glyphs_in_block)?;
-        let built = alloc::sync::Arc::new(fontdue::Font::from_bytes(
-            subset,
-            fontdue::FontSettings {
-                load_substitutions: false,
-                ..fontdue::FontSettings::default()
-            },
-        )
-        .map_err(|_| "unsupported font")?);
-        let font = self.locked(|entries| -> Result<_, &'static str> {
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.first_glyph == first_glyph) {
-                entry.last_used = used;
-                return Ok(entry.font.clone());
-            }
-            if entries.len() == RASTERIZER_CACHE_BLOCKS {
-                if let Some(oldest) = entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(index, _)| index)
-                {
-                    entries.remove(oldest);
+        loop {
+            let used = self.clock.fetch_add(1, Ordering::Relaxed);
+            match self.claim(first_glyph, used)? {
+                BlockState::Ready(font) => return Ok(visit(&font)),
+                BlockState::Building => {
+                    #[cfg(feature = "std")]
+                    std::thread::yield_now();
+                    #[cfg(not(feature = "std"))]
+                    core::hint::spin_loop();
+                }
+                BlockState::Claimed => {
+                    let mut claim = Unclaim(self, first_glyph, false);
+                    let subset = fontdue_bytes_for_glyph_range(bytes, first_glyph, glyphs_in_block)?;
+                    let built = alloc::sync::Arc::new(fontdue::Font::from_bytes(
+                        subset,
+                        fontdue::FontSettings {
+                            load_substitutions: false,
+                            ..fontdue::FontSettings::default()
+                        },
+                    )
+                    .map_err(|_| "unsupported font")?);
+                    self.locked(|entries| {
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry.first_glyph == first_glyph) {
+                            entry.font = Some(built.clone());
+                        }
+                    });
+                    claim.2 = true;
+                    return Ok(visit(&built));
                 }
             }
-            entries
-                .try_reserve(1)
-                .map_err(|_| "font allocation failed")?;
-            entries.push(RasterizerEntry {
-                first_glyph,
-                last_used: used,
-                font: built.clone(),
-            });
-            Ok(built.clone())
-        }).transpose()?.unwrap_or(built);
-        Ok(Some(visit(&font)))
+        }
     }
 
-    #[cfg(test)]
     fn cached_blocks(&self) -> usize {
-        if self.busy.swap(true, Ordering::Acquire) {
-            return 0;
-        }
-        let count = unsafe { (&*self.entries.get()).len() };
-        self.busy.store(false, Ordering::Release);
-        count
+        self.locked(|entries| entries.len())
     }
 }
 
@@ -3882,24 +3894,7 @@ variation_advances: VariationGlyphCache::new(),
         if id >= self.glyph_count {
             return Err("glyph id out of range");
         }
-        if let Some(coverage) =
-            self.rasterizers
-                .with_font(&self.bytes, self.glyph_count, id, &visit)?
-        {
-            return Ok(coverage);
-        }
-        // Another thread is building or using the bounded block cache. Treat
-        // contention as a cache miss so rasterization remains nonblocking.
-        let bytes = fontdue_bytes_for_glyph_range(&self.bytes, id, 1)?;
-        let rasterizer = fontdue::Font::from_bytes(
-            bytes,
-            fontdue::FontSettings {
-                load_substitutions: false,
-                ..fontdue::FontSettings::default()
-            },
-        )
-        .map_err(|_| "unsupported font")?;
-        Ok(visit(&rasterizer))
+        self.rasterizers.with_font(&self.bytes, self.glyph_count, id, &visit)
     }
 
     pub fn outline(&self, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
