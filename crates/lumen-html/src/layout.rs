@@ -23040,7 +23040,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
     /// The layout state a measurement may read besides its subtree and the
     /// viewport, whose reads are counted. None when it depends on state that
-    /// is not compared, such as floats placed outside the measured box.
+    /// is not compared, such as a paragraph's column flow. Floats placed
+    /// outside the measured box do not change what its content measures.
     fn intrinsic_context(&self) -> Option<IntrinsicContext> {
         if self.rendered_table_context.is_some() || self.table_cell_projection.is_some() {
             return None;
@@ -23052,7 +23053,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// text context and the projection of an enclosing cell being laid out
     /// tag that cell's own geometry and box, not what a measurement returns.
     fn cell_intrinsic_context(&self) -> Option<IntrinsicContext> {
-        if !self.floats.is_empty() || self.paragraph_column_flow.is_some() {
+        if self.paragraph_column_flow.is_some() {
             return None;
         }
         self.measurement_context()
@@ -55802,6 +55803,26 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             assert_eq!(layout.intrinsics.measured.get(), measured);
             assert_eq!(layout.intrinsics.reused.get(), reused + 1, "one lookup serves the repeat");
         }
+    }
+
+    #[test]
+    fn intrinsic_sizes_measured_beside_floats_are_reused_in_later_frames() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=f style='float:left'><span>one two three</span></div>", 32).unwrap();
+        let float = crate::selector::query_selector(&document, document.root(), "#f").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let mut layout = Layout::new(&document, &FixedText, &uses, &rules, None,
+            Rect { x:0.0,y:0.0,width:100.0,height:100.0 }, None, &[], &styles, None);
+        // A float placed earlier in the formatting context does not change
+        // what the next float's content measures.
+        layout.floats.push((Rect { x:0.0, y:0.0, width:30.0, height:20.0 }, Float::Left));
+        let style = layout.computed_style_from_tree(float).unwrap();
+        let first = layout.intrinsic_size_mode(float, &style, 0, false).unwrap();
+        layout.intrinsics.begin_frame();
+        let second = layout.intrinsic_size_mode(float, &style, 0, false).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(layout.intrinsics.measured.get(), 0, "the next frame measures nothing again");
+        assert!(layout.intrinsics.reused.get() > 0);
     }
 
     #[test]
