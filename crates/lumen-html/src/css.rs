@@ -8867,9 +8867,9 @@ fn rule_media_matches(&self, order: usize) -> bool {
         let style = Arc::new(compute_for_named_mode(kind, parent, self, Some((document, node)), bloom,
             text, pseudo, None, Some(role), starting, false, Some(&mut eligibility), None)?);
         if !eligibility.dependent.is_empty() { eligibility.sources=Some(core::mem::take(&mut eligibility.dependent).into()); }
-        if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+        if eligibility.remember_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
             eligibility.drop_unregistered_custom_sources();
-            if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+            if eligibility.remember_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
                 return Err(CssError{offset:0,message:TRANSITION_PROVENANCE_LIMIT_MESSAGE});
             }
         }
@@ -26910,6 +26910,9 @@ pub struct EffectEligibility {
     query_context: Option<ContainerUnitContext>,
     light: bool,
     effects_cascaded: bool,
+    /// `checked_retained_bytes` as measured when the record was completed;
+    /// later changes that alter the charge clear it.
+    measured: Option<usize>,
 }
 impl Default for EffectEligibility {
     fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
@@ -26917,7 +26920,7 @@ impl Default for EffectEligibility {
             let mut flags = 0; for bit in 0..64 { let slot = word * 64 + bit; if slot < PROPERTY_COUNT && inherited_property(slot) { flags |= 1 << bit; } } flags
         }), baseline_font_scale: None, baseline_font_smaller: false, baseline_bolder: false, root: false,
         ua_hidden_input: false, ua_clip_input: false, ua_margin_block_em: None, query_context: None, light: false,
-        effects_cascaded: false,
+        effects_cascaded: false, measured: None,
     } }
 }
 impl EffectEligibility {
@@ -26951,6 +26954,18 @@ impl EffectEligibility {
     /// Conservative checked charge including the inline record and all shared
     /// referenced payloads. A document snapshot additionally caps its total.
     pub fn checked_retained_bytes(&self) -> Option<usize> {
+        match self.measured {
+            Some(bytes) => Some(bytes),
+            None => self.measure_retained_bytes(),
+        }
+    }
+    /// Measures the charge once for a completed record; a snapshot reads it
+    /// again when it admits the record.
+    fn remember_retained_bytes(&mut self) -> Option<usize> {
+        self.measured = self.measure_retained_bytes();
+        self.measured
+    }
+    fn measure_retained_bytes(&self) -> Option<usize> {
         let header=2*core::mem::size_of::<usize>();
         let mut bytes=core::mem::size_of::<Self>();
         if let Some(registrations)=&self.registrations {bytes=bytes.checked_add(checked_registration_snapshot_bytes(registrations)?)?;}
@@ -26960,7 +26975,7 @@ impl EffectEligibility {
         bytes=bytes.checked_add(self.dependent.capacity().checked_mul(core::mem::size_of::<SnapshotDeclaration>())?)?;
         let sources=self.sources.as_deref().unwrap_or(&self.dependent);
         if let Some(sources)=&self.sources {bytes=bytes.checked_add(header.checked_add(core::mem::size_of_val(sources.as_ref()))?)?;}
-        let empty_style_bytes=crate::layout::checked_style_retained_bytes(&Style::initial())?;
+        let empty_style_bytes=empty_style_retained_bytes()?;
         for source in sources {
             if let Some(url)=&source.source_url {bytes=bytes.checked_add(header.checked_add(url.len())?)?;}
             if let Some(scope)=&source.reference_scope{bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(scope.as_ref()))?;}
@@ -26988,6 +27003,7 @@ impl EffectEligibility {
     /// ones and the ordinary properties. Replay then resolves `var()` chains
     /// through unregistered names from the old computed values.
     fn drop_unregistered_custom_sources(&mut self) {
+        self.measured=None;
         let Some(sources)=self.sources.take() else {return;};
         let registrations=self.registrations.clone();
         let kept:Vec<SnapshotDeclaration>=sources.iter().filter(|source|match &source.declaration.value {
@@ -27008,6 +27024,20 @@ impl EffectEligibility {
         let property = ascii_lower(property);
         let ids = slots(&property);
         !ids.is_empty() && ids.iter().all(|id| self.slots[*id / 64] & (1 << (*id % 64)) != 0)
+    }
+}
+
+/// The retained charge of `Style::initial()`, measured once: provenance
+/// charges each source declaration as what it adds to an initial style.
+fn empty_style_retained_bytes() -> Option<usize> {
+    static EMPTY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    match EMPTY.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let bytes = crate::layout::checked_style_retained_bytes(&Style::initial())?;
+            EMPTY.store(bytes, core::sync::atomic::Ordering::Relaxed);
+            Some(bytes)
+        }
+        bytes => Some(bytes),
     }
 }
 
