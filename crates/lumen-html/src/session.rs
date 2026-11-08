@@ -1109,6 +1109,9 @@ pub struct RenderSession {
     /// The frame from before effect changes which so far only moved
     /// transforms; `flush_animation_changes` patches it instead of laying out.
     transform_patch_frame: Option<CachedFrame>,
+    /// The last drawn frame, kept after an animation discarded it only to
+    /// lay it out again, so that the next layout reports damage against it.
+    damage_basis: Option<CachedFrame>,
     /// The styles the last patched transforms were computed from, which the
     /// style cache does not hold until a layout computes them again.
     images_pending: bool,
@@ -1675,6 +1678,7 @@ impl RenderSession {
             pending_animation_layout_nodes: Vec::new(),
             pending_animation_full: false,
             transform_patch_frame: None,
+            damage_basis: None,
             images_pending: false,
             pending_lookups: Vec::new(),
             layout_count: 0,
@@ -2044,6 +2048,16 @@ impl RenderSession {
         self.cached = None;
         self.failed_frame = None;
         self.transform_patch_frame = None;
+        self.damage_basis = None;
+    }
+
+    /// `discard_frame` for an animated style change that needs a new layout
+    /// but changes nothing a display list does not show: the next layout's
+    /// damage is the difference from the frame last drawn.
+    fn discard_frame_keeping_damage_basis(&mut self) {
+        let basis = self.cached.take().or_else(|| self.transform_patch_frame.take()).or_else(|| self.damage_basis.take());
+        self.discard_frame();
+        self.damage_basis = basis;
     }
 
     /// Folds the damage of a layout into what the host has not yet drawn;
@@ -3502,7 +3516,7 @@ impl RenderSession {
             }
             self.failed_frame = None;
         } else {
-            self.discard_frame();
+            self.discard_frame_keeping_damage_basis();
         }
         self.frame_id += 1;
         Ok(())
@@ -3564,7 +3578,7 @@ impl RenderSession {
         if intrinsics_current {
             self.intrinsic_style_epoch = Some(self.style_cache.borrow().epoch());
         }
-        self.discard_frame();
+        self.discard_frame_keeping_damage_basis();
         if !layout_nodes.is_empty() {
             // The target's box and every box around it that its size reaches
             // lay out again; its descendants restyle through their parent.
@@ -7543,8 +7557,10 @@ impl RenderSession {
         let damage = self
             .cached
             .as_ref()
+            .or(self.damage_basis.as_ref())
             .filter(|previous| previous.width == width && previous.height == height)
             .and_then(|previous| display_list_damage(&previous.list, &list));
+        self.damage_basis = None;
         self.accumulate_damage(damage);
         self.layout_stale = false;
         self.cached = Some(CachedFrame {
@@ -11683,6 +11699,27 @@ mod tests {
         let after = session.invalidation_stats();
         assert_eq!(after.full_restyles, before.full_restyles);
         assert_eq!(after.partial_restyles, before.partial_restyles + 1);
+    }
+
+    #[test]
+    fn an_animated_layout_change_damages_only_what_moved() {
+        let document = crate::html::parse("<style>body{margin:0}p{margin:0;height:10px;background:gray}#b{position:fixed;left:0;bottom:0;width:50px;height:20px;background:red}</style><body><p></p><p></p><p></p><div id=b></div></body>", 64).unwrap();
+        let banner = find(&document, "#b");
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 400, &NoText).unwrap();
+        for bottom in ["5px", "12px"] {
+            session.set_effect_declarations(banner, css::EffectOrigin::Animation, vec![("bottom".into(), bottom.into())]).unwrap();
+            let list = session.display_list(200, 400, &NoText).unwrap().clone();
+            let damage = session.frame_damage().expect("bounded damage").to_vec();
+            assert!(!damage.is_empty());
+            for rect in &damage {
+                assert!(rect.y >= 350.0 && rect.width <= 60.0, "{bottom}: {rect:?}");
+            }
+            let mut fresh = RenderSession::new(session.document().clone_document(true).unwrap());
+            let fresh_banner = find(fresh.document(), "#b");
+            fresh.set_effect_declarations(fresh_banner, css::EffectOrigin::Animation, vec![("bottom".into(), bottom.into())]).unwrap();
+            assert_eq!(list, *fresh.display_list(200, 400, &NoText).unwrap());
+        }
     }
 
     #[test]
