@@ -1978,6 +1978,22 @@ impl RenderSession {
             return Vec::new();
         }
         let nodes = core::mem::take(&mut self.bitmap_arrivals);
+        // A plain `src` is asked for by its address (`Source`, `From`), once
+        // for every `<img>` sharing it, so such an element has no lookup of
+        // its own: its image only painted when every lookup of its address did.
+        let source_paint_only = |node: NodeId| {
+            let Ok(Some(source)) = self.document.get_attribute_ns_ref(node, None, "src") else { return false };
+            let mut asked = false;
+            for (lookup, paint_only) in &self.pending_lookups {
+                if let layout::PendingLookup::Source(url) | layout::PendingLookup::From(_, url) = lookup {
+                    if &**url == source {
+                        if !*paint_only { return false; }
+                        asked = true;
+                    }
+                }
+            }
+            asked
+        };
         let paint_only = self.cached.is_some()
             && nodes.iter().all(|node| {
                 let mut used = false;
@@ -1993,7 +2009,7 @@ impl RenderSession {
                 // element it did not reach (hidden, or not an image) sized
                 // nothing; only an `<img>` is ever skipped below the region.
                 let is_img = crate::forms::html_element_local_name(&self.document, *node) == Some("img");
-                used || (is_img && self.culled_images.binary_search_by_key(&node.key(), |culled| culled.key()).is_ok())
+                used || (is_img && source_paint_only(*node)) || (is_img && self.culled_images.binary_search_by_key(&node.key(), |culled| culled.key()).is_ok())
                     || self.reached_images.as_ref().is_some_and(|reached| reached.binary_search_by_key(&node.key(), |reached| reached.key()).is_err())
             });
         if !paint_only {
@@ -12519,6 +12535,28 @@ mod tests {
             "<body style='margin:0'><img src='fallback.png' srcset='big.png 2x' width=100 height=50 style='display:block'>", 64).unwrap()), ());
         let reference = fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
         assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn sized_imgs_sharing_a_source_whose_bitmaps_arrive_need_no_layout() {
+        // Layout asks for a shared image once, by address; the host then
+        // hands every element its bitmap.
+        let source = "<body style='margin:0'><img src='a.png' width=10 height=10><img src='a.png' width=10 height=10>\
+            <p><img src='a.png' width=10 height=10></p>";
+        let document = crate::html::parse(source, 64).unwrap();
+        let imgs: Vec<NodeId> = crate::selector::query_selector_all(&document, document.root(), "img").unwrap();
+        let mut session = RenderSession::new(document);
+        let images = Library::new();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let layouts = session.layout_count();
+        for &img in &imgs {
+            session.set_node_bitmap(img, Some(Library::pixel(4))).unwrap();
+        }
+        images.arrive("a.png", 4);
+        let list = session.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        assert_eq!(session.layout_count(), layouts, "the arrivals are painted into the frame");
+        assert_eq!(painted_pixels(&list), [4, 4, 4]);
     }
 
     #[test]

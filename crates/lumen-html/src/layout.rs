@@ -40313,6 +40313,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         child_override: Option<BoxChildOverride>,
         output_rect: Option<&mut Rect>,
     ) -> Result<(f32, OverflowMetrics), LayoutError> {
+        crate::progress::tick();
         if child_override.as_ref().is_none_or(|source|source.generated.is_none()) && self.embed_nothing(id) {return Ok((0.0,OverflowMetrics::default()));}
         let generated = child_override.as_ref().and_then(|source| source.generated.as_ref());
         let generated_pseudo = generated.map(|source| source.pseudo);

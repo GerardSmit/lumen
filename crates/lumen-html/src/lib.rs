@@ -27,6 +27,7 @@ pub mod labels;
 pub mod language;
 pub mod html;
 pub mod preload_scan;
+pub mod progress;
 pub mod parser_documents;
 pub mod layout;
 mod positioned_alignment;
