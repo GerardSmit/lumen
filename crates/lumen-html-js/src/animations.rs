@@ -1970,7 +1970,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         let running_display=running.is_some_and(|properties|properties.iter().any(|property|property=="display"));
         let old=previous_nodes.get(&(input.node,input.pseudo)).copied().filter(|old|old.was_rendered() || running_display);
         let display_index=input.style.transition_property().map_or(Some(0),|properties|properties.iter().enumerate()
-            .filter(|(_,name)|lumen_html::css::transition_property_longhands(name).iter().any(|name|name.as_ref()=="display"))
+            .filter(|(_,name)|lumen_html::css::transition_property_covers(name,"display"))
             .map(|(index,_)|index).last());
         let parent_rendered=input.parent.and_then(|parent|effective_rendered.get(&(parent,None)).copied())
             .or_else(||input.parent.and_then(|parent|after_nodes.get(&(parent,None)).map(|input|input.was_rendered()))).unwrap_or(true);

@@ -20717,6 +20717,8 @@ fn animation_values(name: &str, raw: &str) -> Option<Vec<(usize, String)>> {
 }
 
 pub fn transition_property_longhands(name:&str)->Vec<Arc<str>> { transition_controls::longhands(name) }
+/// Whether `transition_property_longhands(name)` contains `longhand`, without allocating.
+pub fn transition_property_covers(name:&str,longhand:&str)->bool { transition_controls::covers(name,longhand) }
 /// Whether a transition of `name` can change a value descendants inherit or
 /// whether they are rendered: an inherited longhand, a custom or unknown
 /// property, `all`, or display-like properties.
@@ -20743,6 +20745,8 @@ impl StyleIndex {
 }
 pub(crate) fn transition_reaches_descendants(name:&str)->bool {
     if name.trim().eq_ignore_ascii_case("none") {return false;}
+    // `all` includes inherited longhands; expanding it would allocate one name per property.
+    if name.trim().eq_ignore_ascii_case("all") {return true;}
     let longhands=transition_controls::longhands(name);
     longhands.is_empty() || longhands.iter().any(|longhand| {
         let ids=slots(longhand);

@@ -310,6 +310,24 @@ pub(super) fn longhands(raw:&str)->Vec<Arc<str>> {
     if registry_index(&property).is_some() {vec![property]} else {Vec::new()}
 }
 
+/// Whether `longhands(raw)` contains `longhand`, without building the list:
+/// a style change event asks this of every transitioning element, and `all`
+/// expands to every animatable property.
+pub(super) fn covers(raw:&str,longhand:&str)->bool {
+    let Some(property)=property(raw) else{return false;};
+    match property.as_ref() {
+        "none"=>false,
+        "all"=>transition_all_longhands().any(|name|name==longhand),
+        name if name.starts_with("--")=>name==longhand,
+        name=>{
+            let canonical=declaration_block::canonical_alias(name);
+            let longhands=declaration_block::longhands(canonical);
+            if longhands.is_empty() {canonical==longhand && registry_index(canonical).is_some()}
+            else {longhands.iter().any(|name|*name==longhand)}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +384,10 @@ fn specification_transition_logical_properties_share_physical_record_identity() 
         assert_eq!(style.transition_property().unwrap().iter().map(|value|value.as_ref()).collect::<Vec<_>>(),["opacity","UnknownName","--Case","width"]);
         assert_eq!(style.transition_behavior().unwrap(),[TransitionBehavior::Normal,TransitionBehavior::AllowDiscrete]);
         assert!(transition_property_longhands("UnknownName").is_empty());
+        for (raw,longhand) in [("all","display"),("ALL","color"),("margin","margin-top"),("--Case","--Case"),("display","display"),
+            ("margin","display"),("none","display"),("UnknownName","UnknownName"),("--case","--Case"),("inherit","display")] {
+            assert_eq!(covers(raw,longhand),transition_property_longhands(raw).iter().any(|name|name.as_ref()==longhand),"{raw} {longhand}");
+        }
         assert_eq!(transition_property_longhands("--Case").iter().map(|name|name.as_ref()).collect::<Vec<_>>(),["--Case"]);
         assert_eq!(transition_property_longhands("margin").iter().map(|name|name.as_ref()).collect::<Vec<_>>(),declaration_block::longhands("margin"));
         let all=transition_property_longhands("all");
