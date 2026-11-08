@@ -5217,9 +5217,38 @@ impl RenderSession {
         // have read the fonts' metrics is not known to be valid: drop all.
         // The render that sees the generation drops styles computed in
         // between too, so that it computes them all in one restyle.
-        if self.layout_count == 0 || bits & metric_families != 0 {
+        if self.layout_count == 0 {
             self.invalidate_fonts();
             return;
+        }
+        if bits & metric_families != 0 {
+            // A style reads metrics of its own, its parent's and the root's
+            // fonts: restyle the elements using the families and their
+            // children; restyles of changed styles reach further.
+            let reached = self.style_cache.borrow().nodes_with_style(|style| style.font_metric_family_bits() & bits != 0);
+            let Some(reached) = reached else {
+                self.invalidate_fonts();
+                return;
+            };
+            let mut subjects = Vec::new();
+            for node in reached {
+                subjects.push((node, true));
+                let mut child = self.document.first_child(node).ok().flatten();
+                while let Some(id) = child {
+                    if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+                        subjects.push((id, true));
+                    }
+                    child = self.document.next_sibling(id).ok().flatten();
+                }
+            }
+            if subjects.len() > self.document.node_count() / 2 + 64 {
+                self.invalidate_fonts();
+                return;
+            }
+            self.rule_subjects.get_or_insert_with(Vec::new).extend(subjects);
+            self.animation_snapshot = None;
+            self.read_style_cache.clear();
+            self.read_style_key = None;
         }
         match self.layout_cache.invalidate_font_families(&self.document, bits) {
             // No text uses them: the frame stands.
@@ -5235,7 +5264,9 @@ impl RenderSession {
             }
         }
         // The generation itself changes at the next render, as for any font
-        // change, so transition snapshots see it at the same point.
+        // change, so transition snapshots see it at the same point. Styles
+        // computed before then keep the cache filled for this generation.
+        self.style_cache.borrow_mut().adopt_text_generation(self.font_generation, generation);
         self.handled_font_generation = Some(generation);
     }
 
@@ -6995,7 +7026,13 @@ impl RenderSession {
         self.flush_animation_changes(Some(text));
         let font_generation = text.generation();
         if self.font_generation != font_generation {
-            if self.handled_font_generation != Some(font_generation) { self.invalidate_fonts(); }
+            if self.handled_font_generation != Some(font_generation) {
+                self.invalidate_fonts();
+            } else {
+                // `invalidate_font_families` restyled what read the changed
+                // faces' metrics; every other style stands for the new faces.
+                self.style_cache.borrow_mut().adopt_text_generation(self.font_generation, font_generation);
+            }
             self.font_generation = font_generation;
         }
         self.handled_font_generation = None;

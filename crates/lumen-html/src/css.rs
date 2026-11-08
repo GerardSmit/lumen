@@ -2432,9 +2432,7 @@ pub(crate) fn font_metric_families() -> u64 {
 /// families of the element's, its parent's and the root's fonts count, in
 /// the index's sink or else the process-wide set.
 fn note_font_metric_read(index: Option<&StyleIndex>, style: &Style, parent: Option<&Style>) {
-    let families = style.font_spec().family_bits()
-        | parent.map_or(0, |parent| parent.font_spec().family_bits())
-        | style.root_font_units.as_deref().map_or(0, |root| root.spec.family_bits());
+    let families = style.font_metric_family_bits() | parent.map_or(0, |parent| parent.font_spec().family_bits());
     index.and_then(|index| index.font_metric_sink.as_deref()).unwrap_or(&FONT_METRIC_FAMILIES)
         .fetch_or(families, core::sync::atomic::Ordering::Relaxed);
 }
@@ -3695,6 +3693,11 @@ impl PartialEq for Style {
 }
 
 impl Style {
+    /// The families of the fonts whose metrics this style's own values may
+    /// resolve against: its own and the root's (`note_font_metric_read`).
+    pub(crate) fn font_metric_family_bits(&self) -> u64 {
+        self.font_spec().family_bits() | self.root_font_units.as_deref().map_or(0, |root| root.spec.family_bits())
+    }
     /// Whether `used`, a style layout derived from this computed style, still
     /// carries its inheritable values: layout resolves percentages and query
     /// units into the styles it passes down, but must not change these.
@@ -29004,6 +29007,13 @@ impl StyleCache {
     fn replay_viewport_read(&self, node: NodeId, flag: u8) {
         if self.window_depth == 0 && self.viewport_flags.get(node.index()).is_some_and(|flags| flags & flag != 0) {
             note_viewport_read();
+        }
+    }
+    /// Keep the styles computed under font generation `from` for generation
+    /// `to`: the owner invalidated what the change between them can reach.
+    pub(crate) fn adopt_text_generation(&mut self, from: u64, to: u64) {
+        if self.text_generation == Some(Some(from)) {
+            self.text_generation = Some(Some(to));
         }
     }
     /// Whether this cache was filled for the same text shaper generation.

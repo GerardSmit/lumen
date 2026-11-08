@@ -56006,6 +56006,40 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn styles_survive_a_font_generation_change_their_families_did_not_reach() {
+        struct Loading { loaded: core::cell::Cell<bool>, family: &'static str }
+        impl TextShaper for Loading {
+            fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+                Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+            }
+            fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> crate::paint::FontRelativeMetrics {
+                let wide = self.loaded.get() && font.family_bits() & crate::paint::font_family_bit(self.family) != 0;
+                let ex = if wide { size * 0.8 } else { size * 0.5 };
+                crate::paint::FontRelativeMetrics { ex, ch: ex }
+            }
+            fn generation(&self) -> u64 { 1 + u64::from(self.loaded.get()) }
+            fn ascent(&self, _: f32) -> f32 { 2.0 }
+            fn line_height(&self, _: f32) -> f32 { 3.0 }
+        }
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}p{margin:0;height:3px;font-family:Plain}.m{font-family:Metrics;display:block;width:2ex;height:1ex;background:red}.m b{display:block;height:1ex;font-family:Body;background:blue}</style>");
+        for _ in 0..30 { markup.push_str("<p></p>"); }
+        markup.push_str("<div class=m><b></b></div>");
+        for family in ["Metrics", "Body"] {
+            let text = Loading { loaded: core::cell::Cell::new(false), family };
+            let mut session = crate::session::RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+            session.display_list(200, 300, &text).unwrap();
+            let before = session.invalidation_stats().styles_computed;
+            text.loaded.set(true);
+            session.invalidate_font_families([family], text.generation());
+            let after_load = session.display_list(200, 300, &text).unwrap().clone();
+            let restyled = session.invalidation_stats().styles_computed - before;
+            let mut fresh = crate::session::RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+            assert_eq!(after_load, *fresh.display_list(200, 300, &text).unwrap(), "{family}");
+            assert!(restyled < 20, "{family}: only styles using the family compute again, not {restyled}");
+        }
+    }
+
+    #[test]
     fn intrinsic_margin_escapes_share_the_intrinsic_cache_lifecycle() {
         let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=p><div id=b><div style='margin:20px 0;height:10px'></div></div></div>", 32).unwrap();
         let b = crate::selector::query_selector(&document, document.root(), "#b").unwrap().unwrap();
