@@ -1655,6 +1655,9 @@ struct CountingShaper<'a> {
     memo: RefCell<ShapeMemo>,
     /// The families of the fonts shaped with (`TextShaper::family_record`).
     families: core::cell::Cell<u64>,
+    /// The family list last noted with its `FontSpec::family_bits`: shaping
+    /// asks for the same few lists over and over. Holding it keeps its address.
+    last_families: RefCell<Option<(Arc<[crate::paint::FontFamily]>, u64)>>,
 }
 
 const MAX_SHAPE_MEMO_ENTRIES: usize = 8192;
@@ -1798,7 +1801,17 @@ impl CountingShaper<'_> {
     }
 
     fn note(&self, font: &FontSpec) {
-        self.families.set(self.families.get() | font.family_bits());
+        let Some(families) = font.families.as_ref() else { return };
+        let mut last = self.last_families.borrow_mut();
+        let bits = match last.as_ref() {
+            Some((known, bits)) if Arc::ptr_eq(known, families) => *bits,
+            _ => {
+                let bits = font.family_bits();
+                *last = Some((Arc::clone(families), bits));
+                bits
+            }
+        };
+        self.families.set(self.families.get() | bits);
     }
 
     fn memoized<T: ShapeMemoResult>(&self, query: ShapeQuery<'_>, compute: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
@@ -45875,6 +45888,7 @@ fn laid_out_display_list_once(
         uses: core::cell::Cell::new(0),
         memo: RefCell::default(),
         families: core::cell::Cell::new(0),
+        last_families: RefCell::new(None),
     };
     let mut layout = Layout::new(document, &counting, &counting.uses, rules, images,
         viewport, geometry, scrolls, style_cache, retained_fragments);
@@ -55852,7 +55866,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn counting_shaper_answers_repeated_queries_from_its_memo() {
         let inner = CallCountingText { shapes: core::cell::Cell::new(0), metrics: core::cell::Cell::new(0) };
-        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default(), families: core::cell::Cell::new(0) };
+        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default(), families: core::cell::Cell::new(0), last_families: RefCell::new(None) };
         let font = FontSpec::default();
         let first = counting.shape_styled("one two", 16.0, false, &font).unwrap();
         let again = counting.shape_styled("one two", 16.0, false, &font).unwrap();

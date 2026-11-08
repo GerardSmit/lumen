@@ -32103,11 +32103,17 @@ fn compute_for_named_registered_inner(
             }
         }};
         ($raw:expr) => {{
-            let metric = raw_may_use_font_metrics($raw);
-            if metric && text.is_some() { note_font_metric_read(Some(index), &style, parent); }
             match resolved_length_context {
-                Some(context) if !length_metrics_pending || !metric => context,
-                _ => length_context!(),
+                Some(context) if !length_metrics_pending || !raw_may_use_font_metrics($raw) => context,
+                // A value about to resolve against the font's metrics.
+                Some(_) => {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
+                    length_context!()
+                }
+                None => {
+                    if text.is_some() && raw_may_use_font_metrics($raw) { note_font_metric_read(Some(index), &style, parent); }
+                    length_context!()
+                }
             }
         }};
     }
@@ -32412,18 +32418,17 @@ fn compute_for_named_registered_inner(
                 } else if let Value::GeneratedContent(GeneratedContent::Items(items)) =
                     &declaration.value
                 {
-                    if text.is_some() && raw_may_use_font_metrics(&serialize_generated_content_items(items)) {
-                        note_font_metric_read(Some(index), &style, parent);
-                    }
+                    // Font metrics only when an item may use a font-relative unit:
+                    // every computation of them is a read `length_context!` notes.
+                    let raw=serialize_generated_content_items(items);
+                    let context=length_context!(&raw);
                     style.generated_content = Some(resolve_generated_content_items(
                         items,
                         source_url.as_deref(),
-                        length_context!(),
+                        context,
                         &style.resolved_source_color(1,style.color),ContainerUnitContext::no_container(index.environment),
                     ));
                     style.content_none = false;
-                    let context=length_context!();
-                    let raw=serialize_generated_content_items(items);
                     let selected=color_scheme::select_branches(&raw,context.viewport.color_schemes.page().scheme).ok_or(CssError{offset:0,message:"invalid generated image branches"})?;
                     let (uses_font,query_dependent)=image_numeric_dependencies(&selected);
                     let current_font_pending=uses_font&&style.font_query_context_pending();

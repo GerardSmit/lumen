@@ -1032,6 +1032,9 @@ pub struct RenderSession {
     selection: Option<(crate::ranges::Boundary, crate::ranges::Boundary)>,
     frame_id: u64,
     font_generation: u64,
+    /// A font generation `invalidate_font_families` already invalidated
+    /// for; the render that first sees it adopts it without dropping more.
+    handled_font_generation: Option<u64>,
     /// The font families whose metrics this document's styles may have read,
     /// shared by every style index it builds (`StyleIndex::font_metric_sink`).
     font_metric_families: Arc<core::sync::atomic::AtomicU64>,
@@ -1615,6 +1618,7 @@ impl RenderSession {
             selection: None,
             frame_id: 0,
             font_generation: 0,
+            handled_font_generation: None,
             font_metric_families: Arc::default(),
             validity_generation: 0,
             interaction_generation,
@@ -5196,21 +5200,31 @@ impl RenderSession {
     /// `invalidate_fonts`.
     pub fn invalidate_font_families<'a>(&mut self, families: impl IntoIterator<Item = &'a str>, generation: u64) {
         let bits = families.into_iter().fold(0, |bits, family| bits | crate::paint::font_family_bit(family));
-        self.font_generation = generation;
         let metric_families = self.font_metric_families.load(core::sync::atomic::Ordering::Relaxed) | css::font_metric_families();
-        if bits & metric_families != 0 {
+        // Before the first layout only styles are kept, and a style that may
+        // have read the fonts' metrics is not known to be valid: drop all.
+        // The render that sees the generation drops styles computed in
+        // between too, so that it computes them all in one restyle.
+        if self.layout_count == 0 || bits & metric_families != 0 {
             self.invalidate_fonts();
             return;
         }
         match self.layout_cache.invalidate_font_families(&self.document, bits) {
             // No text uses them: the frame stands.
-            Some(false) => return,
-            Some(true) => {}
-            None => self.layout_cache.invalidate_fonts(),
+            Some(false) => {}
+            Some(true) => {
+                self.discard_frame();
+                self.paint_revision = self.paint_revision.wrapping_add(1);
+                self.frame_id += 1;
+            }
+            None => {
+                self.invalidate_fonts();
+                return;
+            }
         }
-        self.discard_frame();
-        self.paint_revision = self.paint_revision.wrapping_add(1);
-        self.frame_id += 1;
+        // The generation itself changes at the next render, as for any font
+        // change, so transition snapshots see it at the same point.
+        self.handled_font_generation = Some(generation);
     }
 
     /// The host's image resolver advanced its generation. The next render
@@ -6969,9 +6983,10 @@ impl RenderSession {
         self.flush_animation_changes(Some(text));
         let font_generation = text.generation();
         if self.font_generation != font_generation {
-            self.invalidate_fonts();
+            if self.handled_font_generation != Some(font_generation) { self.invalidate_fonts(); }
             self.font_generation = font_generation;
         }
+        self.handled_font_generation = None;
         self.prune_retired_nodes();
         let version = self.document.version();
         let image_generation = images.map(ImageResolver::generation);
@@ -12840,3 +12855,4 @@ mod tests {
     }
 
 }
+
