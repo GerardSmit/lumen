@@ -649,13 +649,44 @@ impl Default for SettleOptions {
 pub struct GlyphCache {
     /// Coverage and the tick of its last use. Eviction drops the least
     /// recently used quarter in one pass, so a hit only stamps its tick.
-    glyphs: lumen_common::fasthash::FastMap<(u64, u16, u32), (GlyphCoverage, u64)>,
+    glyphs: lumen_common::fasthash::FastMap<(u64, u16, u32), (std::sync::Arc<GlyphCoverage>, u64)>,
+    /// Coverage other caches of the same frame already rasterized, so parallel
+    /// raster workers rasterize each glyph once between them.
+    shared: Option<std::sync::Arc<SharedGlyphs>>,
     tick: u64,
     bytes: usize,
     hits: u64,
     misses: u64,
     shadow_masks: HashMap<shadow::MaskKey, std::sync::Arc<[u8]>>,
     shadow_bytes: usize,
+}
+
+/// Glyph coverage shared between the caches of parallel raster workers. Hits
+/// stay in each worker's own cache; only a local miss takes this lock.
+#[derive(Default)]
+pub struct SharedGlyphs {
+    glyphs: std::sync::Mutex<(lumen_common::fasthash::FastMap<(u64, u16, u32), std::sync::Arc<GlyphCoverage>>, usize)>,
+}
+
+impl SharedGlyphs {
+    fn get(&self, key: &(u64, u16, u32)) -> Option<std::sync::Arc<GlyphCoverage>> {
+        self.glyphs.lock().ok()?.0.get(key).cloned()
+    }
+
+    fn insert(&self, key: (u64, u16, u32), coverage: std::sync::Arc<GlyphCoverage>) {
+        let Ok(mut shared) = self.glyphs.lock() else { return };
+        let (glyphs, bytes) = &mut *shared;
+        // Workers keep what they use; the shared map only bridges them, so
+        // a full map starts over rather than tracking recency.
+        if *bytes + coverage.alpha.len() > GLYPH_CACHE_BYTES || glyphs.len() >= GLYPH_CACHE_ENTRIES {
+            glyphs.clear();
+            *bytes = 0;
+        }
+        *bytes += coverage.alpha.len();
+        if let Some(old) = glyphs.insert(key, coverage) {
+            *bytes = bytes.saturating_sub(old.alpha.len());
+        }
+    }
 }
 
 /// Cumulative glyph coverage cache counters; callers diff two reads for a frame.
@@ -681,7 +712,22 @@ impl GlyphCache {
         }
     }
 
+    /// Shares rasterized coverage with every other cache given the same `shared`.
+    pub fn share(&mut self, shared: &std::sync::Arc<SharedGlyphs>) {
+        if !self.shared.as_ref().is_some_and(|own| std::sync::Arc::ptr_eq(own, shared)) {
+            self.shared = Some(shared.clone());
+        }
+    }
+
     fn lookup(&mut self, key: &(u64, u16, u32)) -> Option<&GlyphCoverage> {
+        if !self.glyphs.contains_key(key) {
+            let found = self.shared.as_ref().and_then(|shared| shared.get(key));
+            let Some(coverage) = found else {
+                self.misses += 1;
+                return None;
+            };
+            self.store(*key, coverage);
+        }
         let Some((coverage, used)) = self.glyphs.get_mut(key) else {
             self.misses += 1;
             return None;
@@ -689,7 +735,7 @@ impl GlyphCache {
         self.hits += 1;
         self.tick += 1;
         *used = self.tick;
-        Some(&*coverage)
+        Some(&**coverage)
     }
 
     fn shadow_mask(&self, key: &shadow::MaskKey) -> Option<std::sync::Arc<[u8]>> {
@@ -739,6 +785,14 @@ impl GlyphCache {
     }
 
     fn insert(&mut self, key: (u64, u16, u32), coverage: GlyphCoverage) {
+        let coverage = std::sync::Arc::new(coverage);
+        if let Some(shared) = &self.shared {
+            shared.insert(key, coverage.clone());
+        }
+        self.store(key, coverage);
+    }
+
+    fn store(&mut self, key: (u64, u16, u32), coverage: std::sync::Arc<GlyphCoverage>) {
         let bytes = coverage.alpha.len();
         if let Some((old, _)) = self.glyphs.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.alpha.len());
@@ -9385,7 +9439,28 @@ mod tests {
         let other = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
         render_with_font_cached(&list, 80, 30, 1.0, true, &other, &mut cache).unwrap();
         assert_eq!(cache.glyphs.len(), entries * 2);
-    }    #[test]
+    }
+
+    #[test]
+    fn caches_that_share_glyphs_rasterize_each_glyph_once() {
+        let document = lumen_html::html::parse("<p>Hello</p>", 8).unwrap();
+        let font = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
+        let list = lumen_html::layout::display_list(&document, 80, 30, &font).unwrap();
+        let shared = Arc::new(SharedGlyphs::default());
+        let (mut first, mut second) = (GlyphCache::default(), GlyphCache::default());
+        first.share(&shared);
+        second.share(&shared);
+        let drawn = render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut first).unwrap();
+        assert!(first.stats().misses > 0);
+        assert_eq!(render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut second).unwrap(), drawn);
+        assert_eq!(second.stats().misses, 0, "the second cache takes every glyph from the first");
+        assert_eq!(second.glyphs.len(), first.glyphs.len());
+        let mut alone = GlyphCache::default();
+        assert_eq!(render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut alone).unwrap(), drawn);
+        assert_eq!(alone.stats().misses, first.stats().misses);
+    }
+
+    #[test]
     fn specification_background_size_math_actual_query_font_and_nonlinear_raster() {
         let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
         for (area, width) in [(40,20),(100,50),(200,80)] {
