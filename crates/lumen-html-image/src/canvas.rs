@@ -1553,13 +1553,30 @@ impl CanvasSurface {
         width: f32,
         height: f32,
     ) -> Result<(), ImageError> {
-        if self.unbounded_blend() {
-            return self.composite_unbounded(|surface| surface.draw_pixmap_source(source, x, y, width, height));
-        }
-        self.materialize()?;
         let sx = width / source.width() as f32;
         let sy = height / source.height() as f32;
         let transform = self.state.transform;
+        if self.unbounded_blend() {
+            // Without a clip, filter or shadow, a whole-pixel draw composites
+            // in one pass what the transparent layer would.
+            let shadow = self.state.shadow_color[3] != 0
+                && (self.state.shadow_blur != 0.0 || self.state.shadow_offset_x != 0.0 || self.state.shadow_offset_y != 0.0);
+            let placed = Transform::from_row(sx * transform.sx, sx * transform.kx, sy * transform.ky, sy * transform.sy,
+                transform.sx * x + transform.ky * y + transform.tx, transform.kx * x + transform.sy * y + transform.ty);
+            if !self.filter_active() && !shadow && self.state.clip.is_none() {
+                if let Some((dx, dy)) = whole_pixel_offset(placed) {
+                    self.materialize()?;
+                    if let Some(bitmap) = &mut self.bitmap {
+                        if blit::composite_through_layer(bitmap, source, dx, dy, self.state.alpha, self.state.blend) {
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            return self.composite_unbounded(|surface| surface.draw_pixmap_source(source, x, y, width, height));
+        }
+        self.materialize()?;
         let destination_transform = |transform: Transform| {
             Transform::from_row(
                 transform.sx * sx,

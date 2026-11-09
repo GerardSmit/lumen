@@ -43,6 +43,63 @@ pub(super) fn draw_at_offset(target: &mut Pixmap, source: PixmapRef<'_>, dx: i64
     true
 }
 
+/// Draws `source` at a whole-pixel offset with a blend mode that also changes
+/// the destination outside the source (copy, source-in, ...). The canvas does
+/// that through a transparent layer of its own size: the source drawn
+/// source-over onto the layer, then the layer composited with `blend`. This
+/// computes the same pixels in one pass without allocating the layer.
+pub(super) fn composite_through_layer(target: &mut Pixmap, source: PixmapRef<'_>, dx: i64, dy: i64, opacity: f32, blend: BlendMode) -> bool {
+    let Some(blend) = Blend::from_mode(blend) else { return false };
+    if !(0.0..=1.0).contains(&opacity) {
+        return false;
+    }
+    if matches!(blend, Blend::Destination) {
+        return true;
+    }
+    let (target_width, target_height) = (i64::from(target.width()), i64::from(target.height()));
+    let left = dx.max(0).min(target_width);
+    let top = dy.max(0).min(target_height);
+    let right = (dx + i64::from(source.width())).min(target_width).max(left);
+    let bottom = (dy + i64::from(source.height())).min(target_height).max(top);
+    let (source_width, row_width) = (source.width() as usize, target.width() as usize);
+    let (left, right) = (left as usize, right as usize);
+    let first_column = (left as i64 - dx).max(0) as usize;
+    let source_pixels = source.data();
+    let mut layer_row = Vec::new();
+    if layer_row.try_reserve_exact((right - left) * 4).is_err() {
+        return false;
+    }
+    layer_row.resize((right - left) * 4, 0);
+    for (y, row) in target.data_mut().chunks_exact_mut(row_width * 4).enumerate() {
+        let y = y as i64;
+        if y < top || y >= bottom || left == right {
+            blend_transparent(blend, row);
+            continue;
+        }
+        let start = ((y - dy) as usize * source_width + first_column) * 4;
+        // The layer holds the source as source-over onto transparent stores it.
+        for (layer, texel) in layer_row.chunks_exact_mut(4).zip(source_pixels[start..start + (right - left) * 4].chunks_exact(4)) {
+            for channel in 0..4 {
+                layer[channel] = if opacity == 1.0 { texel[channel] } else { store(texel[channel] as f32 * FACTOR * opacity) };
+            }
+        }
+        let (before, rest) = row.split_at_mut(left * 4);
+        let (inside, after) = rest.split_at_mut((right - left) * 4);
+        blend_transparent(blend, before);
+        blend_row(blend, 1.0, &layer_row, inside);
+        blend_transparent(blend, after);
+    }
+    true
+}
+
+/// `blend_row` with a transparent source, as the empty part of a layer is.
+fn blend_transparent(blend: Blend, target: &mut [u8]) {
+    const ZEROS: [u8; 1024] = [0; 1024];
+    for chunk in target.chunks_mut(ZEROS.len()) {
+        blend_row(blend, 1.0, &ZEROS[..chunk.len()], chunk);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Blend {
     Clear,
@@ -132,6 +189,7 @@ fn shortcut(blend: Blend, whole_opacity: bool, s: [u8; 4], d: [u8; 4]) -> Option
         Blend::DestinationOut if sa == 255 && whole_opacity => Some(ZERO),
         Blend::DestinationOver if da == 255 => Some(d),
         Blend::DestinationOver if da == 0 && whole_opacity => Some(s),
+        Blend::DestinationAtop if s == ZERO => Some(ZERO),
         _ => None,
     }
 }
@@ -187,6 +245,27 @@ mod tests {
     }
 
     #[test]
+    fn layer_composites_match_drawing_through_a_layer() {
+        let source = premultiplied(37, 23, 5);
+        let modes = [BlendMode::Source, BlendMode::SourceIn, BlendMode::SourceOut, BlendMode::DestinationIn, BlendMode::DestinationAtop, BlendMode::SourceOver];
+        for mode in modes {
+            for opacity in [1.0, 0.6, 0.0] {
+                for (dx, dy) in [(0, 0), (5, 3), (-4, -6), (40, 2), (-37, 0), (20, 15), (60, 60)] {
+                    let mut expected = premultiplied(48, 32, 9);
+                    let mut actual = expected.clone();
+                    let mut layer = Pixmap::new(48, 32).unwrap();
+                    let draw = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Bilinear };
+                    layer.draw_pixmap(0, 0, source.as_ref(), &draw, Transform::from_translate(dx as f32, dy as f32), None);
+                    let composite = PixmapPaint { opacity: 1.0, blend_mode: mode, quality: FilterQuality::Nearest };
+                    expected.draw_pixmap(0, 0, layer.as_ref(), &composite, Transform::identity(), None);
+                    assert!(composite_through_layer(&mut actual, source.as_ref(), dx, dy, opacity, mode));
+                    assert!(expected.data() == actual.data(), "{mode:?} at {opacity} offset ({dx}, {dy})");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn whole_pixel_draws_match_the_pattern_pipeline() {
         let source = premultiplied(37, 23, 7);
         let modes = [
@@ -208,6 +287,7 @@ mod tests {
         }
         let mut target = premultiplied(4, 4, 3);
         assert!(!draw_at_offset(&mut target, source.as_ref(), 0, 0, 1.0, BlendMode::Multiply));
+        assert!(!composite_through_layer(&mut target, source.as_ref(), 0, 0, 1.0, BlendMode::Multiply));
         assert!(!draw_at_offset(&mut target, source.as_ref(), 0, 0, 1.5, BlendMode::SourceOver));
     }
 }
