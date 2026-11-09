@@ -8844,6 +8844,9 @@ struct FlexItem {
     main_baselines: Option<FlowBaselines>,
     cross_shift: f32,
     content_ranges: Option<FlowContentRanges>,
+    /// Laid out once at its automatic block size, which then is its main
+    /// size (`Layout::column_flex_in_place`).
+    in_place: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27230,6 +27233,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
+            in_place: false,
         })
     }
 
@@ -27478,6 +27482,26 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Some(measured)
     }
 
+    /// Whether a column flex container's items keep their hypothetical main
+    /// sizes: one line, no reversal, and an automatic main size with no
+    /// minimum or maximum, so the free space is zero and nothing flexes or
+    /// shifts. An item whose main size is its content block size is then laid
+    /// out once, at its automatic block size, and placed after the items
+    /// before it, instead of being measured first. Its main size is not
+    /// definite for its descendants' percentages (css-flexbox 9.8), as in the
+    /// measurement.
+    fn column_flex_in_place(&self, container: &Style) -> bool {
+        !container.flex_main_axis_horizontal() && !container.flex_wrap
+            && container.flex_direction == FlexDirection::Column
+            && container.writing_mode == css::WritingMode::HorizontalTb
+            && !container.axis_start_is_far(false)
+            && container.height.is_none() && container.height_intrinsic.is_none()
+            && container.max_height.is_none() && !container.has_max_height_percentage()
+            && container.min_height <= 0.0 && !container.has_min_height_percentage()
+            && self.multicol_depth == 0
+            && !css::gap_decorations::enabled(container)
+    }
+
     fn push_flex_item(
         &mut self,
         items: &mut Vec<FlexItem>,
@@ -27601,7 +27625,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Some(fit)
             }
         };
-        let stretched_height = match inline_size.filter(|_| height_needed) {
+        let in_place = shortcuts && inline_size.is_some() && height_needed && main_from_measure
+            && !item_style.flex_basis_content && item_style.flex_basis_intrinsic.is_none()
+            && item_style.height.is_none() && item_style.height_intrinsic.is_none()
+            && item_style.max_height.is_none() && !item_style.has_max_height_percentage()
+            && item_style.min_height <= 0.0 && !item_style.has_min_height_percentage()
+            && !item_style.margin_auto[0] && !item_style.margin_auto[2]
+            && self.column_flex_in_place(container_style);
+        let stretched_height = match inline_size.filter(|_| height_needed && !in_place) {
             Some(inline_size) => Some(self.column_flex_item_height(
                 node, &item_style, container_style, width, inline_size, depth,
             )?),
@@ -27684,7 +27715,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             constrained_height(&item_style, (main - edges).max(0.0)) + edges
         };
         let min_main =
-            if minimum_needed
+            if minimum_needed && !in_place
             {
                 let mut minimum_style = item_style.clone();
                 let specified_suggestion = if row {
@@ -27746,6 +27777,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
+            in_place,
         });
         *source_order += 1;
         Ok(())
@@ -28079,9 +28111,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     .map(|item| if item.frozen { item.main } else { item.base_main })
                     .sum::<f32>()
             };
+            let in_place = items.iter().any(|item| item.in_place);
             let initial_free = available - gaps - used_space(items);
             let mut freeze_passes = 0usize;
-            while freeze_passes <= items.len() && items.iter().any(|item| !item.frozen) {
+            while !in_place && freeze_passes <= items.len() && items.iter().any(|item| !item.frozen) {
                 freeze_passes += 1;
                 let mut free = available - gaps - used_space(items);
                 let factor_sum: f32 = items
@@ -28139,7 +28172,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     }
                 }
             }
-            let remaining = available - gaps - items.iter().map(|item| item.main).sum::<f32>();
+            let remaining = if in_place { 0.0 } else { available - gaps - items.iter().map(|item| item.main).sum::<f32>() };
             let (main_start, main_end) = match (row, reverse) {
                 (true, false) => (3, 1),
                 (true, true) => (1, 3),
@@ -28246,7 +28279,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         &computed,
                         (item.main - item.edges).max(0.0),
                     ));
-                } else {
+                } else if !item.in_place {
                     computed.height = Some(specified_height(
                         &computed,
                         (item.main - item.edges).max(0.0),
@@ -28418,6 +28451,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         if row { item.main } else { width },
                         depth + 1,
                     )?;
+                    if item.in_place {
+                        item.main = height.max(item.edges);
+                    }
                     if row {
                         height
                     } else {
@@ -28587,6 +28623,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 item.main_baselines = item.main_baselines.map(|value| value.translated(dx, dy));
             }
             lines[line_index].2 = align_extent;
+            let available = if in_place { items.iter().map(|item| item.main).sum::<f32>() + gaps } else { available };
             total_main = total_main.max(available);
         }
         let natural_cross = lines.iter().map(|line| line.2).sum::<f32>()
@@ -56553,6 +56590,17 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn column_flex_item_main_size_is_indefinite_in_an_automatic_container() {
+        // css-flexbox 9.8: without a definite container main size or flex
+        // basis, a percentage block size inside the item behaves as auto.
+        let inner = "<div style='background:green'><div style='height:100%;background:red'>aa</div><div>bb</div></div>";
+        let flex = colored_boxes(&alloc::format!("<div style='display:flex;flex-direction:column;width:20px'>{inner}</div>"));
+        let block = colored_boxes(&alloc::format!("<div style='width:20px'>{inner}</div>"));
+        assert_eq!(flex.len(), 2);
+        assert_eq!(flex, block);
+    }
+
+    #[test]
     fn unstretched_column_flex_item_shrinks_to_its_content() {
         let boxes = colored_boxes(
             "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='background:green'>aa</div></div><div style='display:flex;flex-direction:column;align-items:center;width:20px'><div style='background:green;height:2px'>aa</div></div>",
@@ -64304,7 +64352,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         cache.intrinsics_measured().0
     }
 
-    const FLEX_SHORTCUT_PAGES: [&str; 8] = [
+    const FLEX_SHORTCUT_PAGES: [&str; 10] = [
         "<style>html,body{margin:0}.f{display:flex;width:300px}.f>div{flex:1 1 20px}p{margin:0}</style>\
          <div class=f><div><p>aa bb cc</p><p>dd ee</p></div><div style='display:flex'><p>ff gg</p><p>hh ii jj</p></div></div>",
         "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:120px;height:200px}.f>*{flex:1 1 30px}</style>\
@@ -64323,6 +64371,13 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:180px}p{margin:0}</style>\
          <div class=f><div style='margin:0 10px'><p>stretched with margins and words</p></div><div style='align-self:start'>start</div>\
          <div style='box-sizing:border-box;padding:0 20px'><p>padded words to wrap</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:200px;row-gap:6px;justify-content:center;align-items:center}p{margin:4px 0}</style>\
+         <div class=f><div style='margin:5px 3px;padding:2px;border:1px solid'><p>first item words that wrap</p></div>\
+         <div style='order:-1;display:flex;flex-direction:column'><p>nested column</p><p>two lines of nested words</p></div>\
+         <div style='align-self:stretch;flex:0 1 auto'>x</div><span>inline item</span></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:160px;align-items:baseline}p{margin:0}</style>\
+         <div class=f><div><p>baseline item words</p></div><div style='max-height:30px;overflow:hidden'><p>capped item with more words</p></div>\
+         <div style='height:20px'>fixed</div><div style='margin-top:auto'>auto margin</div><div style='position:relative;top:3px'><p>last words</p></div></div>",
     ];
 
     #[test]
