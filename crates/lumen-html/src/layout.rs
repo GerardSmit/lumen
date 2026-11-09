@@ -2810,11 +2810,11 @@ impl RetainedLayoutCache {
         self.generated_current = false;
         if !self.drop_intrinsics_around(document, targets, false) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
-        self.entries.retain(|entry| {
-            !targets
-                .iter()
-                .any(|target| document_is_ancestor(document, entry.key.node, *target))
-        });
+        // The fragments of the targets and of their ancestors go.
+        match target_chains(document, targets) {
+            Some(chains) => self.entries.retain(|entry| !chains.contains(&retained_node_key(entry.key.node))),
+            None => self.entries.clear(),
+        }
         self.rebuild_indexes();
     }
 
@@ -2860,12 +2860,36 @@ impl RetainedLayoutCache {
         self.generated_current = false;
         if !self.drop_intrinsics_around(document, targets, true) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
+        // A fragment goes when its box is a target, contains one or lies
+        // inside one. The targets' ancestor chains are collected once, and the
+        // walk up from each fragment stops at an ancestor already decided.
+        let Some(chains) = target_chains(document, targets) else {
+            self.entries.clear();
+            self.rebuild_indexes();
+            return;
+        };
+        let roots: BTreeSet<RetainedNodeKey> = targets.iter().map(|target| retained_node_key(*target)).collect();
+        let mut below: BTreeMap<RetainedNodeKey, bool> = BTreeMap::new();
+        let mut path = Vec::new();
         self.entries.retain(|entry| {
-            document.kind(entry.key.node).is_ok()
-                && !targets.iter().any(|target| {
-                    document_is_ancestor(document, entry.key.node, *target)
-                        || document_is_ancestor(document, *target, entry.key.node)
-                })
+            let node = entry.key.node;
+            if document.kind(node).is_err() || chains.contains(&retained_node_key(node)) { return false; }
+            path.clear();
+            let mut current = Some(node);
+            let inside = loop {
+                let Some(id) = current else { break false };
+                let key = retained_node_key(id);
+                if roots.contains(&key) { break true; }
+                if let Some(&known) = below.get(&key) { break known; }
+                if path.len() > 512 { break true; }
+                path.push(key);
+                match document.composed_parent(id) {
+                    Ok(parent) => current = parent,
+                    Err(_) => break true,
+                }
+            };
+            for key in path.drain(..) { below.insert(key, inside); }
+            !inside
         });
         self.rebuild_indexes();
     }
@@ -3208,21 +3232,21 @@ fn changed_generated_nodes<T: PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) 
     changed
 }
 
-fn document_is_ancestor(document: &Document, ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    for _ in 0..=512 {
-        let Some(id) = current else {
-            return false;
-        };
-        if id == ancestor {
-            return true;
+/// The targets and their composed ancestors, or `None` when a chain cannot
+/// be read to its root (it may then hold any box).
+fn target_chains(document: &Document, targets: &[NodeId]) -> Option<BTreeSet<RetainedNodeKey>> {
+    let mut chains = BTreeSet::new();
+    for &target in targets {
+        let mut current = Some(target);
+        let mut bounded = false;
+        for _ in 0..=512 {
+            let Some(id) = current else { bounded = true; break };
+            if !chains.insert(retained_node_key(id)) && id != target { bounded = true; break; }
+            current = document.composed_parent(id).ok()?;
         }
-        current = match document.composed_parent(id) {
-            Ok(parent) => parent,
-            Err(_) => return true,
-        };
+        if !bounded { return None; }
     }
-    true
+    Some(chains)
 }
 
 fn clone_arc_slice<T: Clone>(values: &[T]) -> Option<Arc<[T]>> {
