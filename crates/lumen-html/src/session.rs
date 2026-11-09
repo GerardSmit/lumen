@@ -1104,6 +1104,9 @@ pub struct RenderSession {
     // capture of the same inputs styles a superset of those elements, so it is
     // refused without styling them again.
     rejected_sparse_epoch: Option<TransitionInputEpoch>,
+    /// The document root's container query context, with the inputs it was
+    /// resolved from. Font sources ask for it on every computed-style read.
+    root_query_context: Option<(RootQueryKey, css::ContainerUnitContext)>,
     effects_wait_for_first_render: bool,
     animation_generation: u64,
     animation_epoch: u64,
@@ -1436,6 +1439,20 @@ struct ReadStyleKey {
     container_epoch: u64,
 }
 
+/// What the document root's container query context is resolved from: the
+/// media environment and the root element's writing mode, so the document,
+/// its rules, the installed effect samples and fonts. It reads no geometry.
+#[derive(Clone, Copy, PartialEq)]
+struct RootQueryKey {
+    document_version: u64,
+    validity_generation: u64,
+    interaction_generation: u64,
+    rules_generation: u64,
+    font_generation: u64,
+    animation_epoch: u64,
+    environment: css::MediaEnvironment,
+}
+
 fn inline_style_declares_transition(document: &Document, node: NodeId) -> bool {
     let Ok(NodeKind::Element { attributes, .. }) = document.kind(node) else { return false };
     attributes.iter().any(|(key, value)| key.as_str().eq_ignore_ascii_case("style") && {
@@ -1700,6 +1717,7 @@ impl RenderSession {
             rejected_transition_snapshot: None,
             rejected_snapshot_size: None,
             rejected_sparse_epoch: None,
+            root_query_context: None,
             effects_wait_for_first_render: false,
             animation_generation: 0,
             animation_epoch: 0,
@@ -4239,15 +4257,28 @@ impl RenderSession {
         }
         self.refresh_rules()?;
         let rules = self.rules.as_ref().expect("stylesheets initialized");
-        let geometry = self.cached.as_ref().and_then(|frame| {
-            (frame.document_version == self.document.version()
+        let current = self.cached.as_ref().filter(|frame| {
+            frame.document_version == self.document.version()
                 && frame.width as f32 == rules.environment.width
-                && frame.height as f32 == rules.environment.height)
-                .then_some(&frame.geometry)
+                && frame.height as f32 == rules.environment.height
         });
+        let key = (node == self.document.root()).then(|| RootQueryKey {
+            document_version: self.document.version(),
+            validity_generation: self.document.validity_generation(),
+            interaction_generation: self.document.interaction_generation(),
+            rules_generation: self.rules_generation,
+            font_generation: self.font_generation,
+            animation_epoch: self.animation_epoch,
+            environment: rules.environment,
+        });
+        if let (Some(key), Some((held, context))) = (key, self.root_query_context) {
+            if held == key { return Ok(context); }
+        }
         let mut cache = css::StyleCache::default();
-        style_with_query_context(&self.document, node, rules, &mut cache, geometry,None,false)
-            .map(|(_, context)| context)
+        let context = style_with_query_context(&self.document, node, rules, &mut cache, current.map(|frame| &frame.geometry),None,false)
+            .map(|(_, context)| context)?;
+        if let Some(key) = key { self.root_query_context = Some((key, context)); }
+        Ok(context)
     }
 
     /// Snapshot the computed CSS animation inputs and retained keyframes for
