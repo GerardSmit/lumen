@@ -3614,6 +3614,113 @@ fn arcs_equal<T: ?Sized + PartialEq>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> 
     }
 }
 
+/// Styles `Style::apply_animation_snapshot` resolved, kept across effect
+/// samplings. A script that reads computed style in a loop samples every
+/// effect again after each of its own style writes, with the same captured
+/// sources for every element it did not touch. An entry is reused while all
+/// of its inputs are equal; an attribute change drops its element's entries
+/// and any other tree change drops them all, since the cascade reads
+/// attributes and tree position from the document.
+#[derive(Default)]
+pub struct SnapshotStyleMemo {
+    version: Option<u64>,
+    entries: alloc::collections::BTreeMap<(u128, u8), Vec<SnapshotMemoEntry>>,
+    len: usize,
+}
+
+struct SnapshotMemoEntry {
+    seed: Option<Arc<Style>>,
+    parent: Option<Arc<Style>>,
+    pairs: Vec<(String, String)>,
+    eligibility: EffectEligibility,
+    environment: MediaEnvironment,
+    text: Option<u64>,
+    result: Arc<Style>,
+}
+
+impl SnapshotStyleMemo {
+    const MAX_ENTRIES: usize = 4096;
+    const PER_TARGET: usize = 4;
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.len = 0;
+        self.version = None;
+    }
+
+    pub fn len(&self) -> usize { self.len }
+
+    fn forget(&mut self, node: NodeId) {
+        let key = node.key();
+        let doomed: Vec<(u128, u8)> = self.entries.range((key, 0)..=(key, u8::MAX)).map(|(key, _)| *key).collect();
+        for key in doomed {
+            if let Some(list) = self.entries.remove(&key) { self.len -= list.len(); }
+        }
+    }
+
+    /// Drop what document changes since the last use can reach.
+    fn sync(&mut self, document: &Document) {
+        let now = document.version();
+        let Some(since) = self.version else {
+            self.version = Some(now);
+            return;
+        };
+        if since == now { return; }
+        if !document.mutations_cover(since) {
+            self.clear();
+            self.version = Some(now);
+            return;
+        }
+        let mutations = document.mutations();
+        let first = mutations.partition_point(|mutation| mutation.version <= since);
+        for mutation in &mutations[first..] {
+            match &mutation.kind {
+                crate::MutationKind::Attribute(_) => self.forget(mutation.target),
+                crate::MutationKind::CharacterData => {
+                    if let Ok(Some(parent)) = document.parent(mutation.target) { self.forget(parent); }
+                }
+                _ => {
+                    self.clear();
+                    break;
+                }
+            }
+        }
+        self.version = Some(now);
+    }
+
+    /// `Style::apply_animation_snapshot` on `style`, or the style an earlier
+    /// call resolved from equal inputs.
+    pub fn apply(&mut self, style: &mut Arc<Style>, document: &Document, node: NodeId,
+        parent: Option<&Arc<Style>>, pseudo: Option<PseudoElement>, text: Option<&dyn TextShaper>,
+        environment: MediaEnvironment, pairs: &[(String, String)], eligibility: &EffectEligibility,
+    ) -> Result<(), CssError> {
+        self.sync(document);
+        let key = (node.key(), pseudo.map_or(0, |pseudo| pseudo as u8 + 1));
+        // Without a baseline the cascade starts from the style itself.
+        let seed = eligibility.baseline.is_none().then(|| style.clone());
+        let parent = parent.cloned();
+        let text_generation = text.map(TextShaper::generation);
+        let found = self.entries.get(&key).and_then(|list| list.iter().find(|entry| entry.environment == environment
+            && entry.text == text_generation && entry.pairs.as_slice() == pairs
+            && arcs_equal(&entry.seed, &seed) && arcs_equal(&entry.parent, &parent)
+            && entry.eligibility.same_snapshot_inputs(eligibility)));
+        if let Some(entry) = found {
+            *style = entry.result.clone();
+            return Ok(());
+        }
+        Arc::make_mut(style).apply_animation_snapshot(document, node, parent.as_deref(), pseudo, text, environment, pairs, eligibility)?;
+        if self.len >= Self::MAX_ENTRIES {
+            self.entries.clear();
+            self.len = 0;
+        }
+        let list = self.entries.entry(key).or_default();
+        if list.len() >= Self::PER_TARGET { list.remove(0); } else { self.len += 1; }
+        list.push(SnapshotMemoEntry { seed, parent, pairs: pairs.to_vec(), eligibility: eligibility.clone(),
+            environment, text: text_generation, result: style.clone() });
+        Ok(())
+    }
+}
+
 impl PartialEq for Style {
     fn eq(&self, other: &Self) -> bool {
         if core::ptr::eq(self, other) { return true; }
@@ -6048,7 +6155,7 @@ enum Relation {
     Following,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum LogicalBorderComponent {
     Width(f32),
     Color(Rgba),
@@ -6058,7 +6165,7 @@ enum LogicalBorderComponent {
 
 /// UA keyword sizes share one table with HTML's legacy font-size hints.
 /// Keywords remain specified values until cascade; Style stores only pixels.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FontSizeKeyword {
     Absolute(u8),
     Larger,
@@ -6123,7 +6230,7 @@ fn legacy_font_size(raw: &str) -> Option<f32> {
     Some(FontSizeKeyword::Absolute(value).resolve(16.0))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Value {
     SourceColor(usize,SourceColor),
     Appearance(Appearance),
@@ -7281,7 +7388,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Declaration {
     value: Value,
     important: bool,
@@ -27076,6 +27183,26 @@ impl Default for EffectEligibility {
     } }
 }
 impl EffectEligibility {
+    /// Whether `Style::apply_animation_snapshot` resolves the same style
+    /// under both: every recorded input is equal. The retained-size charge is
+    /// accounting only.
+    fn same_snapshot_inputs(&self, other: &Self) -> bool {
+        let Self { slots, inherited, protected_custom, dependent, sources, registrations, baseline, box_parent,
+            baseline_inherited, baseline_font_scale, baseline_font_smaller, baseline_bolder, root, ua_hidden_input,
+            ua_clip_input, ua_margin_block_em, query_context, light, effects_cascaded, measured: _ } = self;
+        *slots == other.slots && *inherited == other.inherited && *baseline_inherited == other.baseline_inherited
+            && *box_parent == other.box_parent && *baseline_font_scale == other.baseline_font_scale
+            && *baseline_font_smaller == other.baseline_font_smaller && *baseline_bolder == other.baseline_bolder
+            && *root == other.root && *ua_hidden_input == other.ua_hidden_input && *ua_clip_input == other.ua_clip_input
+            && *ua_margin_block_em == other.ua_margin_block_em && *query_context == other.query_context
+            && *light == other.light && *effects_cascaded == other.effects_cascaded
+            && *protected_custom == other.protected_custom && *dependent == other.dependent
+            && arcs_equal(sources, &other.sources) && arcs_equal(registrations, &other.registrations)
+            && arcs_equal(baseline, &other.baseline)
+    }
+}
+
+impl EffectEligibility {
     /// The actual old query bases accompany the old resolved snapshot; replay
     /// never looks up a newly changed container or selector input.
     pub fn set_query_context(&mut self, context: ContainerUnitContext) {self.query_context=Some(context);}
@@ -27231,7 +27358,7 @@ fn winning_priority(winner_at: &[u32], expanded: &[RuleCandidate<'_>], slot: usi
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SnapshotDeclaration {
     priority: Priority,
     reference_scope: Option<Arc<[NodeId]>>,
@@ -35348,6 +35475,46 @@ mod tests {
         assert_eq!(sampled.width,Some(60.0),"sample resolves against old snapshot font, not new author style");
         assert_eq!(sampled.margin_sides[3],7.0);
         assert_eq!(sampled.custom_properties().iter().find(|(name,_)|name=="--Protected").unwrap().1.as_deref(),Some("old"));
+    }
+
+    #[test]
+    fn snapshot_style_memo_reuses_equal_inputs_until_the_element_changes() {
+        let mut document=crate::html::parse("<div id=p style='font-size:20px'><div id=t style='width:10px' data-x=1></div><div id=o></div></div>",32).unwrap();
+        let find=|document:&Document,id|crate::selector::query_selector(document,document.root(),id).unwrap().unwrap();
+        let (parent,target,other)=(find(&document,"#p"),find(&document,"#t"),find(&document,"#o"));
+        let index=StyleIndex::new(Vec::new());
+        let mut cache=StyleCache::default();
+        let (old_parent,_)=index.compute_transition_snapshot_cached(&document,parent,None,None,None,&mut cache,false).unwrap();
+        let (old,eligibility)=index.compute_transition_snapshot_cached(&document,target,Some(&old_parent),None,None,&mut cache,false).unwrap();
+        let environment=MediaEnvironment::default();
+        let pairs=[(String::from("width"),String::from("3em"))];
+        let mut direct=(*old).clone();
+        direct.apply_animation_snapshot(&document,target,Some(&old_parent),None,None,environment,&pairs,&eligibility).unwrap();
+        assert_eq!(direct.width,Some(60.0));
+        let mut memo=SnapshotStyleMemo::default();
+        let apply=|memo:&mut SnapshotStyleMemo,document:&Document,parent:&Arc<Style>,pairs:&[(String,String)]|{
+            let mut style=old.clone();
+            memo.apply(&mut style,document,target,Some(parent),None,None,environment,pairs,&eligibility).unwrap();
+            style
+        };
+        let first=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(*first==direct);
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&old_parent,&pairs)),"equal inputs resolve once");
+        let recaptured=Arc::new((*old_parent).clone());
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&recaptured,&pairs)),"a value-equal parent is the same input");
+        let wider=apply(&mut memo,&document,&old_parent,&[(String::from("width"),String::from("4em"))]);
+        assert_eq!(wider.width,Some(80.0),"other samples resolve on their own");
+        document.set_attribute(other,"class","x").unwrap();
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&old_parent,&pairs)),"another element's attributes cannot reach it");
+        document.set_attribute(target,"data-x","2").unwrap();
+        let again=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(!Arc::ptr_eq(&first,&again),"the element's own attributes drop its entries");
+        assert!(*again==direct);
+        assert_eq!(memo.len(),1);
+        document.remove(other).unwrap();
+        let after_tree=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(!Arc::ptr_eq(&again,&after_tree),"a tree change drops every entry");
+        assert_eq!(memo.len(),1);
     }
 
     #[test]

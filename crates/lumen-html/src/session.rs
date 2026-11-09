@@ -1150,6 +1150,8 @@ pub struct RenderSession {
     /// Effect targets whose sampled declarations changed since the last snapshot.
     snapshot_effect_nodes: alloc::collections::BTreeSet<u128>,
     snapshot_effects_unbounded: bool,
+    /// Effect-free styles resolved for effect sampling, reused across samplings.
+    snapshot_style_memo: core::cell::RefCell<css::SnapshotStyleMemo>,
     /// Elements scripts touched or read; sparse snapshots always record them.
     snapshot_watch: alloc::collections::BTreeSet<u128>,
     /// A watch request did not fit; the next snapshot must cover every element.
@@ -1549,6 +1551,9 @@ struct StylesheetInstall {
 impl RenderSession {
     /// Existing source epoch snapshot; callers obtain computed styles first.
     /// Sharing this Arc does not copy registration records for animation targets.
+    /// The memo effect sampling resolves underlying styles through.
+    pub fn snapshot_style_memo(&self)->&core::cell::RefCell<css::SnapshotStyleMemo> {&self.snapshot_style_memo}
+
     pub fn registered_custom_property_snapshot(&self)->Option<Arc<[css::registered_properties::RegisteredCustomProperty]>> {
         self.rules.as_ref().map(|rules|rules.registered_snapshot())
     }
@@ -1699,6 +1704,7 @@ impl RenderSession {
             snapshot_rules_unbounded: true,
             snapshot_effect_nodes: alloc::collections::BTreeSet::new(),
             snapshot_effects_unbounded: false,
+            snapshot_style_memo: Default::default(),
             snapshot_watch: alloc::collections::BTreeSet::new(),
             snapshot_watch_overflowed: false,
             held_snapshot_stale: None,

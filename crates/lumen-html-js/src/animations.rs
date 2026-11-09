@@ -1716,23 +1716,23 @@ fn before_change_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElement>
     inputs:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),&'a lumen_html::session::TransitionStyleInput>,
     samples:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Vec<(String,String)>>,
     transition_samples:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Vec<(String,String)>>,
-    document:&Document,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
+    document:&Document,memo:&RefCell<lumen_html::css::SnapshotStyleMemo>,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
     prepared:&mut FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Arc<lumen_html::css::Style>>,budget:&mut EffectSamplingBudget,depth:usize,
 )->OpResult<Arc<lumen_html::css::Style>> {
     if let Some(style)=prepared.get(&target) {return Ok(style.clone());}
     if depth>=512 {return Err(OpError::new("InvalidStateError","before-change style depth exceeded"));}
     let input=inputs.get(&target).ok_or_else(||OpError::new("InvalidStateError","before-change target unavailable"))?;
     let parent=input.parent.and_then(|node|inputs.get(&(node,None)).copied());
-    let resolved_parent=parent.map(|parent|before_change_style((parent.node,None),inputs,samples,transition_samples,document,environment,text,prepared,budget,depth+1)).transpose()?;
+    let resolved_parent=parent.map(|parent|before_change_style((parent.node,None),inputs,samples,transition_samples,document,memo,environment,text,prepared,budget,depth+1)).transpose()?;
     let changed_parent=parent.zip(resolved_parent.as_ref()).is_some_and(|(old,new)|!Arc::ptr_eq(&old.style,new));
     let pairs=samples.get(&target).map_or(&[][..],Vec::as_slice);
     let mut style=input.style.clone();
     if (changed_parent || !pairs.is_empty()) && document.kind(input.node).is_ok() {
-        Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+        memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
             environment,pairs,&input.eligibility).map_err(|error|OpError::new("SyntaxError",format!("before-change animation sample failed: {error:?}")))?;
     }
     if let Some(pairs)=transition_samples.get(&target).filter(|_|document.kind(input.node).is_ok()) {
-        Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+        memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
             environment,pairs,&lumen_html::css::EffectEligibility::all())
             .map_err(|error|OpError::new("SyntaxError",format!("before-change transition sample failed: {error:?}")))?;
     }
@@ -2010,7 +2010,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         let before=if let Some(old)=old {
             let session=realm.session.borrow();
             before_change_style((old.node,old.pseudo),&previous_nodes,&sampled_animations,&sampled_transitions,
-                session.document(),session.media_environment(),text,&mut before_styles,&mut before_budget,0)?
+                session.document(),session.snapshot_style_memo(),session.media_environment(),text,&mut before_styles,&mut before_budget,0)?
         }else{starting.expect("before or starting style")};
         if running.is_none() && *before==*input.style && hub.borrow().completed_transitions.is_empty() {continue;}
 
@@ -2854,14 +2854,14 @@ struct EffectUnderlyingSource<'a> {order:usize,input:&'a lumen_html::session::Tr
 fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElement>),own:bool,
     inputs:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),EffectUnderlyingSource<'a>>,
     declarations:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>,bool),BTreeMap<String,String>>,
-    document:&Document,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
+    document:&Document,memo:&RefCell<lumen_html::css::SnapshotStyleMemo>,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
     prepared:&mut FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Arc<lumen_html::css::Style>>,budget:&mut EffectSamplingBudget,depth:usize,
 )->OpResult<Arc<lumen_html::css::Style>> {
     if own {if let Some(style)=prepared.get(&target){return Ok(style.clone());}}
     if depth>=512{return Err(OpError::new("InvalidStateError","effect inheritance depth exceeded"));}
     let input=inputs.get(&target).map(|source|source.input).ok_or_else(||OpError::new("InvalidStateError","effect underlying source unavailable"))?;
     let parent=input.parent.and_then(|node|inputs.get(&(node,None)).map(|source|source.input));
-    let resolved_parent=parent.map(|parent|effect_underlying_style((parent.node,None),true,inputs,declarations,document,environment,text,prepared,budget,depth+1)).transpose()?;
+    let resolved_parent=parent.map(|parent|effect_underlying_style((parent.node,None),true,inputs,declarations,document,memo,environment,text,prepared,budget,depth+1)).transpose()?;
     if own{budget.reserve(prepared,1)?;}
     // A style captured without effects, under an unchanged parent and with no
     // samples to apply, is already its underlying style; restyling it again
@@ -2881,7 +2881,7 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
         .ok_or_else(||OpError::new("QuotaExceededError","effect underlying source limit"))?;
     budget.add(source_bytes)?;
     let mut style=input.style.clone();
-    Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+    memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
         environment,&[],&input.eligibility).map_err(|error|OpError::new("SyntaxError",format!("effect underlying inheritance failed: {error:?}")))?;
     if own {
         for transition in [false,true] {
@@ -2890,7 +2890,7 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
                 let pairs=values.iter().map(|(name,value)|(name.clone(),value.clone())).collect::<Vec<_>>();
                 let unrestricted=transition.then(lumen_html::css::EffectEligibility::all);
                 let eligibility=unrestricted.as_ref().unwrap_or(&input.eligibility);
-                Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+                memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
                     environment,&pairs,eligibility).map_err(|error|OpError::new("SyntaxError",format!("effect parent sample failed: {error:?}")))?;
                 drop(pairs);budget.bytes=checkpoint;
             }
@@ -3384,26 +3384,26 @@ let property_pass=|name:&str| {
                     let base_style=if needs_source(record) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),false,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),false,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let color_style=if pass==1&&keyframes_need_color_context(&record.keyframes) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let context_style=if keyframes_need_context(&record.keyframes) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let context_parent=if context_style.is_some() {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
                         inputs.get(&(node,record.pseudo)).and_then(|source|source.input.parent)
-                            .map(|parent|effect_underlying_style((parent,None),true,inputs,&declarations,session.document(),
+                            .map(|parent|effect_underlying_style((parent,None),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                                 session.media_environment(),shadow_text,parents,&mut underlying_budget,0)).transpose()?
                     }else{None};
                     let mut endpoint_query=if context_style.is_some() {
@@ -7186,7 +7186,7 @@ fn specification_css_transition_all_and_logical_lists_create_one_physical_effect
         // New author inputs must not replace the retained BEFORE lineage.
         eval_ok(&mut engine,"document.getElementById('parent').style.fontSize='10px'");
         let old=realm.with_session(|session|before_change_style((leaf,None),&inputs,&samples,&FastMap::default(),
-            session.document(),session.media_environment(),None,&mut prepared,&mut budget,0)).unwrap();
+            session.document(),session.snapshot_style_memo(),session.media_environment(),None,&mut prepared,&mut budget,0)).unwrap();
         assert_eq!(old.left,Some(60.0));
         assert!(prepared.len()<8,"unrelated old snapshot entries were reconstructed");
         assert!(prepared.contains_key(&(parent,None)) && prepared.contains_key(&(leaf,None)));
