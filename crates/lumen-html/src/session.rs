@@ -1265,6 +1265,9 @@ pub struct InvalidationStats {
     /// every element dirty; then, of the epoch changes, the rules, fonts,
     /// validity, interaction and environment that differed.
     pub transition_snapshot_full_causes: [u64; 12],
+    /// Snapshot captures that failed: over their quota, refused before
+    /// walking (an unchanged oversized tree), and any other error.
+    pub transition_snapshots_failed: [u64; 3],
     /// Font family changes that dropped every style and the font history:
     /// before the first layout, a style cache that cannot list its users,
     /// more than half the document using the families, and a layout that
@@ -4478,6 +4481,7 @@ impl RenderSession {
         let epoch=self.transition_input_epoch()?;
         let key=(epoch,text.map(TextShaper::generation),self.paint_revision);
         if self.rejected_transition_snapshot.as_deref()==Some(&key) {
+            self.invalidation_stats.transition_snapshots_failed[1]+=1;
             return Err(LayoutError::CommandLimit);
         }
         let basis=SnapshotBasis{version:epoch.document_version,text_generation:text.map(TextShaper::generation),
@@ -4489,15 +4493,18 @@ impl RenderSession {
         let mut quota_exceeded=false;
         if keep.is_none() && self.rejected_sparse_epoch==Some(epoch) {
             self.rejected_transition_snapshot=Some(Box::new(key));
+            self.invalidation_stats.transition_snapshots_failed[1]+=1;
             return Err(LayoutError::CommandLimit);
         }
         let only=match keep {Some(keep)=>self.snapshot_candidates(keep)?,None=>None};
         let size=(only.is_some(),only.as_ref().map_or_else(||connected_node_count(&self.document),Vec::len),epoch.environment);
         if self.rejected_snapshot_size.is_some_and(|(sparse,planned,environment)|sparse==size.0 && size.1>=planned && environment==size.2) {
             self.rejected_transition_snapshot=Some(Box::new(key));
+            self.invalidation_stats.transition_snapshots_failed[1]+=1;
             return Err(LayoutError::CommandLimit);
         }
         let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None,base.as_ref(),only.as_deref(),keep);
+        if result.is_err() {self.invalidation_stats.transition_snapshots_failed[if quota_exceeded {0} else {2}]+=1;}
         self.rejected_transition_snapshot=if quota_exceeded {Some(Box::new(key))} else {None};
         if quota_exceeded {
             self.rejected_snapshot_size=Some(size);

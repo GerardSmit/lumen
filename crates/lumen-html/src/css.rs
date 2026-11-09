@@ -119,6 +119,9 @@ pub mod counter_styles;
 pub(crate) const FALLBACK_NO_COLUMNS: u8 = 1;
 pub(crate) const FALLBACK_PLAIN_SELECT: u8 = 2;
 pub(crate) const FALLBACK_NO_GENERATED: u8 = 4;
+/// Column flex containers do not guess that their items fill their minimum
+/// height (`layout::Layout::column_flex_in_place`).
+pub(crate) const FALLBACK_NO_FLEX_SPECULATION: u8 = 8;
 use namespaces::{NamespaceMap,NamespaceConstraint};
 pub mod typed_numeric;
 mod color_values;

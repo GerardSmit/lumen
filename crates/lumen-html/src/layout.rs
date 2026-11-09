@@ -399,6 +399,10 @@ pub enum LayoutError {
     /// The customizable select requires its genuine picker/shadow tree.
     UnsupportedWidgetAppearance,
     CommandLimit,
+    /// A column flex container's guess that its items fill its minimum
+    /// height was wrong (`Layout::column_flex_in_place`); the layout runs
+    /// again without guessing and never returns this.
+    FlexSpeculation,
     /// No longer returned by layout: an image that is still loading lays out
     /// with placeholder geometry and paints nothing (see
     /// `RenderSession::images_pending`).
@@ -2498,6 +2502,10 @@ pub(crate) struct RetainedLayoutCache {
     /// laid out outside every retained box, or owned by a fragment evicted
     /// while boxes that replay it stay. A load of one of them drops all text.
     orphan_families: u64,
+    /// Column flex containers whose items did not fill their minimum height
+    /// (`Layout::column_flex_in_place`): they are not guessed for again.
+    /// Kept by `clear`, which drops only what layouts produced.
+    flex_speculation_failed: BTreeSet<RetainedNodeKey>,
 }
 
 fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
@@ -2540,6 +2548,17 @@ impl RetainedLayoutCache {
             if !grew { break; }
         }
         false
+    }
+
+    fn flex_speculation_failed(&self, container: NodeId) -> bool {
+        self.flex_speculation_failed.contains(&retained_node_key(container))
+    }
+
+    fn note_flex_speculation_failed(&mut self, container: NodeId) {
+        const LIMIT: usize = 4096;
+        if self.flex_speculation_failed.len() < LIMIT {
+            self.flex_speculation_failed.insert(retained_node_key(container));
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -27490,16 +27509,34 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// before it, instead of being measured first. Its main size is not
     /// definite for its descendants' percentages (css-flexbox 9.8), as in the
     /// measurement.
-    fn column_flex_in_place(&self, container: &Style) -> bool {
+    ///
+    /// With `speculate`, a container with a minimum height lays its items out
+    /// in place too, on the guess that their content fills the minimum (as a
+    /// page-sized `min-height: 100vh` column usually does). `flex_children`
+    /// checks the guess once the items are laid out; when free space remains
+    /// that would grow an item, take an auto margin or move the items, the
+    /// layout fails with `LayoutError::FlexSpeculation` and runs again without
+    /// guessing, and the container is not guessed for again.
+    fn column_flex_in_place(&self, container: &Style, speculate: bool) -> bool {
         !container.flex_main_axis_horizontal() && !container.flex_wrap
             && container.flex_direction == FlexDirection::Column
             && container.writing_mode == css::WritingMode::HorizontalTb
             && !container.axis_start_is_far(false)
             && container.height.is_none() && container.height_intrinsic.is_none()
             && container.max_height.is_none() && !container.has_max_height_percentage()
-            && container.min_height <= 0.0 && !container.has_min_height_percentage()
+            && (container.min_height <= 0.0 || speculate && container.min_height_intrinsic.is_none())
+            && !container.has_min_height_percentage()
             && self.multicol_depth == 0
             && !css::gap_decorations::enabled(container)
+    }
+
+    /// Whether `flex_children` may guess that the items of `container`, a
+    /// column with a minimum height, fill it (`column_flex_in_place`). Only a
+    /// layout that keeps fragments guesses: it remembers wrong guesses.
+    fn flex_speculation_allowed(&self, container: NodeId, style: &Style) -> bool {
+        style.min_height > 0.0 && self.geometry.is_some()
+            && self.rules.layout_fallback() & css::FALLBACK_NO_FLEX_SPECULATION == 0
+            && self.retained_fragments.as_deref().is_some_and(|cache| !cache.flex_speculation_failed(container))
     }
 
     fn push_flex_item(
@@ -27514,6 +27551,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         width: f32,
         source_order: &mut usize,
         depth: usize,
+        speculate: bool,
     ) -> Result<(), LayoutError> {
         let cross_auto_margin = if row {
             item_style.margin_auto[0] || item_style.margin_auto[2]
@@ -27625,13 +27663,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Some(fit)
             }
         };
-        let in_place = shortcuts && inline_size.is_some() && height_needed && main_from_measure
-            && !item_style.flex_basis_content && item_style.flex_basis_intrinsic.is_none()
+        // A content basis (`flex: 1` in an automatic column) is the natural
+        // block size too.
+        let in_place = shortcuts && inline_size.is_some() && height_needed
+            && (main_from_measure || item_style.flex_basis_content) && item_style.flex_basis_intrinsic.is_none()
             && item_style.height.is_none() && item_style.height_intrinsic.is_none()
             && item_style.max_height.is_none() && !item_style.has_max_height_percentage()
             && item_style.min_height <= 0.0 && !item_style.has_min_height_percentage()
             && !item_style.margin_auto[0] && !item_style.margin_auto[2]
-            && self.column_flex_in_place(container_style);
+            && self.column_flex_in_place(container_style, speculate);
         let stretched_height = match inline_size.filter(|_| height_needed && !in_place) {
             Some(inline_size) => Some(self.column_flex_item_height(
                 node, &item_style, container_style, width, inline_size, depth,
@@ -27651,7 +27691,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         let edges = box_edges(&item_style, row);
         let cross_edges = box_edges(&item_style, !row);
-        let content_basis = if item_style.flex_basis_content {
+        let content_basis = if item_style.flex_basis_content && !in_place {
             let mut content_style = item_style.clone();
             if row {
                 content_style.width = None;
@@ -27878,6 +27918,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut items: Vec<FlexItem> = Vec::new();
         let mut positioned = Vec::new();
         let mut source_order = 0;
+        let speculate = !style.flex_main_axis_horizontal() && self.flex_speculation_allowed(parent, style);
         let children=match prepared_children {Some(children)=>children,
             None=>self.box_children_with_pseudos(parent,style,width,depth+1,false)?};
         let children=self.anonymous_formatting_items(children,style)?;
@@ -27885,7 +27926,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let child=match item {
                 AnonymousFormattingItem::Text(run)=>{
                     self.push_flex_item(&mut items,&mut positioned,run.node,run.style,Some(run.paragraph),
-                        style,row,width,&mut source_order,depth+1)?;
+                        style,row,width,&mut source_order,depth+1,speculate)?;
                     continue;
                 }
                 AnonymousFormattingItem::Box(child)=>child,
@@ -27964,6 +28005,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 width,
                 &mut source_order,
                 depth + 1,
+                speculate,
             )?;
         }
 
@@ -28623,7 +28665,24 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 item.main_baselines = item.main_baselines.map(|value| value.translated(dx, dy));
             }
             lines[line_index].2 = align_extent;
-            let available = if in_place { items.iter().map(|item| item.main).sum::<f32>() + gaps } else { available };
+            let available = if in_place {
+                let natural = items.iter().map(|item| item.main).sum::<f32>() + gaps;
+                let used = constrained_height(style, natural);
+                // Only a guessed minimum leaves free space: it must change
+                // nothing an item was laid out or placed with.
+                let free = used - natural;
+                if free > 0.01 {
+                    let (lead, extra) = grid_content_distribution(items.len(), free, style.justify_content);
+                    let shifted = style.content_alignment(true).positional_offset(free, style, row, false)
+                        .is_some_and(|offset| offset != 0.0);
+                    if shifted || lead != 0.0 || extra != 0.0 || items.iter().any(|item| item.style.flex_grow > 0.0
+                        || item.style.margin_auto[main_start] || item.style.margin_auto[main_end]) {
+                        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.note_flex_speculation_failed(parent); }
+                        return Err(LayoutError::FlexSpeculation);
+                    }
+                }
+                used
+            } else { available };
             total_main = total_main.max(available);
         }
         let natural_cross = lines.iter().map(|line| line.2).sum::<f32>()
@@ -45867,11 +45926,13 @@ fn laid_out_display_list(
             Err(LayoutError::UnsupportedMulticolumnLayout) => css::FALLBACK_NO_COLUMNS,
             Err(LayoutError::UnsupportedWidgetAppearance) => css::FALLBACK_PLAIN_SELECT,
             Err(LayoutError::UnsupportedGeneratedContent) => css::FALLBACK_NO_GENERATED,
+            Err(LayoutError::FlexSpeculation) => css::FALLBACK_NO_FLEX_SPECULATION,
             _ => 0,
         };
         if added == 0 || flags & added != 0 {
             rules.set_layout_fallback(0);
-            if flags != initial_flags {
+            // A layout without guesses lays out what a right guess does.
+            if (flags ^ initial_flags) & !css::FALLBACK_NO_FLEX_SPECULATION != 0 {
                 // Fragments laid out with a feature switched off must not be
                 // replayed by a later layout that runs with it enabled.
                 if let Some(cache) = retained_fragments.as_deref_mut() {
@@ -64390,6 +64451,54 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             let plain = with_layout_memos_disabled(|| with_flex_shortcuts_disabled(|| fresh_frame(&document)));
             assert_same_frame(&shortcut, &plain);
         }
+    }
+
+    /// Column containers with a minimum height: the items fill it (the guess
+    /// holds), leave free space that grows an item, leave free space nothing
+    /// takes, leave space that centering or an auto margin takes, and nested.
+    const MIN_HEIGHT_COLUMN_PAGES: [&str; 6] = [
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:120px;width:200px}main{flex:1}p{margin:0}</style>\
+         <div class=f><header style='height:10px'></header><main><p>words in the main part</p><div style='height:300px;background:red'></div></main>\
+         <footer style='margin-top:auto'><p>foot</p></footer></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px}main{flex:1;background:blue}p{margin:0}</style>\
+         <div class=f><header style='height:10px'></header><main><p>short main</p><div style='height:50%;background:red'>half</div></main><footer><p>foot</p></footer></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px;background:#eee}p{margin:0}</style>\
+         <div class=f><div><p>no item grows</p></div><div style='border:2px solid'><p>second</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px;justify-content:center}p{margin:0}</style>\
+         <div class=f><div><p>centred</p></div><div><p>items</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px}p{margin:0}</style>\
+         <div class=f><div><p>top</p></div><div style='margin-top:auto;border-top:1px solid'><p>bottom</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:160px;width:220px}.g{display:flex;flex-direction:column;min-height:60px}.g>div{flex:1}p{margin:0}</style>\
+         <div class=f><div><div class=g><div><p>inner grows</p></div></div></div><div style='height:200px'></div><div class=g><p>fills</p><div style='height:90px'></div></div></div>",
+    ];
+
+    #[test]
+    fn column_flex_containers_with_a_minimum_height_render_like_full_measurement() {
+        for markup in MIN_HEIGHT_COLUMN_PAGES.iter().chain(&FLEX_SHORTCUT_PAGES[6..7]) {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let full = with_flex_shortcuts_disabled(|| fresh_frame(&document));
+            let mut cache = RetainedLayoutCache::default();
+            assert_same_frame(&retained_frame(&document, &mut cache), &full);
+            // A wrong guess is not made again, and a right one replays.
+            let guessed = cache.flex_speculation_failed.len();
+            assert_same_frame(&retained_frame(&document, &mut cache), &full);
+            assert_eq!(cache.flex_speculation_failed.len(), guessed, "{markup}");
+        }
+        let failed = |markup: &str| {
+            let mut cache = RetainedLayoutCache::default();
+            retained_frame(&crate::html::parse(markup, 4096).unwrap(), &mut cache);
+            cache.flex_speculation_failed.len()
+        };
+        let failures = MIN_HEIGHT_COLUMN_PAGES.map(failed);
+        assert_eq!(failures, [0, 1, 0, 1, 1, 1], "only free space an item or alignment takes fails the guess");
+    }
+
+    #[test]
+    fn a_column_that_fills_its_minimum_height_lays_its_items_out_once() {
+        let document = crate::html::parse(MIN_HEIGHT_COLUMN_PAGES[0], 4096).unwrap();
+        let shortcut = measured_in_first_frame(&document);
+        let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+        assert!(shortcut < full, "shortcut {shortcut}, full {full}");
     }
 
     #[test]
