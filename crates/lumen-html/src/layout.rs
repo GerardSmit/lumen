@@ -4902,7 +4902,7 @@ struct Layout<'a> {
     initial_clearances: Vec<(NodeId, Option<css::PseudoElement>, f32)>,
     initial_margin_summaries: RefCell<BTreeMap<(u128, u8, u32, bool), (MarginStrut, Option<MarginStrut>, bool)>>,
     initial_margin_origin: Option<f32>,
-    initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,f32)>>,
+    initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,Option<f32>)>>,
     anchor_index: RefCell<anchor_layout::AnchorIndex>,
     last_successful: anchor_layout::LastSuccessful,
     position_area_outer: Option<(NodeId, Rect)>,
@@ -8713,8 +8713,13 @@ struct BlockMargins { lead: MarginStrut, lead_add: f32, trail: MarginStrut, trai
 
 #[derive(Clone, Copy)]
 struct InitialClearance { node: NodeId, pseudo: Option<css::PseudoElement>, clear: Clear, float_count: usize }
-#[derive(Clone, Copy)]
-struct InitialFloat { left: f32, available: f32, width: f32, height: f32, side: Float, clear: Clear }
+/// A float met by the hypothetical margin pass. Its size matters only when a
+/// later box clears it, so an element float is measured then: measuring lays
+/// out its whole content (sciencedaily.com's floated multi-column body).
+#[derive(Clone)]
+struct InitialFloat { left: f32, available: f32, size: InitialFloatSize, side: Float, clear: Clear }
+#[derive(Clone)]
+enum InitialFloatSize { Measured { width: f32, height: f32 }, Element { node: NodeId, style: Rc<Style>, depth: usize } }
 #[derive(Clone,Copy)]
 enum FloatAvoidanceSource<'a> {Node(NodeId),Generated(&'a VirtualGeneratedChild),AnonymousTable(&'a AnonymousTableBox)}
 
@@ -17264,17 +17269,13 @@ impl Layout<'_> {
                     let node=match &child.kind{FlattenedBoxChildKind::Node(node)=>*node,
                         FlattenedBoxChildKind::Generated(generated)=>generated.origin,
                         FlattenedBoxChildKind::AnonymousTable(_)=>continue};
-                    let (floated,width,intrinsic_height)=if let FlattenedBoxChildKind::Generated(generated)=&child.kind {
-                        self.prepare_generated_float_box(generated,available)?
-                    } else {self.prepare_float_box(node,child_style.clone(),available,depth+1)?};
-                    // Both intrinsic_size and box_edges already return the outer
-                    // margin-box extent. Use it once in hypothetical occupancy,
-                    // exactly as in the real float encounter pass.
-                    let height=floated.height.map_or(intrinsic_height,|height|
-                        constrained_height(&floated,content_height_dimension(&floated,height))+box_edges(&floated,false));
+                    let size=if let FlattenedBoxChildKind::Generated(generated)=&child.kind {
+                        let (floated,width,intrinsic_height)=self.prepare_generated_float_box(generated,available)?;
+                        InitialFloatSize::Measured{width,height:Self::initial_float_height(&floated,intrinsic_height)}
+                    } else {InitialFloatSize::Element{node,style:Rc::new(child_style.clone()),depth:depth+1}};
                     if result.floats.len()==4096{return Err(LayoutError::CommandLimit);}
                     result.floats.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                    result.floats.push(InitialFloat{left:0.0,available,width,height:height.max(0.0),side:floated.float,clear:floated.clear});
+                    result.floats.push(InitialFloat{left:0.0,available,size,side:child_style.float,clear:child_style.clear});
                 }
                 continue;
             }
@@ -17339,6 +17340,13 @@ impl Layout<'_> {
         Ok(result)
     }
 
+/// A float's outer height for hypothetical occupancy: its used height, else the
+/// intrinsic one. Both are margin-box extents, as in the real float pass.
+fn initial_float_height(floated:&Style,intrinsic_height:f32)->f32 {
+    floated.height.map_or(intrinsic_height,|height|
+        constrained_height(floated,content_height_dimension(floated,height))+box_edges(floated,false)).max(0.0)
+}
+
 fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
     depth:usize,generated:Option<&VirtualGeneratedChild>)->Result<MarginStrut,LayoutError> {
     let key=(id.key(),generated.map_or(0,|child|child.pseudo as u8+1),available.to_bits(),establishes_formatting_context(style,parent));
@@ -17366,9 +17374,16 @@ fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
         let mut admitted_floats=0;
         for clearance in initial.clearances {
             while admitted_floats<clearance.float_count {
-                let float=initial.floats[admitted_floats];
-                let (x,y)=place_float_in(bands.iter().copied(),outer_x+float.left,float.available,hypothetical,float.width,float.side,float.clear);
-                bands.push((Rect{x,y,width:float.width,height:float.height},float.side));admitted_floats+=1;
+                let float=&initial.floats[admitted_floats];
+                let (width,height)=match &float.size {
+                    InitialFloatSize::Measured{width,height}=>(*width,*height),
+                    InitialFloatSize::Element{node,style,depth}=>{
+                        let (floated,width,intrinsic_height)=self.prepare_float_box(*node,(**style).clone(),float.available,*depth,true)?;
+                        (width,Self::initial_float_height(&floated,intrinsic_height))
+                    }
+                };
+                let (x,y)=place_float_in(bands.iter().copied(),outer_x+float.left,float.available,hypothetical,width,float.side,float.clear);
+                bands.push((Rect{x,y,width,height},float.side));admitted_floats+=1;
             }
             let requires=bands[..external_count+clearance.float_count].iter().any(|(rect,side)|
                 (clearance.clear==Clear::Both || clearance.clear==Clear::Left&&*side==Float::Left
@@ -17658,26 +17673,32 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
     Ok((floated,width,height))
 }
 
-    fn prepare_float_box(&self,id:NodeId,mut floated:Style,available:f32,depth:usize)
+    /// The float's used style and outer width, and with `need_height` its
+    /// intrinsic outer height (else 0). The intrinsic size lays out the float's
+    /// content, so it is measured only for a replaced element's width or when
+    /// the height is asked for (a vertical flow, or a float another box clears).
+    fn prepare_float_box(&self,id:NodeId,mut floated:Style,available:f32,depth:usize,need_height:bool)
         ->Result<(Style,f32,f32),LayoutError> {
         let key=(id.key(),available.to_bits(),self.parent_height.map_or(u32::MAX,f32::to_bits));
-        if let Some(measured)=self.initial_float_measurements.borrow().get(&key) {return Ok(measured.clone());}
+        if let Some((style,width,height))=self.initial_float_measurements.borrow().get(&key) {
+            if !need_height || height.is_some() {return Ok((style.clone(),*width,height.unwrap_or(0.0)));}
+        }
         self.resolve_intrinsic_dimensions(id,&mut floated,available,self.parent_height,depth)?;
-        let (intrinsic,intrinsic_height)=self.intrinsic_size(id,&floated,depth)?;
         let replaced=matches!(self.document.kind(id),Ok(NodeKind::Element{name,namespace:Namespace::Html,..})
             if matches!(name.as_str(),"img"|"canvas"|"video"))
             || self.document.kind(id).is_ok_and(is_svg_root_element);
-        let width=match floated.width {
-            Some(width)=>width,
-            None if replaced=>specified_dimension(&floated,(intrinsic-box_edges(&floated,true)).max(0.0)),
-            None=>self.shrink_to_fit_width(id,&floated,available,depth)?,
+        let intrinsic=if need_height || (replaced && floated.width.is_none()) {Some(self.intrinsic_size(id,&floated,depth)?)} else {None};
+        let width=match (floated.width,intrinsic) {
+            (Some(width),_)=>width,
+            (None,Some((intrinsic,_))) if replaced=>specified_dimension(&floated,(intrinsic-box_edges(&floated,true)).max(0.0)),
+            _=>self.shrink_to_fit_width(id,&floated,available,depth)?,
         };
         floated.width=Some(width);
         let outer_width=constrained_width(&floated,content_dimension(&floated,width))+box_edges(&floated,true);
-        let result=(floated,outer_width,intrinsic_height);
+        let intrinsic_height=intrinsic.map(|(_,height)|height);
         let mut measurements=self.initial_float_measurements.borrow_mut();
-        if measurements.len()<MAX_DISPLAY_COMMANDS {measurements.insert(key,result.clone());}
-        Ok(result)
+        if measurements.len()<MAX_DISPLAY_COMMANDS {measurements.insert(key,(floated.clone(),outer_width,intrinsic_height));}
+        Ok((floated,outer_width,intrinsic_height.unwrap_or(0.0)))
     }
 
     fn place_float(&self, frame:FloatFrame,start:usize,left:f32,width:f32,cursor:f32,
@@ -44228,7 +44249,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.next_paint_order(),
                 ));
             } else if computed.as_ref().is_some_and(|s| s.float != Float::None) {
-                let (mut floated,outer_width,intrinsic_height)=self.prepare_float_box(current,computed.unwrap(),content_width,depth+1)?;
+                let (mut floated,outer_width,intrinsic_height)=self.prepare_float_box(current,computed.unwrap(),content_width,depth+1,vertical_block_flow)?;
                 let frame = if vertical_block_flow {
                     FloatFrame::vertical(
                         &style,
