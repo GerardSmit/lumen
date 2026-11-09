@@ -44,6 +44,39 @@ const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
 /// Installed fonts (CJK collections in particular) exceed the web-font limit.
 const MAX_SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHAPE_TEXT_BYTES: usize = 64 * 1024;
+
+/// The bytes a face reads: owned, or held elsewhere, such as a read-only mapping
+/// of an installed font file whose pages the OS loads as tables are read.
+#[derive(Clone)]
+pub(crate) enum FontBytes {
+    Owned(Arc<[u8]>),
+    #[cfg(feature = "system-fonts")]
+    External(Arc<dyn AsRef<[u8]> + Send + Sync>),
+}
+
+impl core::ops::Deref for FontBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            #[cfg(feature = "system-fonts")]
+            Self::External(bytes) => (**bytes).as_ref(),
+        }
+    }
+}
+
+/// The offset of face `index`'s table directory: 0 for a single face, else the
+/// collection's entry for it.
+fn sfnt_directory_offset(bytes: &[u8], index: u32) -> Option<usize> {
+    if bytes.get(..4) != Some(b"ttcf") {
+        return (index == 0).then_some(0);
+    }
+    let count = sfnt::be32(bytes, 8)?;
+    if index >= count {
+        return None;
+    }
+    usize::try_from(sfnt::be32(bytes, 12usize.checked_add(usize::try_from(index).ok()?.checked_mul(4)?)?)?).ok()
+}
 /// Shaping and outlines scale linearly, so they accept any size a page can compute.
 const MAX_SHAPE_FONT_SIZE: f32 = 16384.0;
 /// Coverage bitmaps grow with the square of the size; larger glyphs are not rasterized.
@@ -77,6 +110,7 @@ const LARGE_FACE_BYTES: usize = 4 * 1024 * 1024;
 /// identically, while bounding retained outline memory to this call.
 fn fontdue_bytes_for_glyph_range(
     bytes: &[u8],
+    face_index: u32,
     first_glyph: u16,
     glyph_count: u16,
 ) -> Result<Vec<u8>, &'static str> {
@@ -122,12 +156,7 @@ fn fontdue_bytes_for_glyph_range(
     if bytes.len() > MAX_SYSTEM_FONT_BYTES {
         return Err("font too large");
     }
-    let sfnt_offset = if bytes.get(..4) == Some(b"ttcf") {
-        usize::try_from(read_u32(bytes, 12).ok_or("invalid font collection")?)
-            .map_err(|_| "invalid font collection")?
-    } else {
-        0
-    };
+    let sfnt_offset = sfnt_directory_offset(bytes, face_index).ok_or("invalid font collection")?;
     let scaler = bytes
         .get(sfnt_offset..sfnt_offset.checked_add(4).ok_or("invalid font table")?)
         .ok_or("invalid font table")?;
@@ -696,7 +725,7 @@ fn shape_buffer(
     script: ScriptSelection,
     features: &[rustybuzz::Feature],
 ) -> Result<rustybuzz::GlyphBuffer, &'static str> {
-    shape_buffer_context(bytes,text,rtl,script,features,ShapeContext::language(None))
+    shape_buffer_context(bytes,0,text,rtl,script,features,ShapeContext::language(None))
 }
 
 #[derive(Clone, Copy)]
@@ -722,9 +751,9 @@ fn is_private_use_cluster(cluster: &str) -> bool {
     cluster.chars().any(|character| matches!(character as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD))
 }
 
-fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelection,
+fn shape_buffer_context(bytes: &[u8], face_index: u32, text: &str, rtl: bool, script: ScriptSelection,
     features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
-    let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
+    let mut face = rustybuzz::Face::from_slice(bytes, face_index).ok_or("font cannot be shaped")?;
     face.set_variations(context.variations);
     face.set_points_per_em(context.points_per_em);
     let buffer = shape_input(&face, text, rtl, script, context)?;
@@ -794,14 +823,14 @@ impl BmpCoverage {
 
     /// Whether `ch` maps to a non-zero glyph, or `None` while another thread
     /// builds the table or for a code point outside the plane.
-    fn covers(&self, bytes: &[u8], ch: char) -> Option<bool> {
+    fn covers(&self, bytes: &[u8], face_index: u32, ch: char) -> Option<bool> {
         let codepoint = ch as u32;
         if codepoint >= 0x1_0000 {
             return None;
         }
         let mut state = self.state.load(Ordering::Acquire);
         if state == 0 && self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            state = match Self::build(bytes) {
+            state = match Self::build(bytes, face_index) {
                 Some(bits) => {
                     // SAFETY: state 1 gives this thread the only access to `bits`.
                     unsafe { *self.bits.get() = bits };
@@ -819,21 +848,35 @@ impl BmpCoverage {
         }
     }
 
-    fn build(bytes: &[u8]) -> Option<Vec<u64>> {
-        let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    fn build(bytes: &[u8], face_index: u32) -> Option<Vec<u64>> {
+        let face = ttf_parser::Face::parse(bytes, face_index).ok()?;
         let mut bits = Vec::new();
         bits.try_reserve_exact(0x1_0000 / 64).ok()?;
         bits.resize(0x1_0000 / 64, 0u64);
+        // `Face::glyph_index` takes the first Unicode subtable that maps a code
+        // point. A subtable maps only code points it lists, so asking each one
+        // about its own code points, earliest subtable first, answers as
+        // `Face::glyph_index` would without searching every subtable per code point.
+        let mut decided = Vec::new();
+        decided.try_reserve_exact(0x1_0000 / 64).ok()?;
+        decided.resize(0x1_0000 / 64, 0u64);
         for subtable in face.tables().cmap?.subtables {
             if !subtable.is_unicode() {
                 continue;
             }
             subtable.codepoints(|codepoint| {
-                // `Face::glyph_index` decides, so the table answers as it would.
-                if codepoint < 0x1_0000
-                    && char::from_u32(codepoint).and_then(|ch| face.glyph_index(ch)).is_some_and(|glyph| glyph.0 != 0)
-                {
-                    bits[codepoint as usize / 64] |= 1 << (codepoint % 64);
+                if codepoint >= 0x1_0000 || char::from_u32(codepoint).is_none() {
+                    return;
+                }
+                let (word, bit) = (codepoint as usize / 64, 1u64 << (codepoint % 64));
+                if decided[word] & bit != 0 {
+                    return;
+                }
+                if let Some(glyph) = subtable.glyph_index(codepoint) {
+                    decided[word] |= bit;
+                    if glyph.0 != 0 {
+                        bits[word] |= bit;
+                    }
                 }
             });
         }
@@ -881,19 +924,19 @@ impl ShaperCache {
     /// plan when one matches. `bytes` must be the bytes of the face that owns
     /// this cache. Another thread shaping with the face at the same time parses
     /// its own.
-    fn shape(&self, bytes: &Arc<[u8]>, text: &str, rtl: bool, script: ScriptSelection,
+    fn shape(&self, bytes: &[u8], face_index: u32, text: &str, rtl: bool, script: ScriptSelection,
         features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
         if self.busy.swap(true, Ordering::Acquire) {
-            return shape_buffer_context(bytes, text, rtl, script, features, context);
+            return shape_buffer_context(bytes, face_index, text, rtl, script, features, context);
         }
         // SAFETY: busy grants exclusive access until it is released below.
         let entries = unsafe { &mut *self.entries.get() };
-        let result = Self::shape_with(entries, bytes, text, rtl, script, features, context);
+        let result = Self::shape_with(entries, bytes, face_index, text, rtl, script, features, context);
         self.busy.store(false, Ordering::Release);
         result
     }
 
-    fn shape_with(entries: &mut Vec<ShaperEntry>, bytes: &Arc<[u8]>, text: &str, rtl: bool, script: ScriptSelection,
+    fn shape_with(entries: &mut Vec<ShaperEntry>, bytes: &[u8], face_index: u32, text: &str, rtl: bool, script: ScriptSelection,
         features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
         let size = context.points_per_em.map(f32::to_bits);
         let variations = context.variations.iter().map(|variation| (variation.tag.0, variation.value.to_bits())).collect::<Vec<_>>();
@@ -902,8 +945,8 @@ impl ShaperCache {
             None => {
                 // SAFETY: the bytes are the owning face's, which drops this
                 // cache before them; the slice outlives every entry.
-                let bytes: &'static [u8] = unsafe { &*Arc::as_ptr(bytes) };
-                let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
+                let bytes: &'static [u8] = unsafe { &*(bytes as *const [u8]) };
+                let mut face = rustybuzz::Face::from_slice(bytes, face_index).ok_or("font cannot be shaped")?;
                 face.set_variations(context.variations);
                 face.set_points_per_em(context.points_per_em);
                 if entries.len() >= MAX_SHAPER_FACES { entries.remove(0); }
@@ -2393,6 +2436,7 @@ impl RasterizerCache {
     fn with_font<R>(
         &self,
         bytes: &[u8],
+        face_index: u32,
         face_glyph_count: u16,
         glyph_id: u16,
         visit: impl Fn(&fontdue::Font)->R,
@@ -2426,7 +2470,7 @@ impl RasterizerCache {
                 }
                 BlockState::Claimed => {
                     let mut claim = Unclaim(self, first_glyph, false);
-                    let subset = fontdue_bytes_for_glyph_range(bytes, first_glyph, glyphs_in_block)?;
+                    let subset = fontdue_bytes_for_glyph_range(bytes, face_index, first_glyph, glyphs_in_block)?;
                     let built = alloc::sync::Arc::new(fontdue::Font::from_bytes(
                         subset,
                         fontdue::FontSettings {
@@ -2522,7 +2566,9 @@ pub struct FontFace {
     id: u64,
     // Declared before `bytes`, so it drops first: its faces borrow them.
     shapers: ShaperCache,
-    bytes: Arc<[u8]>,
+    bytes: FontBytes,
+    // The face's index in a collection; 0 for a single-face file.
+    face_index: u32,
     glyph_count: u16,
     invisible_id: AtomicU64,
     oblique_id: AtomicU64,
@@ -2811,14 +2857,28 @@ impl FontFace {
         } else {
             bytes
         };
-        let face = ttf_parser::Face::parse(&bytes, 0).map_err(|_| "invalid font")?;
+        Self::from_sfnt(FontBytes::Owned(bytes), 0)
+    }
+
+    /// A face read in place from `bytes`, such as a mapped installed font file or
+    /// collection, without copying it.
+    #[cfg(feature = "system-fonts")]
+    pub(crate) fn new_external(bytes: Arc<dyn AsRef<[u8]> + Send + Sync>, face_index: u32, limit: usize) -> Result<Self, &'static str> {
+        if (*bytes).as_ref().len() > limit {
+            return Err("font too large");
+        }
+        Self::from_sfnt(FontBytes::External(bytes), face_index)
+    }
+
+    fn from_sfnt(bytes: FontBytes, face_index: u32) -> Result<Self, &'static str> {
+        let face = ttf_parser::Face::parse(&bytes, face_index).map_err(|_| "invalid font")?;
         let glyph_count = face.number_of_glyphs();
         let units_per_em = face.units_per_em() as f32;
         // Use the maintained table reader rather than a second font codec.
         // The normalized immutable pair is shared by every control using this face.
         let primary_character_widths = {
             use read_fonts::TableProvider;
-            read_fonts::FontRef::new(&bytes).ok().and_then(|font| {
+            read_fonts::FontRef::from_index(&bytes, face_index).ok().and_then(|font| {
                 // Some platform faces (Courier, Menlo on macOS) have no OS/2 table; use the
                 // advance of "0" as the average width, as browsers do.
                 let average = match font.os2() {
@@ -2880,7 +2940,7 @@ impl FontFace {
         let spacing_features = face.tables().gpos.map_or(0, |table| {
             u8::from(table.features.find(ttf_parser::Tag::from_bytes(b"chws")).is_some()) * spacing_trim::FACE_CHWS
         });
-        if rustybuzz::Face::from_slice(&bytes, 0).is_none() {
+        if rustybuzz::Face::from_slice(&bytes, face_index).is_none() {
             return Err("font cannot be shaped");
         }
         let variable_axes: Arc<[VariationAxisInfo]> = face
@@ -2908,6 +2968,7 @@ impl FontFace {
         Ok(Self {
             id,
             bytes,
+            face_index,
             glyph_count,
             invisible_id: AtomicU64::new(0),
             oblique_id: AtomicU64::new(0),
@@ -3050,7 +3111,7 @@ variation_advances: VariationGlyphCache::new(),
         ascent: Option<f32>,
         descent: Option<f32>,
     ) -> Result<Self, &'static str> {
-        Self::new(self.bytes.clone())?.with_metric_overrides(ascent, descent)
+        Self::from_sfnt(self.bytes.clone(), self.face_index)?.with_metric_overrides(ascent, descent)
     }
 
     pub fn id(&self) -> u64 {
@@ -3094,8 +3155,8 @@ variation_advances: VariationGlyphCache::new(),
                 }) && match ch {
                     '0'=>self.metric_glyph_coverage&1!=0,
                     '水'=>self.metric_glyph_coverage&2!=0,
-                    _=>self.bmp_coverage.covers(&self.bytes,ch).unwrap_or_else(||{
-                        let face=cmap.get_or_insert_with(||ttf_parser::Face::parse(&self.bytes,0).ok());
+                    _=>self.bmp_coverage.covers(&self.bytes,self.face_index,ch).unwrap_or_else(||{
+                        let face=cmap.get_or_insert_with(||ttf_parser::Face::parse(&self.bytes,self.face_index).ok());
                         face.as_ref().is_some_and(|face|face.glyph_index(ch).is_some_and(|glyph|glyph.0!=0))
                     }),
                 })
@@ -3263,7 +3324,7 @@ variation_advances: VariationGlyphCache::new(),
         size_scale:f32,cluster_offset:usize,features:&[rustybuzz::Feature],glyphs:&mut Vec<Glyph>,x:&mut f32,
         advances:Option<&mut Vec<RawClusterAdvance>>,context:ShapeContext<'_>) -> Result<(), &'static str> {
         let context = ShapeContext { points_per_em: Some(size), ..context };
-        let shaped = self.shapers.shape(&self.bytes, text, rtl, script, features,context)?;
+        let shaped = self.shapers.shape(&self.bytes, self.face_index, text, rtl, script, features,context)?;
         append_glyphs(
             shaped,
             size / self.units_per_em,
@@ -3460,7 +3521,7 @@ variation_advances: VariationGlyphCache::new(),
             features
         };
         let context = ShapeContext { points_per_em: Some(size), ..context };
-        let shaped = self.shapers.shape(&self.bytes, &transformed, rtl, script, features,context)?;
+        let shaped = self.shapers.shape(&self.bytes, self.face_index, &transformed, rtl, script, features,context)?;
         if glyphs.len().saturating_add(shaped.len()) > MAX_SHAPE_TEXT_BYTES {
             return Err("caps glyph run too large");
         }
@@ -3526,7 +3587,7 @@ variation_advances: VariationGlyphCache::new(),
         let context = ShapeContext { points_per_em: Some(size), ..ShapeContext::language(None) };
         if text.is_ascii() && rtl != Some(true) {
             return visit(
-                self.shapers.shape(&self.bytes, text, false, Script::Latin.into(), features, context)?,
+                self.shapers.shape(&self.bytes, self.face_index, text, false, Script::Latin.into(), features, context)?,
                 0,
             );
         }
@@ -3540,6 +3601,7 @@ variation_advances: VariationGlyphCache::new(),
                     visit(
                         self.shapers.shape(
                             &self.bytes,
+                            self.face_index,
                             &value[item.start..item.end],
                             rtl,
                             item.script,
@@ -3832,7 +3894,7 @@ variation_advances: VariationGlyphCache::new(),
             2 => return false,
             _ => {}
         }
-        let rectilinear = ttf_parser::Face::parse(&self.bytes, 0).is_ok_and(|face| {
+        let rectilinear = ttf_parser::Face::parse(&self.bytes, self.face_index).is_ok_and(|face| {
             ['A', 'O', 'S', 'g'].iter().all(|&character| {
                 let Some(glyph) = face.glyph_index(character) else {
                     return false;
@@ -3868,7 +3930,7 @@ variation_advances: VariationGlyphCache::new(),
     /// Em-relative advance of `character` at a variation instance.
     fn variation_advance_ratio(&self, character: char, coordinates: &Arc<[rustybuzz::Variation]>) -> Option<f32> {
         let key = self.variation_key(coordinates, false).ok()?;
-        let glyph = ttf_parser::Face::parse(&self.bytes, 0).ok()?.glyph_index(character)?;
+        let glyph = ttf_parser::Face::parse(&self.bytes, self.face_index).ok()?.glyph_index(character)?;
         self.advance_with_variations(key, glyph.0, self.units_per_em, coordinates)
             .map(|advance| advance / self.units_per_em)
     }
@@ -3878,7 +3940,7 @@ variation_advances: VariationGlyphCache::new(),
         if let Some(hit) = self.variation_advances.get(cache_key) {
             return Some(hit);
         }
-        let mut face = ttf_parser::Face::parse(&self.bytes, 0).ok()?;
+        let mut face = ttf_parser::Face::parse(&self.bytes, self.face_index).ok()?;
         for variation in variations {
             face.set_variation(variation.tag, variation.value);
         }
@@ -3894,7 +3956,7 @@ variation_advances: VariationGlyphCache::new(),
         if id >= self.glyph_count {
             return Err("glyph id out of range");
         }
-        self.rasterizers.with_font(&self.bytes, self.glyph_count, id, &visit)
+        self.rasterizers.with_font(&self.bytes, self.face_index, self.glyph_count, id, &visit)
     }
 
     pub fn outline(&self, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
@@ -3909,7 +3971,7 @@ variation_advances: VariationGlyphCache::new(),
             commands: Vec::new(),
             overflowed: false,
         };
-        let mut face = ttf_parser::Face::parse(&self.bytes, 0).map_err(|_| "invalid font")?;
+        let mut face = ttf_parser::Face::parse(&self.bytes, self.face_index).map_err(|_| "invalid font")?;
         for variation in variations {
             face.set_variation(variation.tag, variation.value);
         }
@@ -4618,6 +4680,46 @@ pub static TEST_FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans
 mod tests {
     use super::*;
 
+    /// A two-face collection whose faces are both `font`, with its table offsets
+    /// moved past the collection header.
+    #[cfg(feature = "system-fonts")]
+    fn collection_of(font: &[u8]) -> Vec<u8> {
+        const HEADER: usize = 20;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ttcf");
+        bytes.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&(HEADER as u32).to_be_bytes());
+        bytes.extend_from_slice(&(HEADER as u32).to_be_bytes());
+        bytes.extend_from_slice(font);
+        let tables = sfnt::be16(font, 4).unwrap() as usize;
+        for index in 0..tables {
+            let at = HEADER + 12 + index * 16 + 8;
+            let offset = sfnt::be32(&bytes, at).unwrap();
+            sfnt::write_be32(&mut bytes, at, offset + HEADER as u32).unwrap();
+        }
+        bytes
+    }
+
+    #[cfg(feature = "system-fonts")]
+    #[test]
+    fn collection_faces_read_in_place_answer_like_the_standalone_face() {
+        let standalone = FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap();
+        let collection = collection_of(DEFAULT_FONT_BYTES);
+        assert_eq!(sfnt_directory_offset(&collection, 1), Some(20));
+        assert_eq!(sfnt_directory_offset(&collection, 2), None);
+        assert_eq!(sfnt_directory_offset(DEFAULT_FONT_BYTES, 0), Some(0));
+        let external: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(collection);
+        let face = FontFace::new_external(external, 1, MAX_SYSTEM_FONT_BYTES).unwrap();
+        assert_eq!(face.glyph_count, standalone.glyph_count);
+        let (shaped, expected) = (face.shape("Ab 0", 16.0).unwrap(), standalone.shape("Ab 0", 16.0).unwrap());
+        assert_eq!(shaped.glyphs.iter().map(|glyph| glyph.id).collect::<Vec<_>>(), expected.glyphs.iter().map(|glyph| glyph.id).collect::<Vec<_>>());
+        assert_eq!(face.bmp_coverage.covers(&face.bytes, face.face_index, 'A'), Some(true));
+        assert!(face.covers_cluster_with_properties("Ab", None, &[]));
+        let glyph = expected.glyphs[0].id;
+        assert_eq!(face.rasterize(glyph, 16.0).unwrap().alpha, standalone.rasterize(glyph, 16.0).unwrap().alpha);
+    }
+
     #[test]
     fn bmp_coverage_answers_like_the_parsed_cmap() {
         let face = FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap();
@@ -4626,11 +4728,11 @@ mod tests {
         for codepoint in (0..0x3000).chain(0xfff0..0x1_0000) {
             let Some(ch) = char::from_u32(codepoint) else { continue };
             let expected = parsed.glyph_index(ch).is_some_and(|glyph| glyph.0 != 0);
-            assert_eq!(face.bmp_coverage.covers(&face.bytes, ch), Some(expected), "U+{codepoint:04X}");
+            assert_eq!(face.bmp_coverage.covers(&face.bytes, 0, ch), Some(expected), "U+{codepoint:04X}");
             covered += usize::from(expected);
         }
         assert!(covered > 90, "the default face covers ASCII");
-        assert_eq!(face.bmp_coverage.covers(&face.bytes, '\u{1F600}'), None, "astral code points parse the face");
+        assert_eq!(face.bmp_coverage.covers(&face.bytes, 0, '\u{1F600}'), None, "astral code points parse the face");
         assert!(face.covers_cluster_with_properties("Ab", None, &[]));
         assert!(!face.covers_cluster_with_properties("A\u{10FFFD}", None, &[]));
     }
@@ -4647,8 +4749,8 @@ mod tests {
             for size in 0..MAX_SHAPER_FACES+2 {
                 let context=ShapeContext{points_per_em:Some(10.0+size as f32),..ShapeContext::language(Some("en"))};
                 for (text,rtl,features) in [("AVATAR office",false,&[][..]),("AVATAR",false,&kern[..]),("abc",true,&[][..])] {
-                    let fresh=glyphs(shape_buffer_context(&bytes,text,rtl,Script::Latin.into(),features,context).unwrap());
-                    let cached=glyphs(cache.shape(&bytes,text,rtl,Script::Latin.into(),features,context).unwrap());
+                    let fresh=glyphs(shape_buffer_context(&bytes,0,text,rtl,Script::Latin.into(),features,context).unwrap());
+                    let cached=glyphs(cache.shape(&bytes,0,text,rtl,Script::Latin.into(),features,context).unwrap());
                     assert_eq!(cached,fresh,"{text} at {size}");
                 }
             }

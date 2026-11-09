@@ -702,8 +702,10 @@ impl SystemFonts {
     }
 
     fn open(&self, position: usize, entry: &SystemFontEntry) -> Option<SystemFace> {
-        let bytes = read_entry_bytes(entry).ok()?;
-        let mut face = FontFace::new_with_limit(Arc::from(bytes), MAX_SYSTEM_FONT_BYTES).ok()?;
+        let mut face = match map_entry(entry) {
+            Some(face) => face,
+            None => FontFace::new_with_limit(Arc::from(read_entry_bytes(entry).ok()?), MAX_SYSTEM_FONT_BYTES).ok()?,
+        };
         if self.platform == FontPlatform::MacOs && matches!(&*entry.family.to_lowercase(), "times" | "helvetica" | "courier") {
             face = face.with_classic_mac_ascent();
         }
@@ -807,6 +809,45 @@ impl SystemFonts {
         };
         entry.map(|entry| SYSTEM_FACE_BASE + entry as usize)
     }
+}
+
+/// An installed font file mapped read-only. Its pages are file-backed and the OS
+/// loads them as tables are read, so a fallback face costs only the tables it
+/// uses instead of a copy of the whole file (or collection) on first use.
+struct MappedFont(lumen_os::mmap::FileBytes);
+
+// SAFETY: the mapping is private to this value, never resized or remapped, and
+// only read through `as_bytes`; read-only pages may be shared between threads.
+unsafe impl Send for MappedFont {}
+unsafe impl Sync for MappedFont {}
+
+impl AsRef<[u8]> for MappedFont {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// The installed face read in place from a mapping of its file, or `None` where
+/// files cannot be mapped (the caller then reads the face).
+fn map_entry(entry: &SystemFontEntry) -> Option<FontFace> {
+    if entry.file_length > MAX_SYSTEM_FONT_BYTES as u64 {
+        return None;
+    }
+    let mapped @ lumen_os::mmap::FileBytes::Mapped(_) = lumen_os::mmap::map_file_readonly(&entry.path).ok()? else {
+        return None;
+    };
+    let bytes = MappedFont(mapped);
+    let index = if entry.collection { collection_index(bytes.as_ref(), entry.face_offset)? } else { 0 };
+    FontFace::new_external(Arc::new(bytes), index, MAX_SYSTEM_FONT_BYTES).ok()
+}
+
+/// The index of the collection face whose table directory starts at `offset`.
+fn collection_index(bytes: &[u8], offset: u64) -> Option<u32> {
+    if bytes.get(..4) != Some(b"ttcf") {
+        return None;
+    }
+    let count = be32(bytes, 8)?.min(MAX_FACES_PER_FILE as u32);
+    (0..count).find(|&index| be32(bytes, 12 + index as usize * 4).is_some_and(|at| u64::from(at) == offset))
 }
 
 fn read_entry_bytes(entry: &SystemFontEntry) -> io::Result<Vec<u8>> {

@@ -596,7 +596,7 @@ impl ManualFontRegistry {
     }
 }
 
-fn include_font_bytes(usage: &mut FontUsage, bytes: &Arc<[u8]>) -> Result<(), &'static str> {
+fn include_font_bytes(usage: &mut FontUsage, bytes: &[u8]) -> Result<(), &'static str> {
     let pointer = bytes.as_ptr() as *const () as usize;
     if usage.font_allocations.contains(&pointer) {
         return Ok(());
@@ -759,7 +759,8 @@ mod tests {
         registry.add_manual_face(&face).unwrap();
         registry.begin_load(&face).unwrap();
         let decoded = Arc::new(FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap());
-        let decoded_bytes = Arc::downgrade(&decoded.bytes);
+        let crate::FontBytes::Owned(owned) = &decoded.bytes else { panic!("decoded web fonts own their bytes") };
+        let decoded_bytes = Arc::downgrade(owned);
         registry.complete_load(&face, Ok(decoded)).unwrap();
         drop(registry.snapshot().unwrap());
         assert!(decoded_bytes.upgrade().is_some());
