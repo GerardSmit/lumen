@@ -6759,10 +6759,10 @@ impl Value {
                     style.text_align = *v;
                 }
             }
-            Self::TextIndent(v) => style.text_indent = *v,
+            Self::TextIndent(v) => if style.text_indent != *v { style.text_indent = *v },
             Self::TextIndentRaw(_) => unreachable!(),
             Self::LetterSpacing(v) => {
-                style.letter_spacing = *v;
+                if style.letter_spacing != *v { style.letter_spacing = *v; }
                 let suppress = v.is_some_and(|value| value != 0.0);
                 if style.font.disable_optional_ligatures != suppress { style.font.disable_optional_ligatures = suppress; }
             },
@@ -27634,9 +27634,33 @@ fn logical_radius_projection(style: &Style, logical: usize, physical: usize) -> 
     Value::BorderRadiusCorner(physical - 134, Box::new(corner))
 }
 
+/// A cascade candidate's declaration: one from a rule, one built for this
+/// element, or one of a cached `var()` expansion, shared without a copy.
+#[derive(Clone)]
+enum CandidateDeclaration<'a> {
+    Borrowed(&'a Declaration),
+    Owned(Declaration),
+    Shared(Arc<[Declaration]>, usize),
+}
+
+impl core::ops::Deref for CandidateDeclaration<'_> {
+    type Target = Declaration;
+    fn deref(&self) -> &Declaration {
+        match self {
+            Self::Borrowed(declaration) => declaration,
+            Self::Owned(declaration) => declaration,
+            Self::Shared(declarations, index) => &declarations[*index],
+        }
+    }
+}
+
+impl AsRef<Declaration> for CandidateDeclaration<'_> {
+    fn as_ref(&self) -> &Declaration { self }
+}
+
 type RuleCandidate<'a> = (
     Priority,
-    alloc::borrow::Cow<'a, Declaration>,
+    CandidateDeclaration<'a>,
     Option<Arc<str>>,
 );
 
@@ -31295,36 +31319,36 @@ fn compute_for_named_registered_inner(
         }
     }
     if let Some(parent) = parent {
-        style.color = parent.color;
+        if style.color != parent.color { style.color = parent.color; }
         if let Some(colors)=parent.source_colors.as_ref().filter(|colors|colors.len()==1 && colors[0].0==1) {
             style.source_colors=Some(colors.clone());
         }else {style.set_source_color(1,parent.source_color(1));}
-        style.font_size = parent.font_size;
+        if style.font_size != parent.font_size { style.font_size = parent.font_size; }
         if style.font != parent.font {
             style.font = parent.font.clone();
         }
-        style.svg_fill = parent.svg_fill.clone();
-        style.svg_stroke = parent.svg_stroke.clone();
+        if style.svg_fill != parent.svg_fill { style.svg_fill = parent.svg_fill.clone(); }
+        if style.svg_stroke != parent.svg_stroke { style.svg_stroke = parent.svg_stroke.clone(); }
         style.set_source_color(141,parent.source_color(141));
         style.set_source_color(142,parent.source_color(142));
-        style.svg_stroke_width = parent.svg_stroke_width;
-        style.svg_fill_opacity = parent.svg_fill_opacity;
-        style.svg_stroke_opacity = parent.svg_stroke_opacity;
+        if style.svg_stroke_width != parent.svg_stroke_width { style.svg_stroke_width = parent.svg_stroke_width; }
+        if style.svg_fill_opacity != parent.svg_fill_opacity { style.svg_fill_opacity = parent.svg_fill_opacity; }
+        if style.svg_stroke_opacity != parent.svg_stroke_opacity { style.svg_stroke_opacity = parent.svg_stroke_opacity; }
         copy_slot(254,parent,&mut style);
-        style.svg_fill_rule = parent.svg_fill_rule;
-        style.svg_clip_rule = parent.svg_clip_rule;
-        style.line_height = parent.line_height;
+        if style.svg_fill_rule != parent.svg_fill_rule { style.svg_fill_rule = parent.svg_fill_rule; }
+        if style.svg_clip_rule != parent.svg_clip_rule { style.svg_clip_rule = parent.svg_clip_rule; }
+        if style.line_height != parent.line_height { style.line_height = parent.line_height; }
         if style.line_break_counts!=parent.line_break_counts {
             style.line_break_counts=parent.line_break_counts.clone();
         }
-        style.border_spacing = parent.border_spacing;
-        style.quotes = parent.quotes.clone();
-        style.color_scheme = parent.color_scheme.clone();
-        style.list_style_type = parent.list_style_type.clone();
-        style.list_style_position = parent.list_style_position;
-        style.caption_bottom = parent.caption_bottom;
-        style.html_cell_padding_hint = parent.html_cell_padding_hint;
-        style.list_style_image = parent.list_style_image.clone();
+        if style.border_spacing != parent.border_spacing { style.border_spacing = parent.border_spacing; }
+        if style.quotes != parent.quotes { style.quotes = parent.quotes.clone(); }
+        if style.color_scheme != parent.color_scheme { style.color_scheme = parent.color_scheme.clone(); }
+        if style.list_style_type != parent.list_style_type { style.list_style_type = parent.list_style_type.clone(); }
+        if style.list_style_position != parent.list_style_position { style.list_style_position = parent.list_style_position; }
+        if style.caption_bottom != parent.caption_bottom { style.caption_bottom = parent.caption_bottom; }
+        if style.html_cell_padding_hint != parent.html_cell_padding_hint { style.html_cell_padding_hint = parent.html_cell_padding_hint; }
+        if style.list_style_image != parent.list_style_image { style.list_style_image = parent.list_style_image.clone(); }
         if style.writing_mode != parent.writing_mode {
             style.writing_mode = parent.writing_mode;
         }
@@ -31334,11 +31358,11 @@ fn compute_for_named_registered_inner(
         if style.visibility_visible != parent.visibility_visible {
             style.visibility_visible = parent.visibility_visible;
         }
-        style.visibility_collapsed = parent.visibility_collapsed;
+        if style.visibility_collapsed != parent.visibility_collapsed { style.visibility_collapsed = parent.visibility_collapsed; }
         if style.pointer_events_auto != parent.pointer_events_auto {
             style.pointer_events_auto = parent.pointer_events_auto;
         }
-        style.user_select = parent.user_select;
+        if style.user_select != parent.user_select { style.user_select = parent.user_select; }
         extra_props::inherit(parent,&mut style);
         if style.empty_cells_hide != parent.empty_cells_hide {
             style.empty_cells_hide = parent.empty_cells_hide;
@@ -31352,7 +31376,7 @@ fn compute_for_named_registered_inner(
         Value::TextTransform(parent.text_transform).apply(&mut style);
         Value::TextAlign(parent.text_align).apply(&mut style);
         Value::TextIndent(parent.text_indent).apply(&mut style);
-        style.text_indent_mode = parent.text_indent_mode;
+        if style.text_indent_mode != parent.text_indent_mode { style.text_indent_mode = parent.text_indent_mode; }
         Value::LetterSpacing(parent.letter_spacing).apply(&mut style);
         Value::WordSpacing(parent.word_spacing).apply(&mut style);
         Value::Direction(parent.direction).apply(&mut style);
@@ -31869,14 +31893,14 @@ fn compute_for_named_registered_inner(
         // against author !important. Only a direct symbol instance root
         // has the opposite mandatory UA rule (SVG2 5.4.2).
         candidates.push(((CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration { value: Value::Display(
+            CandidateDeclaration::Owned(Declaration { value: Value::Display(
                 if svg_instance_root && matches!(kind,NodeKind::Element{name,..} if crate::svg::local_name(name)=="symbol") { Display::Inline } else { Display::None }), important: true }), None));
     }
     // Presentational hints participate at author origin with zero specificity.
     // Keep them out of the UA baseline so authored `revert` returns to the
     // rendering defaults instead of reviving an HTML attribute hint.
     let mut hint = |value| { if style_seed.is_none() { candidates.push(((CascadeOrigin::Author, [0; 8], (0, 0, 0, 0), (0, 0)),
-        alloc::borrow::Cow::Owned(Declaration { value, important: false }), index.document_base_url.clone())); } };
+        CandidateDeclaration::Owned(Declaration { value, important: false }), index.document_base_url.clone())); } };
     if let Some(spacing) = html_spacing_hint { hint(Value::BorderSpacing(spacing)); }
     if let Some(padding) = html_padding_hint {
         for side in 0..4 { hint(Value::PaddingSide(side, padding)); }
@@ -31904,7 +31928,7 @@ fn compute_for_named_registered_inner(
     if pseudo_target.is_none() { html_presentational_hints(kind, context, image_dimensions, &mut hint); }
     if auto_image_containment {
         candidates.push(((CascadeOrigin::UaImportant,[usize::MAX;8],(0,1,1,0),(0,usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration{value:Value::Containment{size:true,inline_size:false,layout:false,style:false,paint:false},important:true}),None));
+            CandidateDeclaration::Owned(Declaration{value:Value::Containment{size:true,inline_size:false,layout:false,style:false,paint:false},important:true}),None));
     }
     if pseudo_target.is_none() && context.is_some_and(|(document, node)| {
         document.is_html_document() && html_rendering_tag(document, node) == Some("form")
@@ -31912,7 +31936,7 @@ fn compute_for_named_registered_inner(
                 matches!(html_rendering_tag(document, parent), Some("table" | "thead" | "tbody" | "tfoot" | "tr")))
     }) {
         candidates.push(((CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration { value: Value::Display(Display::None), important: true }), None));
+            CandidateDeclaration::Owned(Declaration { value: Value::Display(Display::None), important: true }), None));
     }
     if pseudo_target.is_none()
         && context.is_some_and(|(document, _)| {
@@ -31934,7 +31958,7 @@ fn compute_for_named_registered_inner(
         let priority = (CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX));
         candidates.push((
             priority,
-            alloc::borrow::Cow::Owned(Declaration {
+            CandidateDeclaration::Owned(Declaration {
                 value: Value::Display(Display::None),
                 important: true,
             }),
@@ -31952,7 +31976,7 @@ fn compute_for_named_registered_inner(
             let tag = crate::svg::local_name(name);
             if let Some(matrix)=crate::svg::presentation_transform(tag,attributes,context) {
                 candidates.push(((CascadeOrigin::Author,[0;8],(0,0,0,0),(0,0)),
-                    alloc::borrow::Cow::Owned(Declaration{value:Value::Transforms(Some(Arc::from([Transform::Matrix(matrix)]))),important:false}),index.document_base_url.clone()));
+                    CandidateDeclaration::Owned(Declaration{value:Value::Transforms(Some(Arc::from([Transform::Matrix(matrix)]))),important:false}),index.document_base_url.clone()));
             }
             // SVG presentation attributes participate at author origin with zero
             // specificity, below every stylesheet declaration.
@@ -31982,7 +32006,7 @@ fn compute_for_named_registered_inner(
                     declaration.important = false;
                     candidates.push((
                         (CascadeOrigin::Author, [0; 8], (0, 0, 0, 0), (0, 0)),
-                        alloc::borrow::Cow::Owned(declaration),
+                        CandidateDeclaration::Owned(declaration),
                         index.document_base_url.clone(),
                     ));
                 }
@@ -32005,7 +32029,7 @@ fn compute_for_named_registered_inner(
                 (0, ids, classes, tags),
                 (proximity, order + 1),
             );
-            candidates.push((priority, alloc::borrow::Cow::Borrowed(declaration), source_url.clone()));
+            candidates.push((priority, CandidateDeclaration::Borrowed(declaration), source_url.clone()));
         }
     }
     if pseudo_target.is_none() && style_seed.is_none() {
@@ -32043,7 +32067,7 @@ fn compute_for_named_registered_inner(
                     );
                     candidates.push((
                         priority,
-                        alloc::borrow::Cow::Owned(declaration),
+                        CandidateDeclaration::Owned(declaration),
                         index.document_base_url.clone(),
                     ));
                 }
@@ -32051,7 +32075,7 @@ fn compute_for_named_registered_inner(
         }
     }
     candidates.extend(index.snapshot_declarations.iter().map(|snapshot|
-        (snapshot.priority, alloc::borrow::Cow::Borrowed(&snapshot.declaration), snapshot.source_url.clone())));
+        (snapshot.priority, CandidateDeclaration::Borrowed(&snapshot.declaration), snapshot.source_url.clone())));
     let mut snapshot_targets = Vec::new();
     if !index.snapshot_declarations.is_empty() {
         snapshot_targets.try_reserve_exact(index.snapshot_declarations.len()).map_err(|_| CssError { offset: 0, message: "CSS snapshot projection exceeds limit" })?;
@@ -32073,11 +32097,11 @@ fn compute_for_named_registered_inner(
             for declaration in &effect.declarations {
                 if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, true) { continue; }
                 candidates.push(((origin, [usize::MAX; 8], (0, 0, 0, 0), (0, usize::MAX)),
-                    alloc::borrow::Cow::Borrowed(declaration), index.document_base_url.clone()));
+                    CandidateDeclaration::Borrowed(declaration), index.document_base_url.clone()));
             }
         }
     }
-    candidates.sort_by_key(|(priority, _, _)| *priority);
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
     let appearance_base = candidates.iter().rev().find_map(|(_, declaration, _)| match &declaration.value {
         // `base-select` opts only drop-down boxes out of the native look.
         Value::Appearance(value) => Some(*value == Appearance::Base || *value == Appearance::BaseSelect && form_ua_select),
@@ -32093,7 +32117,7 @@ fn compute_for_named_registered_inner(
         let owner = owner_values::Owner { element: context, property: name };
         let substituted: Arc<str> = owner_values::substitute(raw, &owner).map_or_else(|| Arc::from("unset"), |text| Arc::from(text.trim()));
         let replacement = Declaration { value: Value::Custom(name.clone(), substituted), important: declaration.important };
-        *declaration = alloc::borrow::Cow::Owned(replacement);
+        *declaration = CandidateDeclaration::Owned(replacement);
     }
     let sibling_dependent=candidates.iter().any(|(_,declaration,_)|{
         if value_depends_on_sibling_position(&declaration.value){return true;}
@@ -32171,7 +32195,7 @@ fn compute_for_named_registered_inner(
                             expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
                             expanded_originals.push(original.clone());
                         }
-                        expanded.push((priority, alloc::borrow::Cow::Owned(value), source_url.clone()));
+                        expanded.push((priority, CandidateDeclaration::Owned(value), source_url.clone()));
                     }
                 }};
             }
@@ -32201,8 +32225,14 @@ fn compute_for_named_registered_inner(
                             });
                         }
                     } else {
-                        for parsed in parsed.iter().filter(|declaration| target_slots.contains(&declaration.value.slot())) {
-                            emit!(parsed.clone());
+                        for (position, parsed_declaration) in parsed.iter().enumerate().filter(|(_, declaration)| target_slots.contains(&declaration.value.slot())) {
+                            if !target.is_some_and(|target| parsed_declaration.value.slot() != target) {
+                                if track_originals {
+                                    expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
+                                    expanded_originals.push(original.clone());
+                                }
+                                expanded.push((priority, CandidateDeclaration::Shared(parsed.clone(), position), source_url.clone()));
+                            }
                         }
                     }
                 }
@@ -32219,8 +32249,14 @@ fn compute_for_named_registered_inner(
                             });
                         }
                     } else {
-                        for parsed in parsed.iter() {
-                            emit!(parsed.clone());
+                        for (position, parsed_declaration) in parsed.iter().enumerate() {
+                            if !target.is_some_and(|target| parsed_declaration.value.slot() != target) {
+                                if track_originals {
+                                    expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
+                                    expanded_originals.push(original.clone());
+                                }
+                                expanded.push((priority, CandidateDeclaration::Shared(parsed.clone(), position), source_url.clone()));
+                            }
                         }
                     }
                 }
@@ -32642,7 +32678,8 @@ fn compute_for_named_registered_inner(
                     let origin=if *color_slot==1 {parent.map_or_else(||SourceColor{value:color_values::from_rgba(style.color),color_function:false,expression:None},|parent|parent.resolved_source_color(1,parent.color))}
                         else {style.resolved_source_color(1,style.color)};
                     let current=origin.value;
-                    let (sibling_index,sibling_count)=context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1));
+                    // Walking the siblings is O(siblings); only `sibling-*()` reads it.
+                    let (sibling_index,sibling_count)=if typed_numeric::may_name_sibling_function(raw) {context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1))} else {(1,1)};
                     let length=length_context!(raw);
                     let query=ContainerUnitContext::no_container(index.environment);
                     let selected=color_scheme::select_branches(raw,length.viewport.color_schemes.page().scheme).ok_or(CssError{offset:0,message:"invalid light-dark color branches"})?;
@@ -32708,7 +32745,7 @@ fn compute_for_named_registered_inner(
                     Value::Animation(166,raw) if transition_controls::needs_computation(raw)=>Some(raw.to_string()),_=>None,
                 } {
                     if transition_controls::timing_dependencies(&raw).2 {style.sibling_position_dependent=true;}
-                    let (sibling_index,sibling_count)=context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1));
+                    let (sibling_index,sibling_count)=if typed_numeric::may_name_sibling_function(&raw) {context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1))} else {(1,1)};
                     let raw=transition_controls::substitute_sibling_timings(&raw,sibling_index,sibling_count).unwrap_or(raw);
                     let (uses_font,uses_container,_)=transition_controls::timing_dependencies(&raw);
                     let pending_font=uses_font && style.font_query_context_pending();
@@ -32816,11 +32853,14 @@ fn compute_for_named_registered_inner(
                             else { resolved_length_context.expect("font and line-height phases completed") };
                         LengthContext { percent, ..base }
                     } else { declaration_length_context(metric_text, &style, parent, root, slot, index.environment, percent) };
-                    let uses_font = if slot==233 {image_numeric_dependencies(raw).0}else if slot==166 {transition_controls::timing_dependencies(raw).0}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,font_relative_unit)}else{components(raw).is_some_and(|values|values.iter().any(|raw|typed_numeric::parse_numeric_expression(raw).is_some_and(|expression|expression.contains_unit(font_relative_unit))))};
-                    let uses_line = slot == 233 && animation_controls::contains_unit(raw, |unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)) || typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(|unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)));
+                    // Parsing the value for its units is needed only while a font
+                    // query context is pending, which is rare.
+                    let uses_font = || if slot==233 {image_numeric_dependencies(raw).0}else if slot==166 {transition_controls::timing_dependencies(raw).0}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,font_relative_unit)}else{components(raw).is_some_and(|values|values.iter().any(|raw|typed_numeric::parse_numeric_expression(raw).is_some_and(|expression|expression.contains_unit(font_relative_unit))))};
+                    let uses_line = || slot == 233 && animation_controls::contains_unit(raw, |unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)) || typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(|unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)));
                     let parent_font_input = font_pass || slot == 140;
-                    let pending_current = !parent_font_input && uses_font && (style.font_query_context_pending()
-                        || (slot != 13 && uses_line && style.relative_expressions.iter().any(|expression| expression.slot == 13 && expression.query_dependent)));
+                    let pending_current = !parent_font_input && (style.font_query_context_pending()
+                        || (slot != 13 && style.relative_expressions.iter().any(|expression| expression.slot == 13 && expression.query_dependent) && uses_line()))
+                        && uses_font();
                     let pending_parent = parent_font_input && parent.is_some_and(Style::font_query_context_pending)
                         && typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(font_relative_unit));
                     let uses_container = if slot==233 {image_numeric_dependencies(raw).1}else if slot==166 {transition_controls::timing_dependencies(raw).1}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,container_unit)}else if slot == 26 {
