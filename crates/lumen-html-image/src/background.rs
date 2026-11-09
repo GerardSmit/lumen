@@ -436,48 +436,58 @@ const TRANSPARENT: Rgba = Rgba { r: 0, g: 0, b: 0, a: 0 };
 
 fn sample_image(image: &ImageData, x: f32, y: f32) -> Rgba {
     if !image.is_valid() {
-        return Rgba {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0,
-        };
+        return TRANSPARENT;
     }
-    let (x, y) = (x * image.width as f32 - 0.5, y * image.height as f32 - 0.5);
+    // Offsets within 1/1024 of a texel centre snap to it: the colour error is
+    // below a quarter of one 8-bit step. An image drawn at its natural size
+    // then copies texels instead of blending four of them for every pixel.
+    const SNAP: f32 = 1.0 / 1024.0;
+    let snap = |t: f32, i: f32| if t < SNAP { (0.0, i) } else if t > 1.0 - SNAP { (0.0, i + 1.0) } else { (t, i) };
+    let (width, height) = (image.width as f32, image.height as f32);
+    let (x, y) = (x * width - 0.5, y * height - 0.5);
     let (ix, iy) = (x.floor(), y.floor());
-    let (tx, ty) = (x - ix, y - iy);
-    let mut sum = [0.0; 4];
-    for (dx, dy, weight) in [
-        (0.0, 0.0, (1.0 - tx) * (1.0 - ty)),
-        (1.0, 0.0, tx * (1.0 - ty)),
-        (0.0, 1.0, (1.0 - tx) * ty),
-        (1.0, 1.0, tx * ty),
+    let (tx, ix) = snap(x - ix, ix);
+    let (ty, iy) = snap(y - iy, iy);
+    let column = |i: f32| i.clamp(0.0, width - 1.0) as usize;
+    let row = |i: f32| i.clamp(0.0, height - 1.0) as usize * image.width as usize;
+    let texel = |row: usize, column: usize| {
+        let offset = (row + column) * 4;
+        &image.pixels[offset..offset + 4]
+    };
+    if tx == 0.0 && ty == 0.0 {
+        let pixel = texel(row(iy), column(ix));
+        if pixel[3] == 0 {
+            return TRANSPARENT;
+        }
+        return Rgba { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
+    }
+    let (left, right) = (column(ix), column(ix + 1.0));
+    let (top, bottom) = (row(iy), row(iy + 1.0));
+    let mut sum = [0.0f32; 4];
+    for (pixel, weight) in [
+        (texel(top, left), (1.0 - tx) * (1.0 - ty)),
+        (texel(top, right), tx * (1.0 - ty)),
+        (texel(bottom, left), (1.0 - tx) * ty),
+        (texel(bottom, right), tx * ty),
     ] {
-        let (xx, yy) = (
-            (ix + dx).clamp(0.0, image.width as f32 - 1.0) as usize,
-            (iy + dy).clamp(0.0, image.height as f32 - 1.0) as usize,
-        );
-        let offset = (yy * image.width as usize + xx) * 4;
-        let pixel = &image.pixels[offset..offset + 4];
-        let alpha = pixel[3] as f32;
-        sum[3] += alpha * weight;
+        let alpha = pixel[3] as f32 * weight;
+        sum[3] += alpha;
         for channel in 0..3 {
-            sum[channel] += pixel[channel] as f32 * alpha * weight;
+            sum[channel] += pixel[channel] as f32 * alpha;
         }
     }
     if sum[3] == 0.0 {
-        return Rgba {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0,
-        };
+        return TRANSPARENT;
     }
+    // Every term is non-negative, so adding a half and truncating rounds the
+    // same way as `f32::round`, without a libm call per channel.
+    let unpremultiply = 1.0 / sum[3];
+    let round = |value: f32| (value + 0.5) as u8;
     Rgba {
-        r: (sum[0] / sum[3]).round() as u8,
-        g: (sum[1] / sum[3]).round() as u8,
-        b: (sum[2] / sum[3]).round() as u8,
-        a: sum[3].round() as u8,
+        r: round(sum[0] * unpremultiply),
+        g: round(sum[1] * unpremultiply),
+        b: round(sum[2] * unpremultiply),
+        a: round(sum[3]),
     }
 }
 
