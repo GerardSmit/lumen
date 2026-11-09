@@ -2928,6 +2928,37 @@ impl CssStyleSheetText {
     }
 
     pub fn css_rules(&self) -> Result<Vec<CssRuleText>, css::CssError> {
+        self.shared_rules().map(|rules| (*rules).clone())
+    }
+
+    /// The parsed rule list, shared between readers. Parsing is a pure function
+    /// of this value, so a few recent sheets keep their parse: script loops that
+    /// read `cssRules.length` and `cssRules[i]` would otherwise reparse the whole
+    /// stylesheet for every access.
+    fn shared_rules(&self) -> Result<Rc<Vec<CssRuleText>>, css::CssError> {
+        const ENTRIES: usize = 4;
+        thread_local! {
+            static PARSED: RefCell<Vec<(CssStyleSheetText, Rc<Vec<CssRuleText>>)>> = const { RefCell::new(Vec::new()) };
+        }
+        let hit = PARSED.with(|parsed| {
+            let mut parsed = parsed.borrow_mut();
+            let position = parsed.iter().position(|(sheet, _)| sheet == self)?;
+            let entry = parsed.remove(position);
+            let rules = entry.1.clone();
+            parsed.push(entry);
+            Some(rules)
+        });
+        if let Some(rules) = hit { return Ok(rules); }
+        let rules = Rc::new(self.parse_rules()?);
+        PARSED.with(|parsed| {
+            let mut parsed = parsed.borrow_mut();
+            if parsed.len() >= ENTRIES { parsed.remove(0); }
+            parsed.push((self.clone(), rules.clone()));
+        });
+        Ok(rules)
+    }
+
+    fn parse_rules(&self) -> Result<Vec<CssRuleText>, css::CssError> {
         let mut rules = if self.singleton_declarations {
             let style = CssDeclaration::parse(&self.text);
             vec![CssRuleText { css_text: style.css_text().to_owned(), selector_text: None, style, nested: Vec::new(), nested_declarations: true, font_face: false, position_try: false, function_body: false, keyframes: None, page_selector: None, margin_box: None, header: RuleHeader::Other }]
@@ -2955,10 +2986,13 @@ impl CssStyleSheetText {
     }
 
     fn rule_list(&self, parent_path: &[usize]) -> Result<Vec<CssRuleText>, css::CssError> {
-        if parent_path.is_empty() {
-            return self.css_rules();
-        }
-        let mut rules = self.css_rules()?;
+        self.with_rule_list(parent_path, |rules| rules.to_vec())
+    }
+
+    /// Reads the rule list at `parent_path` without copying the parsed sheet.
+    fn with_rule_list<R>(&self, parent_path: &[usize], read: impl FnOnce(&[CssRuleText]) -> R) -> Result<R, css::CssError> {
+        let shared = self.shared_rules()?;
+        let mut rules: &[CssRuleText] = &shared;
         for index in parent_path {
             let Some(parent) = rules.get(*index) else {
                 return Err(css::CssError {
@@ -2966,9 +3000,9 @@ impl CssStyleSheetText {
                     message: "CSS rule index out of range",
                 });
             };
-            rules = parent.nested.clone();
+            rules = &parent.nested;
         }
-        Ok(rules)
+        Ok(read(rules))
     }
 
     fn rule_at_path(&self, path: &[usize]) -> Result<CssRuleText, css::CssError> {
@@ -2978,8 +3012,7 @@ impl CssStyleSheetText {
                 message: "CSS rule index out of range",
             });
         };
-        let rules = self.rule_list(parents)?;
-        rules.get(index).cloned().ok_or(css::CssError {
+        self.with_rule_list(parents, |rules| rules.get(index).cloned())?.ok_or(css::CssError {
             offset: index,
             message: "CSS rule index out of range",
         })
@@ -6493,17 +6526,11 @@ impl DomCssRuleList {
                 .rules
                 .len());
         }
-        let rules = sheet
-            .rule_list(&location.indices.clone())
-            .map_err(css_error)?;
         let positions = positions_for_rule_list(&location.source, &self.rule_path);
-        let position_text = if self.rule_path.is_empty() {
-            sheet.css_text().to_owned()
-        } else {
-            rules_text(&rules)
-        };
-        if self.rule_path.is_empty() { positions.synchronize(&position_text)?; } else { positions.synchronize_rules(&rules)?; }
-        Ok(rules.len())
+        sheet.with_rule_list(&location.indices, |rules| {
+            if self.rule_path.is_empty() { positions.synchronize(sheet.css_text())?; } else { positions.synchronize_rules(rules)?; }
+            Ok(rules.len())
+        }).map_err(css_error)?
     }
 
     #[proto(getitem)]
@@ -6543,19 +6570,15 @@ impl DomCssRuleList {
             *position.wrapper.borrow_mut() = ctx.weak_value(&wrapper);
             return Ok(wrapper);
         }
-        let rules = sheet
-            .rule_list(&location.indices.clone())
-            .map_err(css_error)?;
-        let Some(rule) = rules.get(index) else {
+        let positions = positions_for_rule_list(&location.source, &self.rule_path);
+        let rule = sheet.with_rule_list(&location.indices, |rules| -> OpResult<Option<CssRuleText>> {
+            let Some(rule) = rules.get(index) else { return Ok(None); };
+            if self.rule_path.is_empty() { positions.synchronize(sheet.css_text())?; } else { positions.synchronize_rules(rules)?; }
+            Ok(Some(rule.clone()))
+        }).map_err(css_error)??;
+        let Some(rule) = rule.as_ref() else {
             return Ok(Value::Undefined);
         };
-        let positions = positions_for_rule_list(&location.source, &self.rule_path);
-        let position_text = if self.rule_path.is_empty() {
-            sheet.css_text().to_owned()
-        } else {
-            rules_text(&rules)
-        };
-        if self.rule_path.is_empty() { positions.synchronize(&position_text)?; } else { positions.synchronize_rules(&rules)?; }
         let position = positions.at(index);
         if let Some(wrapper) = position
             .wrapper
