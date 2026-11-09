@@ -23818,6 +23818,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             natural: (f32, f32),
             minimum: (f32, f32),
             measured: bool,
+            /// Measured only as a block size at its column width, after column sizing.
+            block_only: bool,
             block_at_column: Option<(f32, f32)>,
             stretched_natural: Option<f32>,
             lane_position: f32,
@@ -24139,6 +24141,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         natural: (0.0, 0.0),
                         minimum: (0.0, 0.0),
                         measured: false,
+                        block_only: false,
                         block_at_column: None,
                         stretched_natural: None,
                         lane_position: 0.0,
@@ -24238,6 +24241,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 natural: (0.0, 0.0),
                 minimum: (0.0, 0.0),
                 measured: false,
+                block_only: false,
                 block_at_column: None,
                 stretched_natural: None,
                 lane_position: 0.0,
@@ -25574,7 +25578,23 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let baseline_aligned = item.style.self_alignment(style, true).is_baseline()
                 || item.style.self_alignment(style, false).is_baseline()
                 || item.style.content_alignment(false).is_baseline();
-            if columns_needed || rows_needed || baseline_aligned || item.anonymous_text.is_some() {
+            // An item that only sizes auto rows and fills its column needs no
+            // inline contributions: its row contribution is its block size at
+            // the column width, measured once the columns are sized.
+            let block_only = rows_needed && !columns_needed && !baseline_aligned
+                && item.anonymous_text.is_none() && item.generated.is_none()
+                && !axes.vertical && !style.grid_lanes && definite_height.is_none()
+                && !item.style.grid_rows_subgrid && !item.style.grid_columns_subgrid
+                && item.style.width.is_none() && item.style.width_intrinsic.is_none()
+                && item.style.height.is_none() && item.style.height_intrinsic.is_none()
+                && item.style.writing_mode == style.writing_mode
+                && item.style.self_alignment(style, true).alignment == AlignItems::Stretch
+                && item.style.self_alignment(style, false).alignment == AlignItems::Stretch
+                && !axes.automatic_margin(&item.style, true) && !axes.automatic_margin(&item.style, false)
+                && row_definitions[item.row..item.row + item.rows].iter().all(|track| matches!(track, GridTrack::Auto));
+            if block_only {
+                item.block_only = true;
+            } else if columns_needed || rows_needed || baseline_aligned || item.anonymous_text.is_some() {
                 measure_item(self, item)?;
             }
         }
@@ -25630,6 +25650,23 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         // Grid section 12.1); the measured ones are at the max-content width.
         for item in &mut items {
             item.block_at_column = None;
+            if item.block_only && !item.measured {
+                let cw = widths[item.col..item.col + item.cols].iter().sum::<f32>()
+                    + column_gap * (item.cols - 1) as f32;
+                let block = self.column_flex_item_height(
+                    item.node,
+                    &item.style,
+                    style,
+                    cw,
+                    (cw - box_edges(&item.style, true)).max(0.0),
+                    depth + 1,
+                )?;
+                item.natural = (cw, block);
+                item.minimum = (cw, block);
+                item.measured = true;
+                item.block_at_column = Some((cw, block));
+                continue;
+            }
             if !item.measured
                 || axes.vertical
                 || item.generated.is_some()
@@ -57062,7 +57099,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[derive(Default)]
-    struct RecordingText(core::cell::RefCell<Vec<String>>);
+    pub(super) struct RecordingText(core::cell::RefCell<Vec<String>>);
 
     fn native_button_fills_and_strokes(item_style: &str) -> Vec<String> {
         let html = alloc::format!(
@@ -64706,5 +64743,35 @@ mod type_sizes {
             "retained slots: IntrinsicSizes holds one {} B IntrinsicSlot per measured (node*2) slot plus one {} B shared Style per way",
             size_of::<IntrinsicSlot>(), size_of::<Style>()
         );
+    }
+}
+
+#[test]
+fn auto_rows_over_definite_columns_size_to_each_item_at_its_column_width() {
+    let content = [
+        "a long run of words that wraps several times inside a narrow column",
+        "short",
+        "<div style='padding:7px'>nested block with a few more words in it</div>",
+    ];
+    let rect_of = |markup: &str, id: &str| {
+        let document = crate::html::parse(markup, 256).unwrap();
+        let node = crate::selector::get_element_by_id(&document, document.root(), id).unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        display_list_with_styles(&document, 800, 600, &tests::RecordingText::default(), &rules, None, Some(&mut geometry), &[]).unwrap();
+        geometry.hits.iter().find(|hit| hit.node == node).unwrap().rect
+    };
+    for (columns, widths) in [("100px 1fr 150px", [100.0, 350.0, 150.0]), ("1fr 2fr 1fr", [150.0, 300.0, 150.0])] {
+        let alone: Vec<f32> = content.iter().zip(widths).map(|(text, width)| {
+            rect_of(&alloc::format!("<style>body{{margin:0}}</style><div id=x style='width:{width}px;border:2px solid'>{text}</div>"), "x").height
+        }).collect();
+        let row = alone.iter().copied().fold(0.0f32, f32::max);
+        let items: String = content.iter().enumerate()
+            .map(|(i, text)| alloc::format!("<div id=i{i} style='border:2px solid'>{text}</div>")).collect();
+        let markup = alloc::format!("<style>body{{margin:0}}</style><div style='display:grid;width:600px;grid-template-columns:{columns}'>{items}</div>");
+        for (i, width) in widths.iter().enumerate() {
+            let rect = rect_of(&markup, &alloc::format!("i{i}"));
+            assert_eq!((rect.width, rect.height), (*width, row), "{columns} item {i}, alone {alone:?}");
+        }
     }
 }

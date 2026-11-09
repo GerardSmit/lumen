@@ -1335,7 +1335,9 @@ fn grid_with_definite_fixed_and_zero_minimum_tracks_measures_no_items() {
     let fixed = measured("400px 100px", "60px");
     let auto_rows = measured("400px 100px", "auto");
     assert!(content_based >= 120, "a content-minimum track measured {content_based}");
-    assert!(auto_rows >= 120, "an auto row measured {auto_rows}");
+    // An auto row over fixed columns needs only the items' block sizes at the
+    // column widths, which are layouts, not intrinsic measurements.
+    assert!(auto_rows < 12, "an auto row measured {auto_rows}");
     assert!(zero_minimum < 12, "minmax(0,1fr) measured {zero_minimum} boxes");
     assert!(fixed < 12, "fixed tracks measured {fixed} boxes");
 }
