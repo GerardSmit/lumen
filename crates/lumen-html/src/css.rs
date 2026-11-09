@@ -9920,7 +9920,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
     /// Whether `::before`/`::after` (or the marker of one) of the element can
     /// exist. False only when no rule can match it and nothing else (a quote
     /// element, an animation effect, a transition snapshot) supplies content.
-    fn generated_pseudo_may_exist(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
+    pub(crate) fn generated_pseudo_may_exist(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
         if !matches!(pseudo, PseudoElement::Before | PseudoElement::After | PseudoElement::BeforeMarker | PseudoElement::AfterMarker) {
             return true;
         }

@@ -4692,7 +4692,11 @@ impl RenderSession {
         let font_bits=held_fonts|epoch_fonts;
         let epoch=&TransitionInputEpoch{font_generation:previous.epoch.font_generation,..*epoch};
         if held.version!=previous.epoch.document_version {causes[2]+=1; return None;}
-        if held.had_effects!=basis.had_effects || basis.had_effects && self.snapshot_effects_unbounded {causes[3]+=1; return None;}
+        // Effects that appear or disappear between the snapshots are noted
+        // per element like any other changed sample (the embedder compares
+        // the samples each snapshot was taken against), so only an unbounded
+        // set of changed samples forces a full capture.
+        if (held.had_effects || basis.had_effects) && self.snapshot_effects_unbounded {causes[3]+=1; return None;}
         if !(previous.epoch.differs_only_in_document(epoch)
             || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {
             let old=&previous.epoch;
@@ -4970,6 +4974,10 @@ impl RenderSession {
                             .is_some_and(|parent| parent.style.display != css::Display::None && parent.style.is_list_item());
                         if !requested && !origin_present {continue;}
                         if !requested && !rules.has_transition_pseudo_rules(pseudo) && !(pseudo.is_marker() && pseudo_origin.is_list_item()) && !(quote && !pseudo.is_marker()) {continue;}
+                        // A `::before`/`::after` no generated-content rule can reach has no
+                        // box, so it is never recorded; layout's gate says so without a cascade.
+                        if !requested && matches!(pseudo,css::PseudoElement::Before|css::PseudoElement::After)
+                            && !rules.generated_pseudo_may_exist(&self.document,node,pseudo) {continue;}
                         let (mut generated,mut eligible)=rules.compute_transition_snapshot_cached(&self.document,node,Some(pseudo_origin),Some(pseudo),text,
                             &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?;
                         if generated.has_query_container_dependencies() || generated.has_inherited_query_container_dependencies() {
