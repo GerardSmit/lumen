@@ -1035,6 +1035,11 @@ pub struct RenderSession {
     /// A font generation `invalidate_font_families` already invalidated
     /// for; the render that first sees it adopts it without dropping more.
     handled_font_generation: Option<u64>,
+    /// Font generation steps `invalidate_font_families` handled, oldest
+    /// first: from, to, and the changed families whose metrics a style may
+    /// have read. A transition snapshot taken before them stays valid for the
+    /// elements none of those families reach. Any other font change clears it.
+    font_steps: Vec<(u64, u64, u64)>,
     /// The font families whose metrics this document's styles may have read,
     /// shared by every style index it builds (`StyleIndex::font_metric_sink`).
     font_metric_families: Arc<core::sync::atomic::AtomicU64>,
@@ -1630,6 +1635,7 @@ impl RenderSession {
             frame_id: 0,
             font_generation: 0,
             handled_font_generation: None,
+            font_steps: Vec::new(),
             font_metric_families: Arc::default(),
             validity_generation: 0,
             interaction_generation,
@@ -4652,10 +4658,24 @@ impl RenderSession {
     /// the journal cannot bound the change.
     fn snapshot_extension<'a>(&mut self,previous:&'a Arc<TransitionSnapshot>,epoch:&TransitionInputEpoch,basis:SnapshotBasis)->Option<SnapshotBase<'a>> {
         let held=self.snapshot_basis?;
-        if held.version!=previous.epoch.document_version || held.text_generation!=basis.text_generation
+        // A handled font load changes the styles only of the elements whose
+        // own or root font is one of its families, when a style read their
+        // metrics; those and what they reach are styled again.
+        let font_bits=self.font_change_between(held.text_generation,basis.text_generation)?
+            | self.font_change_between(Some(previous.epoch.font_generation),Some(epoch.font_generation))?;
+        let epoch=&TransitionInputEpoch{font_generation:previous.epoch.font_generation,..*epoch};
+        if held.version!=previous.epoch.document_version
             || held.had_effects!=basis.had_effects || basis.had_effects && self.snapshot_effects_unbounded
             || !(previous.epoch.differs_only_in_document(epoch)
                 || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {return None;}
+        const MAX_FONT_DIRTY:usize=4096;
+        let mut font_dirty=Vec::new();
+        if font_bits!=0 {
+            for input in previous.nodes.iter().filter(|input|input.style.font_metric_family_bits()&font_bits!=0) {
+                if font_dirty.len()>=MAX_FONT_DIRTY {return None;}
+                font_dirty.push(input.node.key());
+            }
+        }
         let tree_changed=self.snapshot_dirty.tree_changed
             || self.document.mutations().iter()
                 .any(|mutation|mutation.version>self.snapshot_noted_version && matches!(mutation.kind,MutationKind::Tree{..}));
@@ -4688,7 +4708,7 @@ impl RenderSession {
         Some(SnapshotBase{previous,ranges,
             dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key())
                 .chain(self.snapshot_effect_nodes.iter().copied()).chain(sibling_dependent).collect(),
-            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
+            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).chain(font_dirty).collect()})
     }
 
     /// Capture current effect-underlying author provenance only for the supplied
@@ -5221,6 +5241,7 @@ impl RenderSession {
         Ok(())
     }
     pub fn invalidate_fonts(&mut self) {
+        self.font_steps.clear();
         self.discard_frame();
         self.style_cache.borrow_mut().clear();
         self.layout_cache.invalidate_fonts();
@@ -5290,7 +5311,26 @@ impl RenderSession {
         // change, so transition snapshots see it at the same point. Styles
         // computed before then keep the cache filled for this generation.
         self.style_cache.borrow_mut().adopt_text_generation(self.font_generation, generation);
+        const MAX_FONT_STEPS: usize = 32;
+        if self.font_steps.len() >= MAX_FONT_STEPS { self.font_steps.remove(0); }
+        let from = self.handled_font_generation.unwrap_or(self.font_generation);
+        self.font_steps.push((from, generation, if bits & metric_families != 0 { bits } else { 0 }));
         self.handled_font_generation = Some(generation);
+    }
+
+    /// The families whose metrics may differ between font generations `from`
+    /// and `to`, when every step between them was a handled family change.
+    fn font_change_between(&self, from: Option<u64>, to: Option<u64>) -> Option<u64> {
+        if from == to { return Some(0); }
+        let (mut current, to) = (from?, to?);
+        let mut bits = 0;
+        for _ in 0..self.font_steps.len() {
+            let &(_, next, changed) = self.font_steps.iter().find(|(start, _, _)| *start == current)?;
+            bits |= changed;
+            current = next;
+            if current == to { return Some(bits); }
+        }
+        None
     }
 
     /// The host's image resolver advanced its generation. The next render
@@ -11611,6 +11651,52 @@ mod tests {
         let list = session.display_list(400, 600, &NoText).unwrap().clone();
         assert!(crate::layout::cell_measurements() > before);
         assert_eq!(list, reference_list(&nested_tables_source("", "width:120px;height:50px"), 400, 600));
+    }
+
+    #[test]
+    fn a_handled_font_load_extends_the_transition_snapshot() {
+        struct Loading { loaded: core::cell::Cell<bool> }
+        impl TextShaper for Loading {
+            fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+                Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+            }
+            fn font_relative_metrics_styled(&self, size: f32, font: &crate::paint::FontSpec) -> crate::paint::FontRelativeMetrics {
+                let wide = self.loaded.get() && font.family_bits() & crate::paint::font_family_bit("Body") != 0;
+                let ex = if wide { size * 0.8 } else { size * 0.5 };
+                crate::paint::FontRelativeMetrics { ex, ch: ex }
+            }
+            fn generation(&self) -> u64 { 1 + u64::from(self.loaded.get()) }
+            fn ascent(&self, _: f32) -> f32 { 2.0 }
+            fn line_height(&self, _: f32) -> f32 { 3.0 }
+        }
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}p{margin:0;height:3px;font-family:Plain;transition:width 1s}.m{font-family:Metrics;display:block;width:2ex;height:1ex;background:red}.m b{display:block;width:1ex;height:1ex;font-family:Body;background:blue}</style>");
+        for _ in 0..30 { markup.push_str("<p></p>"); }
+        markup.push_str("<div class=m id=m><b id=i></b></div>");
+        let width = |snapshot: &TransitionSnapshot, node: NodeId| snapshot.nodes.iter()
+            .find(|input| input.node == node && input.pseudo.is_none()).and_then(|input| input.style.width);
+        for handled in [true, false] {
+            let text = Loading { loaded: core::cell::Cell::new(false) };
+            let document = crate::html::parse(&markup, 512).unwrap();
+            let (m, i) = (find(&document, "#m"), find(&document, "#i"));
+            let mut session = RenderSession::new(document);
+            session.display_list(200, 300, &text).unwrap();
+            let first = session.transition_snapshot_after(Some(&text), None).unwrap();
+            assert_eq!(width(&first, m), Some(16.0));
+            text.loaded.set(true);
+            if handled { session.invalidate_font_families(["Body"], text.generation()); }
+            session.display_list(200, 300, &text).unwrap();
+            let before = session.invalidation_stats();
+            let next = session.transition_snapshot_after(Some(&text), Some(&first)).unwrap();
+            let incremental = session.invalidation_stats().transition_snapshots_incremental - before.transition_snapshots_incremental;
+            assert_eq!(incremental, u64::from(handled), "only a handled family change keeps the snapshot");
+            let mut fresh = RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+            fresh.display_list(200, 300, &text).unwrap();
+            let reference = fresh.transition_snapshot_after(Some(&text), None).unwrap();
+            let (fresh_m, fresh_i) = (find(fresh.document(), "#m"), find(fresh.document(), "#i"));
+            assert_eq!(width(&next, m), width(&reference, fresh_m));
+            assert_eq!(width(&next, i), width(&reference, fresh_i));
+            assert_eq!((width(&next, m), width(&next, i)), (Some(16.0), Some(12.8)), "only the loaded family's metrics change");
+        }
     }
 
     #[test]
