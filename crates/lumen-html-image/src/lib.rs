@@ -647,8 +647,9 @@ impl Default for SettleOptions {
 
 #[derive(Default)]
 pub struct GlyphCache {
-    glyphs: HashMap<(u64, u16, u32), (GlyphCoverage, u64)>,
-    recency: std::collections::BTreeMap<u64, (u64, u16, u32)>,
+    /// Coverage and the tick of its last use. Eviction drops the least
+    /// recently used quarter in one pass, so a hit only stamps its tick.
+    glyphs: lumen_common::fasthash::FastMap<(u64, u16, u32), (GlyphCoverage, u64)>,
     tick: u64,
     bytes: usize,
     hits: u64,
@@ -687,9 +688,7 @@ impl GlyphCache {
         };
         self.hits += 1;
         self.tick += 1;
-        self.recency.remove(used);
         *used = self.tick;
-        self.recency.insert(self.tick, *key);
         Some(&*coverage)
     }
 
@@ -715,24 +714,33 @@ impl GlyphCache {
         self.shadow_masks.clear();
         self.shadow_bytes = 0;
         self.glyphs.clear();
-        self.recency.clear();
         self.bytes = 0;
     }
 
+    /// Drops the least recently used quarter of the entries (at least one).
     fn evict_oldest(&mut self) -> bool {
-        let Some((_, key)) = self.recency.pop_first() else {
+        if self.glyphs.is_empty() {
             return false;
-        };
-        if let Some((coverage, _)) = self.glyphs.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(coverage.alpha.len());
         }
+        let mut ticks: Vec<u64> = self.glyphs.values().map(|(_, used)| *used).collect();
+        let drop = (ticks.len() / 4).max(1);
+        let (_, cutoff, _) = ticks.select_nth_unstable(drop - 1);
+        let cutoff = *cutoff;
+        let mut freed = 0;
+        self.glyphs.retain(|_, (coverage, used)| {
+            let keep = *used > cutoff;
+            if !keep {
+                freed += coverage.alpha.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
         true
     }
 
     fn insert(&mut self, key: (u64, u16, u32), coverage: GlyphCoverage) {
         let bytes = coverage.alpha.len();
-        if let Some((old, used)) = self.glyphs.remove(&key) {
-            self.recency.remove(&used);
+        if let Some((old, _)) = self.glyphs.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.alpha.len());
         }
         while (self.bytes + bytes > GLYPH_CACHE_BYTES || self.glyphs.len() >= GLYPH_CACHE_ENTRIES)
@@ -740,7 +748,6 @@ impl GlyphCache {
         {}
         self.tick += 1;
         self.bytes += bytes;
-        self.recency.insert(self.tick, key);
         self.glyphs.insert(key, (coverage, self.tick));
     }
 }
@@ -9345,6 +9352,22 @@ mod tests {
             paint:Box::new(Command::FillRect{rect:Rect{x:0.0,y:0.0,width:4000.0,height:4000.0},color:Rgba{r:255,g:0,b:0,a:255}}),
             mask:Arc::new(DisplayList(vec![Command::FillRect{rect:Rect{x:0.0,y:0.0,width:1.0,height:1.0},color:Rgba{r:255,g:255,b:255,a:255}}])),offset:[0.0,0.0]}));
         assert_eq!(resolve_layers(&[huge],1.0,Some(&font),&mut cache,&mut 0),Err(ImageError::TooLarge),"peak shadow workspace is rejected before allocation");
+    }
+
+    #[test]
+    fn glyph_cache_evicts_the_least_recently_used_glyphs() {
+        let coverage = || GlyphCoverage { x_min: 0, y_min: 0, width: 1, height: 1, alpha: vec![255] };
+        let mut cache = GlyphCache::default();
+        for id in 0..GLYPH_CACHE_ENTRIES as u16 {
+            cache.insert((1, id, 0), coverage());
+        }
+        assert!(cache.lookup(&(1, 0, 0)).is_some());
+        cache.insert((2, 0, 0), coverage());
+        assert!(cache.glyphs.len() < GLYPH_CACHE_ENTRIES && cache.bytes() == cache.glyphs.len());
+        assert!(cache.lookup(&(1, 0, 0)).is_some(), "a glyph used since its insert survives");
+        assert!(cache.lookup(&(2, 0, 0)).is_some());
+        assert!(cache.lookup(&(1, 1, 0)).is_none(), "the oldest unused glyph goes first");
+        assert!(cache.lookup(&(1, GLYPH_CACHE_ENTRIES as u16 - 1, 0)).is_some());
     }
 
     #[test]
