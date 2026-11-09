@@ -1258,6 +1258,21 @@ pub struct InvalidationStats {
     pub transition_snapshots_full: u64,
     /// Transition snapshots built on the previous one.
     pub transition_snapshots_incremental: u64,
+    /// Why a snapshot given a previous one was captured in full: no held
+    /// basis, unknown font change, document version moved, effect
+    /// declarations changed, epoch changed (rules, fonts, validity,
+    /// interaction or environment), too many font or sibling dependents,
+    /// every element dirty; then, of the epoch changes, the rules, fonts,
+    /// validity, interaction and environment that differed.
+    pub transition_snapshot_full_causes: [u64; 12],
+    /// Font family changes that dropped every style and the font history:
+    /// before the first layout, a style cache that cannot list its users,
+    /// more than half the document using the families, and a layout that
+    /// cannot tell which text used them; then every call to
+    /// `invalidate_fonts`, these included; of those, the ones a render made
+    /// for a font generation no family change announced, and the ones a
+    /// `@font-face` descriptor change made.
+    pub font_invalidation_falls_back: [u64; 7],
     /// Element styles transition snapshots computed through the cascade.
     pub transition_styles_computed: u64,
     /// Element styles transition snapshots carried over from the previous snapshot.
@@ -2319,6 +2334,7 @@ impl RenderSession {
         }
         self.font_face_rules[face_index].descriptors = descriptors;
         self.font_face_generation = self.font_face_generation.wrapping_add(1);
+        self.invalidation_stats.font_invalidation_falls_back[6] += 1;
         self.invalidate_fonts();
         Ok(true)
     }
@@ -4657,22 +4673,35 @@ impl RenderSession {
     /// another cascade input changed, effect samples shape either snapshot, or
     /// the journal cannot bound the change.
     fn snapshot_extension<'a>(&mut self,previous:&'a Arc<TransitionSnapshot>,epoch:&TransitionInputEpoch,basis:SnapshotBasis)->Option<SnapshotBase<'a>> {
-        let held=self.snapshot_basis?;
+        let causes=&mut self.invalidation_stats.transition_snapshot_full_causes;
+        let Some(held)=self.snapshot_basis else {causes[0]+=1; return None};
         // A handled font load changes the styles only of the elements whose
         // own or root font is one of its families, when a style read their
         // metrics; those and what they reach are styled again.
-        let font_bits=self.font_change_between(held.text_generation,basis.text_generation)?
-            | self.font_change_between(Some(previous.epoch.font_generation),Some(epoch.font_generation))?;
+        let fonts=self.font_change_between(held.text_generation,basis.text_generation).zip(
+            self.font_change_between(Some(previous.epoch.font_generation),Some(epoch.font_generation)));
+        let causes=&mut self.invalidation_stats.transition_snapshot_full_causes;
+        let Some((held_fonts,epoch_fonts))=fonts else {causes[1]+=1; return None};
+        let font_bits=held_fonts|epoch_fonts;
         let epoch=&TransitionInputEpoch{font_generation:previous.epoch.font_generation,..*epoch};
-        if held.version!=previous.epoch.document_version
-            || held.had_effects!=basis.had_effects || basis.had_effects && self.snapshot_effects_unbounded
-            || !(previous.epoch.differs_only_in_document(epoch)
-                || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {return None;}
+        if held.version!=previous.epoch.document_version {causes[2]+=1; return None;}
+        if held.had_effects!=basis.had_effects || basis.had_effects && self.snapshot_effects_unbounded {causes[3]+=1; return None;}
+        if !(previous.epoch.differs_only_in_document(epoch)
+            || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {
+            let old=&previous.epoch;
+            causes[4]+=1;
+            if old.rules_generation!=epoch.rules_generation {causes[7]+=1;}
+            if old.font_generation!=epoch.font_generation {causes[8]+=1;}
+            if old.validity_generation!=epoch.validity_generation {causes[9]+=1;}
+            if old.interaction_generation!=epoch.interaction_generation {causes[10]+=1;}
+            if old.environment!=epoch.environment {causes[11]+=1;}
+            return None;
+        }
         const MAX_FONT_DIRTY:usize=4096;
         let mut font_dirty=Vec::new();
         if font_bits!=0 {
             for input in previous.nodes.iter().filter(|input|input.style.font_metric_family_bits()&font_bits!=0) {
-                if font_dirty.len()>=MAX_FONT_DIRTY {return None;}
+                if font_dirty.len()>=MAX_FONT_DIRTY {self.invalidation_stats.transition_snapshot_full_causes[5]+=1; return None;}
                 font_dirty.push(input.node.key());
             }
         }
@@ -4687,12 +4716,12 @@ impl RenderSession {
         let mut sibling_dependent=Vec::new();
         if tree_changed {
             for input in previous.nodes.iter().filter(|input|input.style.sibling_position_dependent) {
-                if sibling_dependent.len()>=MAX_SIBLING_DEPENDENT {return None;}
+                if sibling_dependent.len()>=MAX_SIBLING_DEPENDENT {self.invalidation_stats.transition_snapshot_full_causes[5]+=1; return None;}
                 sibling_dependent.push(input.node.key());
             }
         }
         self.note_snapshot_dirty();
-        if self.snapshot_dirty.all {return None;}
+        if self.snapshot_dirty.all {self.invalidation_stats.transition_snapshot_full_causes[6]+=1; return None;}
         let mut ranges=alloc::collections::BTreeMap::new();
         let nodes=&previous.nodes;
         let mut start=0;
@@ -5241,6 +5270,7 @@ impl RenderSession {
         Ok(())
     }
     pub fn invalidate_fonts(&mut self) {
+        self.invalidation_stats.font_invalidation_falls_back[4] += 1;
         self.font_steps.clear();
         self.discard_frame();
         self.style_cache.borrow_mut().clear();
@@ -5262,6 +5292,7 @@ impl RenderSession {
         // The render that sees the generation drops styles computed in
         // between too, so that it computes them all in one restyle.
         if self.layout_count == 0 {
+            self.invalidation_stats.font_invalidation_falls_back[0] += 1;
             self.invalidate_fonts();
             return;
         }
@@ -5271,6 +5302,7 @@ impl RenderSession {
             // children; restyles of changed styles reach further.
             let reached = self.style_cache.borrow().nodes_with_style(|style| style.font_metric_family_bits() & bits != 0);
             let Some(reached) = reached else {
+                self.invalidation_stats.font_invalidation_falls_back[1] += 1;
                 self.invalidate_fonts();
                 return;
             };
@@ -5286,6 +5318,7 @@ impl RenderSession {
                 }
             }
             if subjects.len() > self.document.node_count() / 2 + 64 {
+                self.invalidation_stats.font_invalidation_falls_back[2] += 1;
                 self.invalidate_fonts();
                 return;
             }
@@ -5302,9 +5335,14 @@ impl RenderSession {
                 self.paint_revision = self.paint_revision.wrapping_add(1);
                 self.frame_id += 1;
             }
+            // Some text using them has no owner: all text is laid out again.
+            // The styles above stand, so the font history does too.
             None => {
-                self.invalidate_fonts();
-                return;
+                self.invalidation_stats.font_invalidation_falls_back[3] += 1;
+                self.discard_frame();
+                self.layout_cache.invalidate_fonts();
+                self.paint_revision = self.paint_revision.wrapping_add(1);
+                self.frame_id += 1;
             }
         }
         // The generation itself changes at the next render, as for any font
@@ -7090,6 +7128,7 @@ impl RenderSession {
         let font_generation = text.generation();
         if self.font_generation != font_generation {
             if self.handled_font_generation != Some(font_generation) {
+                self.invalidation_stats.font_invalidation_falls_back[5] += 1;
                 self.invalidate_fonts();
             } else {
                 // `invalidate_font_families` restyled what read the changed
@@ -11697,6 +11736,51 @@ mod tests {
             assert_eq!(width(&next, i), width(&reference, fresh_i));
             assert_eq!((width(&next, m), width(&next, i)), (Some(16.0), Some(12.8)), "only the loaded family's metrics change");
         }
+    }
+
+    #[test]
+    fn a_font_load_whose_text_has_no_owner_still_extends_the_transition_snapshot() {
+        struct Loading { loaded: core::cell::Cell<bool> }
+        impl TextShaper for Loading {
+            fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+                Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+            }
+            fn font_relative_metrics_styled(&self, size: f32, font: &crate::paint::FontSpec) -> crate::paint::FontRelativeMetrics {
+                let wide = self.loaded.get() && font.family_bits() & crate::paint::font_family_bit("Body") != 0;
+                let ex = if wide { size * 0.8 } else { size * 0.5 };
+                crate::paint::FontRelativeMetrics { ex, ch: ex }
+            }
+            fn generation(&self) -> u64 { 1 + u64::from(self.loaded.get()) }
+            fn ascent(&self, _: f32) -> f32 { 2.0 }
+            fn line_height(&self, _: f32) -> f32 { 3.0 }
+        }
+        // Text straight in the body, in the loading family, is laid out
+        // outside every retained fragment.
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}body{font-family:Body}p{margin:0;height:3px;font-family:Plain;transition:width 1s}.m{font-family:Body;display:block;width:2ex;height:1ex;transition:width 1s}</style>loose text");
+        for _ in 0..30 { markup.push_str("<p></p>"); }
+        markup.push_str("<div class=m id=m></div>");
+        let width = |snapshot: &TransitionSnapshot, node: NodeId| snapshot.nodes.iter()
+            .find(|input| input.node == node && input.pseudo.is_none()).and_then(|input| input.style.width);
+        let text = Loading { loaded: core::cell::Cell::new(false) };
+        let document = crate::html::parse(&markup, 512).unwrap();
+        let m = find(&document, "#m");
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 300, &text).unwrap();
+        let first = session.transition_snapshot_after(Some(&text), None).unwrap();
+        assert_eq!(width(&first, m), Some(16.0));
+        text.loaded.set(true);
+        let before = session.invalidation_stats();
+        session.invalidate_font_families(["Body"], text.generation());
+        assert_eq!(session.invalidation_stats().font_invalidation_falls_back[3], before.font_invalidation_falls_back[3] + 1,
+            "the loose text has no retained owner");
+        let laid_out = session.display_list(200, 300, &text).unwrap().clone();
+        let next = session.transition_snapshot_after(Some(&text), Some(&first)).unwrap();
+        assert_eq!(session.invalidation_stats().transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+        assert_eq!(width(&next, m), Some(25.6), "the loaded family's metrics apply");
+        let mut fresh = RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+        assert_eq!(*fresh.display_list(200, 300, &text).unwrap(), laid_out, "all text is laid out again");
+        let reference = fresh.transition_snapshot_after(Some(&text), None).unwrap();
+        assert_eq!(width(&next, m), width(&reference, find(fresh.document(), "#m")));
     }
 
     #[test]
