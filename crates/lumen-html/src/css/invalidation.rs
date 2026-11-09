@@ -74,13 +74,15 @@ impl Position {
 }
 
 /// Attributes whose writes change element state that pseudo-classes read
-/// (`:checked`, `:disabled`, `:link`, `:lang()`, `:open`, ...).
+/// (`:checked`, `:disabled`, `:lang()`, `:open`, ...). `:link` and
+/// `:any-link` are `:is(a[href],area[href])`, which the `href` attribute key
+/// covers, and `:visited` matches nothing.
 fn state_attribute(name: &str) -> bool {
     matches!(
         name,
         "checked" | "selected" | "disabled" | "readonly" | "required" | "value" | "type" | "multiple"
             | "min" | "max" | "step" | "pattern" | "minlength" | "maxlength" | "placeholder"
-            | "name" | "form" | "for" | "list" | "href" | "open" | "popover" | "dir" | "lang"
+            | "name" | "form" | "for" | "list" | "open" | "popover" | "dir" | "lang"
             | "xml:lang" | "contenteditable" | "inert" | "hidden" | "autofocus" | "indeterminate"
             | "default" | "label" | "src" | "srcdoc"
     )
@@ -1677,6 +1679,23 @@ mod tests {
         assert!(affected.contains(&link));
         assert!(!affected.contains(&elements(&document, "span")[0]));
         assert!(!affected.contains(&elements(&document, "i")[0]));
+    }
+
+    #[test]
+    fn href_write_ignores_state_selectors_across_scopes() {
+        let html = "<div><a id=l>x</a><span></span></div><section><i></i></section>";
+        let (mut document, sets) = setup(html, "::slotted(:checked) { color: red } a:any-link { color: blue }");
+        let link = elements(&document, "a")[0];
+        document.set_attribute(link, "href", "/x").unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("a link's href reaches only the link");
+        assert!(affected.contains(&link));
+        assert!(!affected.contains(&elements(&document, "i")[0]));
+        let input = element_with(&mut document, "input", &[]);
+        let section = elements(&document, "section")[0];
+        document.insert_before(section, input, None).unwrap();
+        document.clear_mutations();
+        document.set_attribute(input, "checked", "").unwrap();
+        assert!(sets.affected(&document, document.mutations()).is_none(), "a state read across scopes still reaches the document");
     }
 
     #[test]
