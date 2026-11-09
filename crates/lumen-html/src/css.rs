@@ -2987,7 +2987,7 @@ impl FilterInterpolation {
     pub(crate) fn css_keyword(self)->&'static str {match self{Self::Auto=>"auto",Self::Srgb=>"srgb",Self::LinearRgb=>"linearrgb"}}
 }
 impl SvgFilterProperties {pub const INITIAL:Self=Self{flood:Rgba{r:0,g:0,b:0,a:255},opacity:1.0,interpolation:FilterInterpolation::LinearRgb};}
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StyleExtras {
     pub source_colors:Option<Arc<[(usize,SourceColor)]>>,
     shadow_source_colors:Option<Arc<[(usize,Arc<[SourceColor]>)]>>,
@@ -3261,6 +3261,239 @@ pub struct StyleExtras {
     /// Inset, margin and size declarations using `anchor()` or `anchor-size()`,
     /// resolved against anchor geometry during layout: (slot, canonical value).
     pub anchored: Option<Arc<[(usize, Arc<str>)]>>,
+}
+
+// Shared `Arc` slices and strings compare by address first: `Arc`'s own `==`
+// skips identical allocations only for sized values, and restyles compare
+// extras whose lists are mostly still shared with the old style.
+impl PartialEq for StyleExtras {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured without `..`, so a new field must be compared here.
+        let Self { source_colors, shadow_source_colors, image_color_origins, field_sizing, appearance, border_image, widget_devolved, text_shadows, text_shadow_current_color, text_transform, container_type, container_flags, animation, font, min_width_auto, min_height_auto, flex_basis_content, compressible_percentage, flex_basis_intrinsic, sibling_position_dependent, gap_specified, row_gap_normal, writing_mode, text_orientation, word_break, overflow_wrap, contain_paint, contain_layout, contain_style, contain_size, contain_inline_size, contain_intrinsic, column_width, line_break_counts, break_controls, visibility_visible, visibility_collapsed, pointer_events_auto, user_select, user_select_declared, svg_fill, svg_stroke, svg_stroke_width, svg_fill_opacity, svg_stroke_opacity, svg_fill_rule, svg_clip_rule, svg_clip_path, svg_geometry, svg_stop_color, svg_stop_opacity, svg_filter_properties, filter_reference_scope, generated_content, content_none, color_scheme, transition_duration, transition_delay, transition_property, transition_timing_function, transition_behavior, view_transition_name, quotes, counter_reset, counter_increment, counter_set, list_style_type, list_style_position, list_style_image, empty_cells_hide, caption_bottom, border_collapse, logical_border_width, logical_border_color, logical_border_style, border_width_sides, border_color_sides, border_solid_sides, border_style_sides, border_corner_radii, logical_border_radius_corners, height_intrinsic, width_intrinsic, min_width_intrinsic, max_width_intrinsic, logical_size_intrinsic, logical_min_intrinsic, logical_max_intrinsic, min_height_intrinsic, max_height_intrinsic, logical_inline_size, logical_block_size, logical_overflow, logical_min_size, logical_max_size, logical_offsets, logical_padding_inline, logical_padding_block, logical_margin_inline, logical_margin_block, column_count, column_gap, row_gap_fraction, column_gap_fraction, column_fill_auto, column_rule_width, column_rule_color, column_rule_style, outline, grid_auto_columns, grid_auto_rows, grid_auto_flow, grid_lanes, display_inline, display_list_item, display_ruby, grid_lanes_direction, grid_lanes_dense, flow_tolerance, justify_items, justify_self, grid_areas, grid_area_dimensions, grid_area, grid_column_names, grid_row_names, grid_column_spec, grid_row_spec, grid_columns_subgrid, grid_rows_subgrid, grid_columns_subgrid_repeat, grid_rows_subgrid_repeat, grid_columns_auto, grid_rows_auto, grid_columns_source, grid_rows_source, grid_lead, transforms, individual_transforms, filters, transform_origin, transform_origin_z, transform_box, border_pattern, shadows, background_images, background_position, background_size, background_size_math, background_repeat, background_clip, background_origin, background_attachment, mask_images, mask_position, mask_size, mask_repeat, mask_origin, mask_clip, mask_mode, overflow_x, overflow_y, white_space, text_align, text_indent, text_indent_mode, letter_spacing, word_spacing, vertical_align, direction, unicode_bidi, scroll_behavior, text_overflow, text_overflow_markers, text_decoration, text_decoration_style, text_decoration_color, text_underline_position, text_decoration_thickness, text_underline_offset, table_cell_content_offset, root_font_size, root_font_units, registered_query, min_height, max_height, aspect_ratio, aspect_ratio_components, aspect_ratio_auto, z_index, relative_lengths, relative_expressions, order, margin_auto, align_content, align_content_safe, justify_content_safe, align_content_keyword, justify_content_keyword, align_items_keyword, justify_items_keyword, align_self_keyword, justify_self_keyword, align_items_safe, justify_items_safe, align_self_safe, justify_self_safe, flex_wrap_reverse, flex_wrap_balance, align_self, position, float, clear, top, right, bottom, left, margin_sides, padding_sides, grid_columns, grid_rows, generic, anchored } = self;
+        *field_sizing == other.field_sizing
+            && *appearance == other.appearance
+            && *widget_devolved == other.widget_devolved
+            && *text_shadow_current_color == other.text_shadow_current_color
+            && *text_transform == other.text_transform
+            && *container_type == other.container_type
+            && *container_flags == other.container_flags
+            && *font == other.font
+            && *min_width_auto == other.min_width_auto
+            && *min_height_auto == other.min_height_auto
+            && *flex_basis_content == other.flex_basis_content
+            && *compressible_percentage == other.compressible_percentage
+            && *flex_basis_intrinsic == other.flex_basis_intrinsic
+            && *sibling_position_dependent == other.sibling_position_dependent
+            && *gap_specified == other.gap_specified
+            && *row_gap_normal == other.row_gap_normal
+            && *writing_mode == other.writing_mode
+            && *text_orientation == other.text_orientation
+            && *word_break == other.word_break
+            && *overflow_wrap == other.overflow_wrap
+            && *contain_paint == other.contain_paint
+            && *contain_layout == other.contain_layout
+            && *contain_style == other.contain_style
+            && *contain_size == other.contain_size
+            && *contain_inline_size == other.contain_inline_size
+            && *column_width == other.column_width
+            && *visibility_visible == other.visibility_visible
+            && *visibility_collapsed == other.visibility_collapsed
+            && *pointer_events_auto == other.pointer_events_auto
+            && *user_select == other.user_select
+            && *user_select_declared == other.user_select_declared
+            && *svg_fill == other.svg_fill
+            && *svg_stroke == other.svg_stroke
+            && *svg_stroke_width == other.svg_stroke_width
+            && *svg_fill_opacity == other.svg_fill_opacity
+            && *svg_stroke_opacity == other.svg_stroke_opacity
+            && *svg_fill_rule == other.svg_fill_rule
+            && *svg_clip_rule == other.svg_clip_rule
+            && *svg_stop_color == other.svg_stop_color
+            && *svg_stop_opacity == other.svg_stop_opacity
+            && *content_none == other.content_none
+            && *view_transition_name == other.view_transition_name
+            && *quotes == other.quotes
+            && *list_style_type == other.list_style_type
+            && *list_style_position == other.list_style_position
+            && *empty_cells_hide == other.empty_cells_hide
+            && *caption_bottom == other.caption_bottom
+            && *border_collapse == other.border_collapse
+            && *logical_border_width == other.logical_border_width
+            && *logical_border_color == other.logical_border_color
+            && *logical_border_style == other.logical_border_style
+            && *border_width_sides == other.border_width_sides
+            && *border_color_sides == other.border_color_sides
+            && *border_solid_sides == other.border_solid_sides
+            && *border_style_sides == other.border_style_sides
+            && *border_corner_radii == other.border_corner_radii
+            && *logical_border_radius_corners == other.logical_border_radius_corners
+            && *height_intrinsic == other.height_intrinsic
+            && *width_intrinsic == other.width_intrinsic
+            && *min_width_intrinsic == other.min_width_intrinsic
+            && *max_width_intrinsic == other.max_width_intrinsic
+            && *logical_size_intrinsic == other.logical_size_intrinsic
+            && *logical_min_intrinsic == other.logical_min_intrinsic
+            && *logical_max_intrinsic == other.logical_max_intrinsic
+            && *min_height_intrinsic == other.min_height_intrinsic
+            && *max_height_intrinsic == other.max_height_intrinsic
+            && *logical_inline_size == other.logical_inline_size
+            && *logical_block_size == other.logical_block_size
+            && *logical_overflow == other.logical_overflow
+            && *logical_min_size == other.logical_min_size
+            && *logical_max_size == other.logical_max_size
+            && *logical_offsets == other.logical_offsets
+            && *logical_padding_inline == other.logical_padding_inline
+            && *logical_padding_block == other.logical_padding_block
+            && *logical_margin_inline == other.logical_margin_inline
+            && *logical_margin_block == other.logical_margin_block
+            && *column_count == other.column_count
+            && *column_gap == other.column_gap
+            && *row_gap_fraction == other.row_gap_fraction
+            && *column_gap_fraction == other.column_gap_fraction
+            && *column_fill_auto == other.column_fill_auto
+            && *column_rule_width == other.column_rule_width
+            && *column_rule_color == other.column_rule_color
+            && *column_rule_style == other.column_rule_style
+            && *outline == other.outline
+            && *grid_auto_flow == other.grid_auto_flow
+            && *grid_lanes == other.grid_lanes
+            && *display_inline == other.display_inline
+            && *display_list_item == other.display_list_item
+            && *display_ruby == other.display_ruby
+            && *grid_lanes_direction == other.grid_lanes_direction
+            && *grid_lanes_dense == other.grid_lanes_dense
+            && *flow_tolerance == other.flow_tolerance
+            && *justify_items == other.justify_items
+            && *justify_self == other.justify_self
+            && *grid_area_dimensions == other.grid_area_dimensions
+            && *grid_columns_subgrid == other.grid_columns_subgrid
+            && *grid_rows_subgrid == other.grid_rows_subgrid
+            && *grid_columns_subgrid_repeat == other.grid_columns_subgrid_repeat
+            && *grid_rows_subgrid_repeat == other.grid_rows_subgrid_repeat
+            && *grid_columns_auto == other.grid_columns_auto
+            && *grid_rows_auto == other.grid_rows_auto
+            && *grid_lead == other.grid_lead
+            && *transform_origin == other.transform_origin
+            && *transform_origin_z == other.transform_origin_z
+            && *transform_box == other.transform_box
+            && *border_pattern == other.border_pattern
+            && *overflow_x == other.overflow_x
+            && *overflow_y == other.overflow_y
+            && *white_space == other.white_space
+            && *text_align == other.text_align
+            && *text_indent == other.text_indent
+            && *text_indent_mode == other.text_indent_mode
+            && *letter_spacing == other.letter_spacing
+            && *word_spacing == other.word_spacing
+            && *vertical_align == other.vertical_align
+            && *direction == other.direction
+            && *unicode_bidi == other.unicode_bidi
+            && *scroll_behavior == other.scroll_behavior
+            && *text_overflow == other.text_overflow
+            && *text_decoration == other.text_decoration
+            && *text_decoration_style == other.text_decoration_style
+            && *text_decoration_color == other.text_decoration_color
+            && *text_underline_position == other.text_underline_position
+            && *text_decoration_thickness == other.text_decoration_thickness
+            && *text_underline_offset == other.text_underline_offset
+            && *table_cell_content_offset == other.table_cell_content_offset
+            && *root_font_size == other.root_font_size
+            && *min_height == other.min_height
+            && *max_height == other.max_height
+            && *aspect_ratio == other.aspect_ratio
+            && *aspect_ratio_components == other.aspect_ratio_components
+            && *aspect_ratio_auto == other.aspect_ratio_auto
+            && *z_index == other.z_index
+            && *relative_lengths == other.relative_lengths
+            && *relative_expressions == other.relative_expressions
+            && *order == other.order
+            && *margin_auto == other.margin_auto
+            && *align_content == other.align_content
+            && *align_content_safe == other.align_content_safe
+            && *justify_content_safe == other.justify_content_safe
+            && *align_content_keyword == other.align_content_keyword
+            && *justify_content_keyword == other.justify_content_keyword
+            && *align_items_keyword == other.align_items_keyword
+            && *justify_items_keyword == other.justify_items_keyword
+            && *align_self_keyword == other.align_self_keyword
+            && *justify_self_keyword == other.justify_self_keyword
+            && *align_items_safe == other.align_items_safe
+            && *justify_items_safe == other.justify_items_safe
+            && *align_self_safe == other.align_self_safe
+            && *justify_self_safe == other.justify_self_safe
+            && *flex_wrap_reverse == other.flex_wrap_reverse
+            && *flex_wrap_balance == other.flex_wrap_balance
+            && *align_self == other.align_self
+            && *position == other.position
+            && *float == other.float
+            && *clear == other.clear
+            && *top == other.top
+            && *right == other.right
+            && *bottom == other.bottom
+            && *left == other.left
+            && *margin_sides == other.margin_sides
+            && *padding_sides == other.padding_sides
+            && *generic == other.generic
+            && arcs_equal(source_colors, &other.source_colors)
+            && arcs_equal(shadow_source_colors, &other.shadow_source_colors)
+            && arcs_equal(image_color_origins, &other.image_color_origins)
+            && arcs_equal(border_image, &other.border_image)
+            && arcs_equal(text_shadows, &other.text_shadows)
+            && animation.iter().zip(&other.animation).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(contain_intrinsic, &other.contain_intrinsic)
+            && arcs_equal(line_break_counts, &other.line_break_counts)
+            && arcs_equal(break_controls, &other.break_controls)
+            && arcs_equal(svg_clip_path, &other.svg_clip_path)
+            && svg_geometry.iter().zip(&other.svg_geometry).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(svg_filter_properties, &other.svg_filter_properties)
+            && arcs_equal(filter_reference_scope, &other.filter_reference_scope)
+            && arcs_equal(generated_content, &other.generated_content)
+            && arcs_equal(color_scheme, &other.color_scheme)
+            && arcs_equal(transition_duration, &other.transition_duration)
+            && arcs_equal(transition_delay, &other.transition_delay)
+            && arcs_equal(transition_property, &other.transition_property)
+            && arcs_equal(transition_timing_function, &other.transition_timing_function)
+            && arcs_equal(transition_behavior, &other.transition_behavior)
+            && arcs_equal(counter_reset, &other.counter_reset)
+            && arcs_equal(counter_increment, &other.counter_increment)
+            && arcs_equal(counter_set, &other.counter_set)
+            && arcs_equal(list_style_image, &other.list_style_image)
+            && arcs_equal(grid_auto_columns, &other.grid_auto_columns)
+            && arcs_equal(grid_auto_rows, &other.grid_auto_rows)
+            && arcs_equal(grid_areas, &other.grid_areas)
+            && arcs_equal(grid_area, &other.grid_area)
+            && arcs_equal(grid_column_names, &other.grid_column_names)
+            && arcs_equal(grid_row_names, &other.grid_row_names)
+            && arcs_equal(grid_column_spec, &other.grid_column_spec)
+            && arcs_equal(grid_row_spec, &other.grid_row_spec)
+            && arcs_equal(grid_columns_source, &other.grid_columns_source)
+            && arcs_equal(grid_rows_source, &other.grid_rows_source)
+            && arcs_equal(transforms, &other.transforms)
+            && individual_transforms.iter().zip(&other.individual_transforms).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(filters, &other.filters)
+            && arcs_equal(shadows, &other.shadows)
+            && arcs_equal(background_images, &other.background_images)
+            && arcs_equal(background_position, &other.background_position)
+            && arcs_equal(background_size, &other.background_size)
+            && arcs_equal(background_size_math, &other.background_size_math)
+            && arcs_equal(background_repeat, &other.background_repeat)
+            && arcs_equal(background_clip, &other.background_clip)
+            && arcs_equal(background_origin, &other.background_origin)
+            && arcs_equal(background_attachment, &other.background_attachment)
+            && arcs_equal(mask_images, &other.mask_images)
+            && arcs_equal(mask_position, &other.mask_position)
+            && arcs_equal(mask_size, &other.mask_size)
+            && arcs_equal(mask_repeat, &other.mask_repeat)
+            && arcs_equal(mask_origin, &other.mask_origin)
+            && arcs_equal(mask_clip, &other.mask_clip)
+            && arcs_equal(mask_mode, &other.mask_mode)
+            && arcs_equal(text_overflow_markers, &other.text_overflow_markers)
+            && arcs_equal(root_font_units, &other.root_font_units)
+            && arcs_equal(registered_query, &other.registered_query)
+            && arcs_equal(grid_columns, &other.grid_columns)
+            && arcs_equal(grid_rows, &other.grid_rows)
+            && arcs_equal(anchored, &other.anchored)
+    }
 }
 
 static INITIAL_EXTRAS: StyleExtras = StyleExtras {
@@ -29882,17 +30115,19 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
             })+
         };
     }
-    paint_fields!(
+    // Shared lists compare by address first (`Arc`'s `==` does not for slices).
+    macro_rules! paint_shared_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(if !arcs_equal(&probe.$field, &new.$field) {
+                probe.$field = new.$field.clone();
+            })+
+        };
+    }
+    paint_shared_fields!(
         source_colors,
         shadow_source_colors,
         image_color_origins,
         text_shadows,
-        text_shadow_current_color,
-        border_corner_radii,
-        logical_border_radius_corners,
-        border_color_sides,
-        logical_border_color,
-        outline,
         shadows,
         background_images,
         background_position,
@@ -29909,6 +30144,14 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
         mask_origin,
         mask_clip,
         mask_mode,
+    );
+    paint_fields!(
+        text_shadow_current_color,
+        border_corner_radii,
+        logical_border_radius_corners,
+        border_color_sides,
+        logical_border_color,
+        outline,
         text_decoration,
         text_decoration_style,
         text_decoration_color,
@@ -29931,7 +30174,7 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
         column_rule_color,
     );
     if old.filters.is_some() == new.filters.is_some() {
-        paint_fields!(filters);
+        paint_shared_fields!(filters);
     }
     // A transform or backdrop filter that starts or stops changes stacking
     // and containing blocks; one that changes value moves only paint.
