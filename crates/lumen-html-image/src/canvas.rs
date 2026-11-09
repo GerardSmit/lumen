@@ -5,6 +5,7 @@ use lumen_html::paint::{FontSpec, ShapedRun};
 use lumen_html_text::{CanvasTextOptions, FontProvider, GlyphOutlineCommand};
 use std::{cell::RefCell, rc::Rc};
 
+mod blit;
 mod record;
 pub use record::{
     canvas_stats, reset_canvas_stats, set_canvas_recording_enabled, set_canvas_recording_limits,
@@ -1316,14 +1317,16 @@ impl CanvasSurface {
                 blend_mode: blend,
                 quality: FilterQuality::Nearest,
             };
-            target.draw_pixmap(
-                0,
-                0,
-                layer.as_ref(),
-                &paint,
-                Transform::identity(),
-                self.state.clip.as_deref(),
-            );
+            if self.state.clip.is_some() || !blit::draw_at_offset(target, layer.as_ref(), 0, 0, 1.0, blend) {
+                target.draw_pixmap(
+                    0,
+                    0,
+                    layer.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    self.state.clip.as_deref(),
+                );
+            }
             self.changed();
         }
         result
@@ -1601,14 +1604,11 @@ impl CanvasSurface {
             quality: self.state.image_filter_quality(),
         };
         if let Some(bitmap) = &mut self.bitmap {
-            bitmap.draw_pixmap(
-                0,
-                0,
-                source,
-                &paint,
-                destination_transform(transform),
-                self.state.clip.as_deref(),
-            );
+            let placed = destination_transform(transform);
+            let whole_pixels = self.state.clip.is_none().then(|| whole_pixel_offset(placed)).flatten();
+            if !whole_pixels.is_some_and(|(dx, dy)| blit::draw_at_offset(bitmap, source, dx, dy, paint.opacity, paint.blend_mode)) {
+                bitmap.draw_pixmap(0, 0, source, &paint, placed, self.state.clip.as_deref());
+            }
             self.changed();
         }
         Ok(())
@@ -2368,8 +2368,16 @@ impl CanvasSurface {
             // admitted pixel lease also covers the actual Vec capacity.
             pixels.reserve_exact(bitmap.data().len());
             for pixel in bitmap.pixels() {
-                let c = pixel.demultiply();
-                pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+                // Opaque and transparent pixels, most of a canvas, need no
+                // division: `demultiply` keeps the first and zeroes the second.
+                match pixel.alpha() {
+                    0 => pixels.extend_from_slice(&[0; 4]),
+                    255 => pixels.extend_from_slice(&[pixel.red(), pixel.green(), pixel.blue(), 255]),
+                    _ => {
+                        let c = pixel.demultiply();
+                        pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+                    }
+                }
             }
         } else if self.lazy {
             let aliased = self.alias.as_ref().and_then(CanvasSource::pixels);
@@ -2790,7 +2798,10 @@ struct PremultipliedEntry {
     tick: u64,
 }
 
-const PREMULTIPLIED_CACHE_BYTES: usize = lumen_common::budget::retained(16 * 1024 * 1024);
+// Large enough for a few full-viewport images drawn every frame (swift.org's
+// hero draws five of about 4.4 MB each); below that the cache thrashes and
+// every draw premultiplies its image again.
+const PREMULTIPLIED_CACHE_BYTES: usize = lumen_common::budget::retained(64 * 1024 * 1024);
 const PREMULTIPLIED_CACHE_ENTRIES: usize = 64;
 
 #[derive(Default)]
@@ -2947,6 +2958,14 @@ pub fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
     let size =
         tiny_skia::IntSize::from_wh(image.width, image.height).ok_or(ImageError::TooLarge)?;
     Pixmap::from_vec(premultiplied, size).ok_or(ImageError::TooLarge)
+}
+
+/// The whole-pixel offset a transform places a pixmap at, when it only
+/// translates it by whole pixels (so each pixel samples exactly one texel).
+fn whole_pixel_offset(transform: Transform) -> Option<(i64, i64)> {
+    let whole = |value: f32| value.is_finite() && value.fract() == 0.0 && value.abs() < 1.0e9;
+    (transform.sx == 1.0 && transform.sy == 1.0 && transform.kx == 0.0 && transform.ky == 0.0 && whole(transform.tx) && whole(transform.ty))
+        .then(|| (transform.tx as i64, transform.ty as i64))
 }
 
 fn allocate(width: u32, height: u32) -> Result<Option<Pixmap>, ImageError> {
