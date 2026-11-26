@@ -245,8 +245,8 @@ pub(crate) fn copy_slot(slot: usize, from: &Style, to: &mut Style) {
         text_props::copy_white_space(prop_at(index).name, from, to);
         return;
     }
-    let value = from.generic.get(index).cloned();
-    if to.generic.get(index) != value.as_ref() {
+    if to.generic.get(index) != from.generic.get(index) {
+        let value = from.generic.get(index).cloned();
         mirror_svg_reference(slot, value.as_deref().unwrap_or(prop_at(index).initial), to);
         to.generic.set(index, value);
         mirror_spacing_trim(slot, to);

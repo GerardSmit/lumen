@@ -56,6 +56,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_sha2", bound::<super::hashlibm::_sha2::Module>),
     ("_sha3", bound::<super::hashlibm::_sha3::Module>),
     ("_signal", bound::<super::signalm::_signal::Module>),
+    #[cfg(unix)]
     ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", bound::<super::sre::_sre::Module>),
     #[cfg(all(unix, not(target_os = "android")))]

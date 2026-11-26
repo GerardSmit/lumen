@@ -211,7 +211,9 @@ impl TargetHooks for HtmlTarget {
             }
             node = parent;
         }
-        if node == realm.session.borrow().document().root() {
+        // A Document's "get the parent" is null for `load` events: an image,
+        // script or stylesheet load never reaches the Window's listeners.
+        if node == realm.session.borrow().document().root() && event.kind().as_str() != "load" {
             let adjusted = realm
                 .session
                 .borrow()
@@ -1301,6 +1303,32 @@ mod tests {
             panic!("shadow retargeting contract must return diagnostics");
         };
         assert!(failures.is_empty(), "shadow retargeting failures: {failures}");
+    }
+
+    #[test]
+    fn element_load_events_stop_at_the_document() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const seen = [];
+                window.addEventListener('load', () => seen.push('window-load'), true);
+                window.addEventListener('other', () => seen.push('window-other'));
+                document.addEventListener('load', () => seen.push('document-load'), true);
+                const image = document.createElement('img');
+                document.body.appendChild(image);
+                const load = new Event('load', {bubbles: true});
+                image.dispatchEvent(load);
+                image.dispatchEvent(new Event('other', {bubbles: true}));
+                check(seen.join() === 'document-load,window-other', 'seen ' + seen.join());
+                check(!load.composedPath().length, 'path-cleared');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("load path contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "load path failures: {failures}");
     }
 
     #[test]

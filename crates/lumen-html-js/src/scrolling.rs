@@ -762,6 +762,28 @@ fn apply_offset_waiting(
     apply_offset_snapping(ctx, realm, node, x, y, behavior, waiter, true)
 }
 
+/// Whether a request to scroll the viewport to the origin, made while it is
+/// there, leaves it there for any layout: the viewport's scroll range always
+/// holds the origin, so only snapping could move it. Pages call
+/// `window.scroll(0, 0)` while loading (wikipedia.org), which would otherwise
+/// lay the page out early.
+fn viewport_stays_at_origin(realm: &Rc<DomRealm>, node: NodeId, x: f64, y: f64, snap: bool) -> OpResult<bool> {
+    let origin = |value: f64| !value.is_finite() || value == 0.0;
+    let (root, document_element) = {
+        let session = realm.session.borrow();
+        let root = session.document().root();
+        if node != root || !origin(x) || !origin(y) || session.scroll_offset(node) != (0.0, 0.0) {
+            return Ok(false);
+        }
+        (root, selector::document_element(session.document()))
+    };
+    if !snap || realm.layout_flusher.borrow().is_none() {
+        return Ok(true);
+    }
+    let style_node = document_element.unwrap_or(root);
+    Ok(crate::style::computed_property_value(realm, style_node, "scroll-snap-type")? == "none")
+}
+
 fn apply_offset_snapping(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
@@ -778,40 +800,46 @@ fn apply_offset_snapping(
     if realm.layout_flusher.borrow().is_none() && realm.session.borrow().viewport_size().is_none() {
         return Ok(());
     }
-    realm.flush_layout()?;
-    let (from, to, behavior, limits) = {
-        let mut session = realm.session.borrow_mut();
-        let root = session.document().root();
-        let Some((min_x,max_x,min_y,max_y)) = session
-            .scroll_bounds(node)
-            .or_else(|| (node == root).then_some((0.0,0.0,0.0,0.0)))
-        else {
-            return Ok(());
+    let (from, to, behavior) = if viewport_stays_at_origin(realm, node, x, y, snap)? {
+        // Nothing moves whatever layout decides, so none is needed.
+        ((0.0, 0.0), (0.0, 0.0), behavior)
+    } else {
+        realm.flush_layout()?;
+        let (from, to, behavior, limits) = {
+            let mut session = realm.session.borrow_mut();
+            let root = session.document().root();
+            let Some((min_x,max_x,min_y,max_y)) = session
+                .scroll_bounds(node)
+                .or_else(|| (node == root).then_some((0.0,0.0,0.0,0.0)))
+            else {
+                return Ok(());
+            };
+            let x = if x.is_finite() { x } else { 0.0 };
+            let y = if y.is_finite() { y } else { 0.0 };
+            let x=x.clamp(f64::from(min_x),f64::from(max_x)) as f32;
+            let y=y.clamp(f64::from(min_y),f64::from(max_y)) as f32;
+            let behavior = if behavior == ScrollBehavior::Auto {
+                // The viewport uses the root element's property. Body values do
+                // not propagate here, unlike the separate overflow propagation.
+                let style_node = if node == root {
+                    selector::document_element(session.document()).unwrap_or(node)
+                } else { node };
+                let style = session.computed_style(style_node).map_err(|error| {
+                    OpError::new("InvalidStateError", format!("scroll style failed: {error:?}"))
+                })?;
+                resolved_scroll_behavior(behavior, style.scroll_behavior)
+            } else { behavior };
+            (session.scroll_offset(node), (x, y), behavior, (min_x, max_x, min_y, max_y))
         };
-        let x = if x.is_finite() { x } else { 0.0 };
-        let y = if y.is_finite() { y } else { 0.0 };
-        let x=x.clamp(f64::from(min_x),f64::from(max_x)) as f32;
-        let y=y.clamp(f64::from(min_y),f64::from(max_y)) as f32;
-        let behavior = if behavior == ScrollBehavior::Auto {
-            // The viewport uses the root element's property. Body values do
-            // not propagate here, unlike the separate overflow propagation.
-            let style_node = if node == root {
-                selector::document_element(session.document()).unwrap_or(node)
-            } else { node };
-            let style = session.computed_style(style_node).map_err(|error| {
-                OpError::new("InvalidStateError", format!("scroll style failed: {error:?}"))
-            })?;
-            resolved_scroll_behavior(behavior, style.scroll_behavior)
-        } else { behavior };
-        (session.scroll_offset(node), (x, y), behavior, (min_x, max_x, min_y, max_y))
+        let to = if snap && realm.layout_flusher.borrow().is_some() {
+            let snapped = crate::scroll_snap::snap_destination(realm, node, from, to, limits)?;
+            // Reading the snap style may restyle with the font source, which
+            // leaves the frame stale; the offset below needs a fresh one.
+            if realm.layout_flusher.borrow().is_some() { realm.flush_layout()?; }
+            snapped
+        } else { to };
+        (from, to, behavior)
     };
-    let to = if snap && realm.layout_flusher.borrow().is_some() {
-        let snapped = crate::scroll_snap::snap_destination(realm, node, from, to, limits)?;
-        // Reading the snap style may restyle with the font source, which
-        // leaves the frame stale; the offset below needs a fresh one.
-        if realm.layout_flusher.borrow().is_some() { realm.flush_layout()?; }
-        snapped
-    } else { to };
     let apply = |ctx: &mut Ctx| {
         // Abort even when the replacement destination equals the current
         // offset: a no-op instant request must stop an ongoing animation.
@@ -1301,6 +1329,38 @@ mod tests {
                 panic!("scrolling script failed: {message}");
             }
         }
+    }
+
+    #[test]
+    fn scrolling_the_viewport_to_the_origin_it_is_at_needs_no_layout() {
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<style>html,body{margin:0}#tall{height:400px}</style><div id='tall'></div>",
+            32,
+        )
+        .unwrap();
+        let layouts = Rc::new(core::cell::Cell::new(0));
+        let counter = layouts.clone();
+        realm.set_layout_flusher(Rc::new(move |session| {
+            counter.set(counter.get() + 1);
+            session.display_list(100, 80, &NoText).map(|_| ()).map_err(|error| format!("{error:?}"))
+        }));
+        realm.flush_layout().unwrap();
+        script(&mut engine, "document.getElementById('tall').style.height='500px'; true");
+        let before = layouts.get();
+        script(&mut engine, "window.scroll(0, 0); window.scrollTo({top: 0, left: 0}); true");
+        assert_eq!(layouts.get(), before, "the viewport stays at the origin for any layout");
+        script(&mut engine, "window.scroll(0, 30); true");
+        assert!(layouts.get() > before, "a destination off the origin is clamped by layout");
+        assert!(matches!(script(&mut engine, "scrollY"), Value::Num(y) if y == 30.0));
+        let scrolled = layouts.get();
+        script(&mut engine, "document.getElementById('tall').style.height='600px'; window.scroll(0, 0); true");
+        assert!(layouts.get() > scrolled, "leaving a scrolled position takes layout");
+        assert!(matches!(script(&mut engine, "scrollY"), Value::Num(y) if y == 0.0));
+        let snapping = layouts.get();
+        script(&mut engine, "document.documentElement.style.scrollSnapType='y mandatory'; window.scroll(0, 0); true");
+        assert!(layouts.get() > snapping, "a snapping viewport may move, so it lays out");
     }
 
     #[test]

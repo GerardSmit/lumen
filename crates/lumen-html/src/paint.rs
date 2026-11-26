@@ -563,7 +563,7 @@ impl FontFeatureSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FontSpec {
     pub families: Option<Arc<[FontFamily]>>,
     /// Shared declaration-origin shadow roots, nearest first; None is document scope.
@@ -591,6 +591,36 @@ pub struct FontSpec {
     /// Computed `text-spacing-trim`, mirrored here because it selects font features.
     pub spacing_trim: SpacingTrim,
 }
+
+/// Shared slices compare by address first. `Arc`'s own `==` skips the
+/// contents for an identical allocation only for sized values, so a shared
+/// family list would otherwise compare every name on each shaping lookup.
+fn same_shared_slice<T: PartialEq>(left: &Option<Arc<[T]>>, right: &Option<Arc<[T]>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right) || left == right,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl PartialEq for FontSpec {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured without `..`, so a new field must be compared here.
+        let Self {
+            families, family_scope, weight, weight_fraction, style, unresolved_style, unresolved_stretch, stretch,
+            size_adjust, caps, ligatures, feature_settings, alternates, disable_optional_ligatures,
+            synthesize_small_caps, spacing_trim,
+        } = self;
+        *weight == other.weight && *weight_fraction == other.weight_fraction && *style == other.style
+            && *stretch == other.stretch && *size_adjust == other.size_adjust && *caps == other.caps
+            && *ligatures == other.ligatures && *disable_optional_ligatures == other.disable_optional_ligatures
+            && *synthesize_small_caps == other.synthesize_small_caps && *spacing_trim == other.spacing_trim
+            && *unresolved_style == other.unresolved_style && *unresolved_stretch == other.unresolved_stretch
+            && *feature_settings == other.feature_settings && *alternates == other.alternates
+            && same_shared_slice(families, &other.families) && same_shared_slice(family_scope, &other.family_scope)
+    }
+}
+
 impl Default for FontSpec {
     fn default() -> Self {
         Self {
@@ -637,7 +667,28 @@ impl SpacingTrim {
     }
 }
 
+/// The bit a named font family takes in a family set (`FontSpec::family_bits`):
+/// families match ASCII case-insensitively, so equal names share a bit. A set
+/// may hold false positives, never false negatives.
+pub fn font_family_bit(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    1 << (hash % 64)
+}
+
 impl FontSpec {
+    /// The named families this font may select a face from, as a set of
+    /// `font_family_bit`s. Generic families never select a document's
+    /// `@font-face` faces, so they take no bit.
+    pub fn family_bits(&self) -> u64 {
+        self.families.as_deref().map_or(0, |families| {
+            families.iter().filter_map(FontFamily::named).fold(0, |bits, name| bits | font_family_bit(name))
+        })
+    }
+
     pub fn weight_milli(&self) -> u32 {
         u32::from(self.weight) * 1000 + u32::from(self.weight_fraction)
     }
@@ -767,6 +818,12 @@ pub trait TextShaper {
     /// Identity/generation of the immutable font configuration used for layout.
     fn generation(&self) -> u64 {
         0
+    }
+    /// The set of `font_family_bit`s of the fonts shaped with, which layout
+    /// reads and resets to learn which families a box's text used. None when
+    /// this shaper does not record them.
+    fn family_record(&self) -> Option<&core::cell::Cell<u64>> {
+        None
     }
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()>;
     fn shape_directional(&self, text: &str, size: f32, _rtl: bool) -> Result<ShapedRun, ()> {

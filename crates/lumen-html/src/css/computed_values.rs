@@ -35,6 +35,40 @@ pub struct ComputedValueContext<'a> {
     pub independent_border_widths: bool,
 }
 
+impl Style {
+    /// Whether the resolved value of `name` for this style depends on layout,
+    /// for a property [`needs_layout`] lists. Blink's `IsLayoutDependent` in the
+    /// same spirit: a `transform` matrix needs the reference box only for a
+    /// percentage translation or a relative expression, so any other transform
+    /// (and `none`) resolves without laying the document out.
+    pub fn resolved_value_needs_layout(&self, name: &str) -> bool {
+        match name {
+            "transform" => {
+                self.relative_expressions.iter().any(|expression| expression.slot == 59)
+                    || self.transforms.as_deref().is_some_and(|values| {
+                        values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))
+                    })
+            }
+            // As in Blink (`IsLayoutDependent`), a fixed margin, padding or
+            // min/max size resolves to its computed value; percentages,
+            // relative expressions and `auto` margins take the used value.
+            _ if name.starts_with("margin") => self.margin_auto.contains(&true) || self.has_relative_slots(39..43),
+            _ if name.starts_with("padding") => self.has_relative_slots(43..47),
+            "min-width" | "max-width" | "min-height" | "max-height" | "min-inline-size" | "max-inline-size"
+            | "min-block-size" | "max-block-size" => self.has_relative_slots(23..25) || self.has_relative_slots(51..53),
+            // A statically positioned box's insets resolve to their computed values.
+            "top" | "right" | "bottom" | "left" => self.position != Position::Static,
+            _ if name.starts_with("inset") => self.position != Position::Static,
+            _ => needs_layout(name),
+        }
+    }
+
+    fn has_relative_slots(&self, slots: core::ops::Range<usize>) -> bool {
+        self.relative_lengths.iter().any(|(slot, _)| slots.contains(slot))
+            || self.relative_expressions.iter().any(|expression| slots.contains(&expression.slot))
+    }
+}
+
 pub fn needs_layout(name: &str) -> bool {
     matches!(
         name,

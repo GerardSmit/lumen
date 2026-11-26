@@ -949,6 +949,15 @@ fn is_ncname(name: &str) -> bool {
 /// Split and validate an XML qualified name.
 ///
 /// An unprefixed QName returns an empty prefix and the name as its local part.
+/// The local part of a qualified name, or the whole name when it has no valid
+/// prefix. Without a colon that is the name itself, so it is not validated.
+pub fn local_part(name: &str) -> &str {
+    if !name.contains(':') {
+        return name;
+    }
+    split_qname(name).map_or(name, |(_, local)| local)
+}
+
 pub fn split_qname(name: &str) -> Option<(&str, &str)> {
     if let Some((prefix, local)) = name.split_once(':') {
         (is_ncname(prefix) && is_ncname(local)).then_some((prefix, local))

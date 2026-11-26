@@ -2798,7 +2798,9 @@ fn rule_mutation_exception(ctx: &mut Ctx, error: CssRuleMutationError) -> OpErro
     crate::error_reporting::dom_exception(ctx,name,message)
 }
 fn parse_inserted_rule(text: &str, namespace_source: &str) -> Result<CssRuleText, css::CssError> {
-    let namespaces=css::namespaces::NamespaceMap::from_stylesheet(namespace_source)?;
+    parse_inserted_rule_in(text,&css::namespaces::NamespaceMap::from_stylesheet(namespace_source)?)
+}
+fn parse_inserted_rule_in(text: &str, namespaces: &css::namespaces::NamespaceMap) -> Result<CssRuleText, css::CssError> {
     let source=css::nesting::parse_one_source_rule_in_namespace_context(text,&[],&namespaces)?;
     let mut rules=source_rules_to_cssom_with_namespaces(text,core::slice::from_ref(&source),false,&namespaces)?;
     if rules.len()!=1 {return Err(css::CssError{offset:0,message:"insertRule requires exactly one rule"});}
@@ -2926,6 +2928,37 @@ impl CssStyleSheetText {
     }
 
     pub fn css_rules(&self) -> Result<Vec<CssRuleText>, css::CssError> {
+        self.shared_rules().map(|rules| (*rules).clone())
+    }
+
+    /// The parsed rule list, shared between readers. Parsing is a pure function
+    /// of this value, so a few recent sheets keep their parse: script loops that
+    /// read `cssRules.length` and `cssRules[i]` would otherwise reparse the whole
+    /// stylesheet for every access.
+    fn shared_rules(&self) -> Result<Rc<Vec<CssRuleText>>, css::CssError> {
+        const ENTRIES: usize = 4;
+        thread_local! {
+            static PARSED: RefCell<Vec<(CssStyleSheetText, Rc<Vec<CssRuleText>>)>> = const { RefCell::new(Vec::new()) };
+        }
+        let hit = PARSED.with(|parsed| {
+            let mut parsed = parsed.borrow_mut();
+            let position = parsed.iter().position(|(sheet, _)| sheet == self)?;
+            let entry = parsed.remove(position);
+            let rules = entry.1.clone();
+            parsed.push(entry);
+            Some(rules)
+        });
+        if let Some(rules) = hit { return Ok(rules); }
+        let rules = Rc::new(self.parse_rules()?);
+        PARSED.with(|parsed| {
+            let mut parsed = parsed.borrow_mut();
+            if parsed.len() >= ENTRIES { parsed.remove(0); }
+            parsed.push((self.clone(), rules.clone()));
+        });
+        Ok(rules)
+    }
+
+    fn parse_rules(&self) -> Result<Vec<CssRuleText>, css::CssError> {
         let mut rules = if self.singleton_declarations {
             let style = CssDeclaration::parse(&self.text);
             vec![CssRuleText { css_text: style.css_text().to_owned(), selector_text: None, style, nested: Vec::new(), nested_declarations: true, font_face: false, position_try: false, function_body: false, keyframes: None, page_selector: None, margin_box: None, header: RuleHeader::Other }]
@@ -2953,10 +2986,13 @@ impl CssStyleSheetText {
     }
 
     fn rule_list(&self, parent_path: &[usize]) -> Result<Vec<CssRuleText>, css::CssError> {
-        if parent_path.is_empty() {
-            return self.css_rules();
-        }
-        let mut rules = self.css_rules()?;
+        self.with_rule_list(parent_path, |rules| rules.to_vec())
+    }
+
+    /// Reads the rule list at `parent_path` without copying the parsed sheet.
+    fn with_rule_list<R>(&self, parent_path: &[usize], read: impl FnOnce(&[CssRuleText]) -> R) -> Result<R, css::CssError> {
+        let shared = self.shared_rules()?;
+        let mut rules: &[CssRuleText] = &shared;
         for index in parent_path {
             let Some(parent) = rules.get(*index) else {
                 return Err(css::CssError {
@@ -2964,9 +3000,9 @@ impl CssStyleSheetText {
                     message: "CSS rule index out of range",
                 });
             };
-            rules = parent.nested.clone();
+            rules = &parent.nested;
         }
-        Ok(rules)
+        Ok(read(rules))
     }
 
     fn rule_at_path(&self, path: &[usize]) -> Result<CssRuleText, css::CssError> {
@@ -2976,8 +3012,7 @@ impl CssStyleSheetText {
                 message: "CSS rule index out of range",
             });
         };
-        let rules = self.rule_list(parents)?;
-        rules.get(index).cloned().ok_or(css::CssError {
+        self.with_rule_list(parents, |rules| rules.get(index).cloned())?.ok_or(css::CssError {
             offset: index,
             message: "CSS rule index out of range",
         })
@@ -3191,9 +3226,10 @@ impl CssStyleSheetText {
     #[cfg(test)]
     pub fn insert_rule(&mut self, rule: &str, index: usize) -> Result<(), CssRuleMutationError> {
         let rule=parse_inserted_rule(rule,&self.text)?;
-        self.insert_parsed_rule(rule,index)
+        self.insert_parsed_rule(rule,index).map(drop)
     }
-    fn insert_parsed_rule(&mut self, rule: CssRuleText, index: usize) -> Result<(), CssRuleMutationError> {
+    /// Inserts `rule` at `index`, returning how many top-level rules follow.
+    fn insert_parsed_rule(&mut self, rule: CssRuleText, index: usize) -> Result<usize, CssRuleMutationError> {
         let mut current=self.css_rules()?;
         if index>current.len() {return Err(CssRuleMutationError::IndexSize);}
         check_rule_order(&current,index,&rule)?;
@@ -3202,7 +3238,28 @@ impl CssStyleSheetText {
         self.set_rules(&current)?;
         self.import_occurrences=import_map;
         self.rebase_retained(&[],index,true);
-        Ok(())
+        Ok(current.len())
+    }
+
+    /// Appends an ordinary rule to a sheet whose text is already the
+    /// serialization of its `count` rules, as CSS-in-JS libraries do for every
+    /// rule they generate. That serialization stays a prefix of the result, so
+    /// only the new rule is written; nothing before it is parsed again.
+    fn append_parsed_rule(&mut self, rule: &CssRuleText) -> Result<bool, CssRuleMutationError> {
+        if rule.header != RuleHeader::Other || self.singleton_declarations || self.nested_context || self.scoped_context
+            || self.namespaces.is_some() || self.import_occurrences.is_some() {
+            return Ok(false);
+        }
+        let start = self.text.len();
+        let mut boundaries = self.boundaries.to_vec();
+        if !self.text.is_empty() { self.text.push('\n'); }
+        serialize_rule_into(rule, &mut self.text, None, &mut boundaries);
+        if self.text.len() > 1024 * 1024 || boundaries.len() > css::nesting::MAX_DECLARATION_BOUNDARIES {
+            self.text.truncate(start);
+            return Err(CssRuleMutationError::Syntax(css::CssError { offset: 0, message: "CSSOM source topology exceeds limit" }));
+        }
+        self.boundaries = boundaries.into();
+        Ok(true)
     }
     pub fn delete_rule(&mut self, index: usize) -> Result<(), CssRuleMutationError> {
         let mut current=self.css_rules()?;
@@ -3706,6 +3763,9 @@ struct RulePositions {
     nested_context: bool,
     scoped_context: bool,
     text: RefCell<Option<String>>,
+    /// How many top-level rules `text` holds, known once a rule insertion has
+    /// written `text` as the serialization of its rules.
+    rule_count: Cell<Option<usize>>,
     live: RefCell<Vec<Weak<RulePosition>>>,
     declarations: RefCell<Vec<(Arc<[usize]>, Rc<css::DeclarationBlock>)>>,
     boundaries: RefCell<Arc<[css::nesting::DeclarationBoundary]>>,
@@ -3889,6 +3949,7 @@ impl RulePositions {
 
     fn remember(&self, text:&str)->OpResult<()> {
         if self.text.borrow().as_deref()==Some(text){return Ok(());}
+        self.rule_count.set(None);
         let namespaces=if !self.inherited_namespaces && !self.frame_rules {Some(Arc::new(css::namespaces::NamespaceMap::from_stylesheet(text).map_err(css_error)?))}else{None};
         *self.text.borrow_mut()=Some(text.to_owned());
         if let Some(namespaces)=namespaces{*self.namespaces.borrow_mut()=namespaces;}
@@ -3952,6 +4013,13 @@ impl RulePositions {
         }
         self.remember(text)?;
         Ok(())
+    }
+
+    /// A style rule appended to the serialized `text`: no rule moves and the
+    /// header sections, hence the namespaces, are unchanged.
+    fn appended(&self, text: String, rule_count: usize) {
+        *self.text.borrow_mut() = Some(text);
+        self.rule_count.set(Some(rule_count));
     }
 
     fn deleted(&self, index: usize, removed: &str, text: &str)->OpResult<()> {
@@ -6313,13 +6381,30 @@ impl DomCssStyleSheet {
         let position = index.unwrap_or(0) as usize;
         // CSSStyleSheet parses before invoking the generic list algorithm,
         // including its index check. Constructed imports fail in this phase.
-        let parsed=parse_inserted_rule(rule,sheet.css_text()).map_err(|error|css_rule_dom_exception(ctx,error))?;
+        let positions = self.source.positions();
+        // Synchronized above: the positions hold this text's namespaces.
+        let parsed=if !positions.inherited_namespaces && !positions.frame_rules {
+            parse_inserted_rule_in(rule,&positions.namespaces.borrow().clone())
+        } else { parse_inserted_rule(rule,sheet.css_text()) }.map_err(|error|css_rule_dom_exception(ctx,error))?;
         if matches!(&self.source,SheetSource::Constructed(_)) && parsed.header==RuleHeader::Import {
             return Err(crate::error_reporting::dom_exception(ctx,"SyntaxError","constructed stylesheets cannot insert import rules"));
         }
-        sheet.insert_parsed_rule(parsed,position).map_err(|error|rule_mutation_exception(ctx,error))?;
-        commit_rule_declaration(&self.realm, &self.source, &before, &sheet, &[], None)?;
-        self.source.positions().inserted(position, sheet.css_text())?;
+        let appended = positions.rule_count.get() == Some(position)
+            && sheet.append_parsed_rule(&parsed).map_err(|error|rule_mutation_exception(ctx,error))?;
+        let count = if appended { position + 1 } else {
+            sheet.insert_parsed_rule(parsed,position).map_err(|error|rule_mutation_exception(ctx,error))?
+        };
+        // Remembered first, so the commit finds the text current instead of
+        // scanning it for namespaces; a failed commit remembers `before`.
+        if appended { positions.appended(sheet.css_text().to_owned(), count); }
+        if let Err(error) = commit_rule_declaration(&self.realm, &self.source, &before, &sheet, &[], None) {
+            if appended { positions.remember(before.css_text())?; }
+            return Err(error);
+        }
+        if !appended {
+            positions.inserted(position, sheet.css_text())?;
+            positions.rule_count.set(Some(count));
+        }
         Ok(position as u32)
     }
 
@@ -6441,17 +6526,11 @@ impl DomCssRuleList {
                 .rules
                 .len());
         }
-        let rules = sheet
-            .rule_list(&location.indices.clone())
-            .map_err(css_error)?;
         let positions = positions_for_rule_list(&location.source, &self.rule_path);
-        let position_text = if self.rule_path.is_empty() {
-            sheet.css_text().to_owned()
-        } else {
-            rules_text(&rules)
-        };
-        if self.rule_path.is_empty() { positions.synchronize(&position_text)?; } else { positions.synchronize_rules(&rules)?; }
-        Ok(rules.len())
+        sheet.with_rule_list(&location.indices, |rules| {
+            if self.rule_path.is_empty() { positions.synchronize(sheet.css_text())?; } else { positions.synchronize_rules(rules)?; }
+            Ok(rules.len())
+        }).map_err(css_error)?
     }
 
     #[proto(getitem)]
@@ -6491,19 +6570,15 @@ impl DomCssRuleList {
             *position.wrapper.borrow_mut() = ctx.weak_value(&wrapper);
             return Ok(wrapper);
         }
-        let rules = sheet
-            .rule_list(&location.indices.clone())
-            .map_err(css_error)?;
-        let Some(rule) = rules.get(index) else {
+        let positions = positions_for_rule_list(&location.source, &self.rule_path);
+        let rule = sheet.with_rule_list(&location.indices, |rules| -> OpResult<Option<CssRuleText>> {
+            let Some(rule) = rules.get(index) else { return Ok(None); };
+            if self.rule_path.is_empty() { positions.synchronize(sheet.css_text())?; } else { positions.synchronize_rules(rules)?; }
+            Ok(Some(rule.clone()))
+        }).map_err(css_error)??;
+        let Some(rule) = rule.as_ref() else {
             return Ok(Value::Undefined);
         };
-        let positions = positions_for_rule_list(&location.source, &self.rule_path);
-        let position_text = if self.rule_path.is_empty() {
-            sheet.css_text().to_owned()
-        } else {
-            rules_text(&rules)
-        };
-        if self.rule_path.is_empty() { positions.synchronize(&position_text)?; } else { positions.synchronize_rules(&rules)?; }
         let position = positions.at(index);
         if let Some(wrapper) = position
             .wrapper
@@ -10177,6 +10252,38 @@ return true;})()"#).unwrap();
             rules[0].nested[0].selector_text.as_deref(),
             Some(".supported")
         );
+    }
+
+    #[test]
+    fn appended_rules_match_inserted_ones_and_apply() {
+        let mut engine = lumen::Engine::new();
+        // The author text ends inside a comment; appending to it verbatim
+        // would hide every later rule.
+        crate::install(engine.ctx(), "<style>.a { color: red } /* open</style><p class=b>x</p>", 64).unwrap();
+        let result = engine.eval_value(r#"(() => {
+            const sheet = document.querySelector('style').sheet;
+            const expected = ['.a { color: red; }'];
+            for (let i = 0; i < 40; i++) {
+                sheet.insertRule(`.c${i} { order: ${i}; }`, sheet.cssRules.length);
+                expected.push(`.c${i} { order: ${i}; }`);
+            }
+            sheet.insertRule('.mid { order: 1; }', 3); expected.splice(3, 0, '.mid { order: 1; }');
+            sheet.deleteRule(1); expected.splice(1, 1);
+            sheet.insertRule('@media screen { .m { order: 2; } }', sheet.cssRules.length);
+            expected.push('@media screen {\n  .m { order: 2; }\n}');
+            sheet.insertRule('.b { color: rgb(0, 128, 0); }', sheet.cssRules.length);
+            expected.push('.b { color: rgb(0, 128, 0); }');
+            const texts = Array.from(sheet.cssRules, rule => rule.cssText);
+            if (texts.length !== expected.length) return 'length ' + texts.length;
+            for (let i = 0; i < texts.length; i++) if (texts[i] !== expected[i]) return i + ': ' + texts[i];
+            try { sheet.insertRule('.late { order: 3; }', sheet.cssRules.length + 1); return 'no IndexSizeError'; }
+            catch (error) { if (error.name !== 'IndexSizeError') return error.name; }
+            try { sheet.insertRule('@import url(x.css);', sheet.cssRules.length); return 'no HierarchyRequestError'; }
+            catch (error) { if (error.name !== 'HierarchyRequestError') return error.name; }
+            const color = getComputedStyle(document.querySelector('p')).color;
+            return color === 'rgb(0, 128, 0)' || color;
+        })()"#);
+        assert!(matches!(result, Ok(Ok(Value::Bool(true)))), "appended rules diverged from inserted ones");
     }
 
     #[test]

@@ -64,6 +64,7 @@ pub mod selectm;
 pub mod signalm;
 pub mod singlephasem;
 pub mod slots;
+#[cfg(unix)]
 pub mod socketm;
 pub mod sre;
 #[cfg(all(unix, not(target_os = "android")))]

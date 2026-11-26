@@ -43,6 +43,31 @@ pub fn enable_system_fonts() {
     ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Builds the index of installed fonts and loads the generic families' regular and bold faces
+/// on a background thread, so the first layout of a page does not wait for the font files. Hosts
+/// call it once system fonts are enabled, before a page needs text; without system fonts it does
+/// nothing. Later lookups share the loaded faces.
+pub fn prewarm_system_fonts() {
+    if !system_fonts_enabled() || STATE.get().is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("font-prewarm".into()).spawn(|| {
+        let fonts = state();
+        for generic in [GenericFontFamily::SansSerif, GenericFontFamily::Serif, GenericFontFamily::Monospace,
+            GenericFontFamily::SystemUi] {
+            for weight in [400, 700] {
+                let _ = fonts.generic(generic, &FontSpec { weight, ..FontSpec::default() });
+            }
+        }
+        let _ = fonts.scan.get_or_init(|| fonts.index.scan_list());
+        // Every style's `ic` unit base measures "水" in its fallback face, so the
+        // first layout of any page asks for the CJK fallback.
+        for weight in [400, 700] {
+            let _ = fonts.fallback('水', None, &FontSpec { weight, ..FontSpec::default() });
+        }
+    });
+}
+
 pub fn system_fonts_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
@@ -677,8 +702,10 @@ impl SystemFonts {
     }
 
     fn open(&self, position: usize, entry: &SystemFontEntry) -> Option<SystemFace> {
-        let bytes = read_entry_bytes(entry).ok()?;
-        let mut face = FontFace::new_with_limit(Arc::from(bytes), MAX_SYSTEM_FONT_BYTES).ok()?;
+        let mut face = match map_entry(entry) {
+            Some(face) => face,
+            None => FontFace::new_with_limit(Arc::from(read_entry_bytes(entry).ok()?), MAX_SYSTEM_FONT_BYTES).ok()?,
+        };
         if self.platform == FontPlatform::MacOs && matches!(&*entry.family.to_lowercase(), "times" | "helvetica" | "courier") {
             face = face.with_classic_mac_ascent();
         }
@@ -784,6 +811,45 @@ impl SystemFonts {
     }
 }
 
+/// An installed font file mapped read-only. Its pages are file-backed and the OS
+/// loads them as tables are read, so a fallback face costs only the tables it
+/// uses instead of a copy of the whole file (or collection) on first use.
+struct MappedFont(lumen_os::mmap::FileBytes);
+
+// SAFETY: the mapping is private to this value, never resized or remapped, and
+// only read through `as_bytes`; read-only pages may be shared between threads.
+unsafe impl Send for MappedFont {}
+unsafe impl Sync for MappedFont {}
+
+impl AsRef<[u8]> for MappedFont {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// The installed face read in place from a mapping of its file, or `None` where
+/// files cannot be mapped (the caller then reads the face).
+fn map_entry(entry: &SystemFontEntry) -> Option<FontFace> {
+    if entry.file_length > MAX_SYSTEM_FONT_BYTES as u64 {
+        return None;
+    }
+    let mapped @ lumen_os::mmap::FileBytes::Mapped(_) = lumen_os::mmap::map_file_readonly(&entry.path).ok()? else {
+        return None;
+    };
+    let bytes = MappedFont(mapped);
+    let index = if entry.collection { collection_index(bytes.as_ref(), entry.face_offset)? } else { 0 };
+    FontFace::new_external(Arc::new(bytes), index, MAX_SYSTEM_FONT_BYTES).ok()
+}
+
+/// The index of the collection face whose table directory starts at `offset`.
+fn collection_index(bytes: &[u8], offset: u64) -> Option<u32> {
+    if bytes.get(..4) != Some(b"ttcf") {
+        return None;
+    }
+    let count = be32(bytes, 8)?.min(MAX_FACES_PER_FILE as u32);
+    (0..count).find(|&index| be32(bytes, 12 + index as usize * 4).is_some_and(|at| u64::from(at) == offset))
+}
+
 fn read_entry_bytes(entry: &SystemFontEntry) -> io::Result<Vec<u8>> {
     if !entry.collection {
         if entry.file_length > MAX_SYSTEM_FONT_BYTES as u64 {
@@ -840,7 +906,11 @@ pub(crate) fn by_identity(identity: u64) -> Option<&'static Arc<FontFace>> {
                 })
             });
             drop(loaded);
-            found?
+            // Derived keys are unique and never reused, so a found one stays valid;
+            // a miss is not kept, as the face may be loaded later.
+            let found = found?;
+            lock(&state.by_id).insert(identity, found);
+            found
         }
     };
     state.faces[position as usize].get()?.as_ref().map(|loaded| &loaded.font.face)

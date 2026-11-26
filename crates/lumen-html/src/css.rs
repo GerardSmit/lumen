@@ -119,6 +119,9 @@ pub mod counter_styles;
 pub(crate) const FALLBACK_NO_COLUMNS: u8 = 1;
 pub(crate) const FALLBACK_PLAIN_SELECT: u8 = 2;
 pub(crate) const FALLBACK_NO_GENERATED: u8 = 4;
+/// Column flex containers do not guess that their items fill their minimum
+/// height (`layout::Layout::column_flex_in_place`).
+pub(crate) const FALLBACK_NO_FLEX_SPECULATION: u8 = 8;
 use namespaces::{NamespaceMap,NamespaceConstraint};
 pub mod typed_numeric;
 mod color_values;
@@ -2418,6 +2421,25 @@ struct FontLengthUnits {
     root: FontUnitBases,
 }
 
+/// The font families (`font_family_bit`s) whose metrics ever resolved a
+/// font-relative length for a style index without a sink of its own.
+static FONT_METRIC_FAMILIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The families a style computed without a sink may have read font metrics
+/// from. It only grows: a cached style may still hold such a read.
+pub(crate) fn font_metric_families() -> u64 {
+    FONT_METRIC_FAMILIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A computed style resolved a value that may use a font metric: the
+/// families of the element's, its parent's and the root's fonts count, in
+/// the index's sink or else the process-wide set.
+fn note_font_metric_read(index: Option<&StyleIndex>, style: &Style, parent: Option<&Style>) {
+    let families = style.font_metric_family_bits() | parent.map_or(0, |parent| parent.font_spec().family_bits());
+    index.and_then(|index| index.font_metric_sink.as_deref()).unwrap_or(&FONT_METRIC_FAMILIES)
+        .fetch_or(families, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn font_unit_bases(
     text: Option<&dyn TextShaper>,
     size: f32,
@@ -2965,7 +2987,7 @@ impl FilterInterpolation {
     pub(crate) fn css_keyword(self)->&'static str {match self{Self::Auto=>"auto",Self::Srgb=>"srgb",Self::LinearRgb=>"linearrgb"}}
 }
 impl SvgFilterProperties {pub const INITIAL:Self=Self{flood:Rgba{r:0,g:0,b:0,a:255},opacity:1.0,interpolation:FilterInterpolation::LinearRgb};}
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StyleExtras {
     pub source_colors:Option<Arc<[(usize,SourceColor)]>>,
     shadow_source_colors:Option<Arc<[(usize,Arc<[SourceColor]>)]>>,
@@ -3239,6 +3261,239 @@ pub struct StyleExtras {
     /// Inset, margin and size declarations using `anchor()` or `anchor-size()`,
     /// resolved against anchor geometry during layout: (slot, canonical value).
     pub anchored: Option<Arc<[(usize, Arc<str>)]>>,
+}
+
+// Shared `Arc` slices and strings compare by address first: `Arc`'s own `==`
+// skips identical allocations only for sized values, and restyles compare
+// extras whose lists are mostly still shared with the old style.
+impl PartialEq for StyleExtras {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured without `..`, so a new field must be compared here.
+        let Self { source_colors, shadow_source_colors, image_color_origins, field_sizing, appearance, border_image, widget_devolved, text_shadows, text_shadow_current_color, text_transform, container_type, container_flags, animation, font, min_width_auto, min_height_auto, flex_basis_content, compressible_percentage, flex_basis_intrinsic, sibling_position_dependent, gap_specified, row_gap_normal, writing_mode, text_orientation, word_break, overflow_wrap, contain_paint, contain_layout, contain_style, contain_size, contain_inline_size, contain_intrinsic, column_width, line_break_counts, break_controls, visibility_visible, visibility_collapsed, pointer_events_auto, user_select, user_select_declared, svg_fill, svg_stroke, svg_stroke_width, svg_fill_opacity, svg_stroke_opacity, svg_fill_rule, svg_clip_rule, svg_clip_path, svg_geometry, svg_stop_color, svg_stop_opacity, svg_filter_properties, filter_reference_scope, generated_content, content_none, color_scheme, transition_duration, transition_delay, transition_property, transition_timing_function, transition_behavior, view_transition_name, quotes, counter_reset, counter_increment, counter_set, list_style_type, list_style_position, list_style_image, empty_cells_hide, caption_bottom, border_collapse, logical_border_width, logical_border_color, logical_border_style, border_width_sides, border_color_sides, border_solid_sides, border_style_sides, border_corner_radii, logical_border_radius_corners, height_intrinsic, width_intrinsic, min_width_intrinsic, max_width_intrinsic, logical_size_intrinsic, logical_min_intrinsic, logical_max_intrinsic, min_height_intrinsic, max_height_intrinsic, logical_inline_size, logical_block_size, logical_overflow, logical_min_size, logical_max_size, logical_offsets, logical_padding_inline, logical_padding_block, logical_margin_inline, logical_margin_block, column_count, column_gap, row_gap_fraction, column_gap_fraction, column_fill_auto, column_rule_width, column_rule_color, column_rule_style, outline, grid_auto_columns, grid_auto_rows, grid_auto_flow, grid_lanes, display_inline, display_list_item, display_ruby, grid_lanes_direction, grid_lanes_dense, flow_tolerance, justify_items, justify_self, grid_areas, grid_area_dimensions, grid_area, grid_column_names, grid_row_names, grid_column_spec, grid_row_spec, grid_columns_subgrid, grid_rows_subgrid, grid_columns_subgrid_repeat, grid_rows_subgrid_repeat, grid_columns_auto, grid_rows_auto, grid_columns_source, grid_rows_source, grid_lead, transforms, individual_transforms, filters, transform_origin, transform_origin_z, transform_box, border_pattern, shadows, background_images, background_position, background_size, background_size_math, background_repeat, background_clip, background_origin, background_attachment, mask_images, mask_position, mask_size, mask_repeat, mask_origin, mask_clip, mask_mode, overflow_x, overflow_y, white_space, text_align, text_indent, text_indent_mode, letter_spacing, word_spacing, vertical_align, direction, unicode_bidi, scroll_behavior, text_overflow, text_overflow_markers, text_decoration, text_decoration_style, text_decoration_color, text_underline_position, text_decoration_thickness, text_underline_offset, table_cell_content_offset, root_font_size, root_font_units, registered_query, min_height, max_height, aspect_ratio, aspect_ratio_components, aspect_ratio_auto, z_index, relative_lengths, relative_expressions, order, margin_auto, align_content, align_content_safe, justify_content_safe, align_content_keyword, justify_content_keyword, align_items_keyword, justify_items_keyword, align_self_keyword, justify_self_keyword, align_items_safe, justify_items_safe, align_self_safe, justify_self_safe, flex_wrap_reverse, flex_wrap_balance, align_self, position, float, clear, top, right, bottom, left, margin_sides, padding_sides, grid_columns, grid_rows, generic, anchored } = self;
+        *field_sizing == other.field_sizing
+            && *appearance == other.appearance
+            && *widget_devolved == other.widget_devolved
+            && *text_shadow_current_color == other.text_shadow_current_color
+            && *text_transform == other.text_transform
+            && *container_type == other.container_type
+            && *container_flags == other.container_flags
+            && *font == other.font
+            && *min_width_auto == other.min_width_auto
+            && *min_height_auto == other.min_height_auto
+            && *flex_basis_content == other.flex_basis_content
+            && *compressible_percentage == other.compressible_percentage
+            && *flex_basis_intrinsic == other.flex_basis_intrinsic
+            && *sibling_position_dependent == other.sibling_position_dependent
+            && *gap_specified == other.gap_specified
+            && *row_gap_normal == other.row_gap_normal
+            && *writing_mode == other.writing_mode
+            && *text_orientation == other.text_orientation
+            && *word_break == other.word_break
+            && *overflow_wrap == other.overflow_wrap
+            && *contain_paint == other.contain_paint
+            && *contain_layout == other.contain_layout
+            && *contain_style == other.contain_style
+            && *contain_size == other.contain_size
+            && *contain_inline_size == other.contain_inline_size
+            && *column_width == other.column_width
+            && *visibility_visible == other.visibility_visible
+            && *visibility_collapsed == other.visibility_collapsed
+            && *pointer_events_auto == other.pointer_events_auto
+            && *user_select == other.user_select
+            && *user_select_declared == other.user_select_declared
+            && *svg_fill == other.svg_fill
+            && *svg_stroke == other.svg_stroke
+            && *svg_stroke_width == other.svg_stroke_width
+            && *svg_fill_opacity == other.svg_fill_opacity
+            && *svg_stroke_opacity == other.svg_stroke_opacity
+            && *svg_fill_rule == other.svg_fill_rule
+            && *svg_clip_rule == other.svg_clip_rule
+            && *svg_stop_color == other.svg_stop_color
+            && *svg_stop_opacity == other.svg_stop_opacity
+            && *content_none == other.content_none
+            && *view_transition_name == other.view_transition_name
+            && *quotes == other.quotes
+            && *list_style_type == other.list_style_type
+            && *list_style_position == other.list_style_position
+            && *empty_cells_hide == other.empty_cells_hide
+            && *caption_bottom == other.caption_bottom
+            && *border_collapse == other.border_collapse
+            && *logical_border_width == other.logical_border_width
+            && *logical_border_color == other.logical_border_color
+            && *logical_border_style == other.logical_border_style
+            && *border_width_sides == other.border_width_sides
+            && *border_color_sides == other.border_color_sides
+            && *border_solid_sides == other.border_solid_sides
+            && *border_style_sides == other.border_style_sides
+            && *border_corner_radii == other.border_corner_radii
+            && *logical_border_radius_corners == other.logical_border_radius_corners
+            && *height_intrinsic == other.height_intrinsic
+            && *width_intrinsic == other.width_intrinsic
+            && *min_width_intrinsic == other.min_width_intrinsic
+            && *max_width_intrinsic == other.max_width_intrinsic
+            && *logical_size_intrinsic == other.logical_size_intrinsic
+            && *logical_min_intrinsic == other.logical_min_intrinsic
+            && *logical_max_intrinsic == other.logical_max_intrinsic
+            && *min_height_intrinsic == other.min_height_intrinsic
+            && *max_height_intrinsic == other.max_height_intrinsic
+            && *logical_inline_size == other.logical_inline_size
+            && *logical_block_size == other.logical_block_size
+            && *logical_overflow == other.logical_overflow
+            && *logical_min_size == other.logical_min_size
+            && *logical_max_size == other.logical_max_size
+            && *logical_offsets == other.logical_offsets
+            && *logical_padding_inline == other.logical_padding_inline
+            && *logical_padding_block == other.logical_padding_block
+            && *logical_margin_inline == other.logical_margin_inline
+            && *logical_margin_block == other.logical_margin_block
+            && *column_count == other.column_count
+            && *column_gap == other.column_gap
+            && *row_gap_fraction == other.row_gap_fraction
+            && *column_gap_fraction == other.column_gap_fraction
+            && *column_fill_auto == other.column_fill_auto
+            && *column_rule_width == other.column_rule_width
+            && *column_rule_color == other.column_rule_color
+            && *column_rule_style == other.column_rule_style
+            && *outline == other.outline
+            && *grid_auto_flow == other.grid_auto_flow
+            && *grid_lanes == other.grid_lanes
+            && *display_inline == other.display_inline
+            && *display_list_item == other.display_list_item
+            && *display_ruby == other.display_ruby
+            && *grid_lanes_direction == other.grid_lanes_direction
+            && *grid_lanes_dense == other.grid_lanes_dense
+            && *flow_tolerance == other.flow_tolerance
+            && *justify_items == other.justify_items
+            && *justify_self == other.justify_self
+            && *grid_area_dimensions == other.grid_area_dimensions
+            && *grid_columns_subgrid == other.grid_columns_subgrid
+            && *grid_rows_subgrid == other.grid_rows_subgrid
+            && *grid_columns_subgrid_repeat == other.grid_columns_subgrid_repeat
+            && *grid_rows_subgrid_repeat == other.grid_rows_subgrid_repeat
+            && *grid_columns_auto == other.grid_columns_auto
+            && *grid_rows_auto == other.grid_rows_auto
+            && *grid_lead == other.grid_lead
+            && *transform_origin == other.transform_origin
+            && *transform_origin_z == other.transform_origin_z
+            && *transform_box == other.transform_box
+            && *border_pattern == other.border_pattern
+            && *overflow_x == other.overflow_x
+            && *overflow_y == other.overflow_y
+            && *white_space == other.white_space
+            && *text_align == other.text_align
+            && *text_indent == other.text_indent
+            && *text_indent_mode == other.text_indent_mode
+            && *letter_spacing == other.letter_spacing
+            && *word_spacing == other.word_spacing
+            && *vertical_align == other.vertical_align
+            && *direction == other.direction
+            && *unicode_bidi == other.unicode_bidi
+            && *scroll_behavior == other.scroll_behavior
+            && *text_overflow == other.text_overflow
+            && *text_decoration == other.text_decoration
+            && *text_decoration_style == other.text_decoration_style
+            && *text_decoration_color == other.text_decoration_color
+            && *text_underline_position == other.text_underline_position
+            && *text_decoration_thickness == other.text_decoration_thickness
+            && *text_underline_offset == other.text_underline_offset
+            && *table_cell_content_offset == other.table_cell_content_offset
+            && *root_font_size == other.root_font_size
+            && *min_height == other.min_height
+            && *max_height == other.max_height
+            && *aspect_ratio == other.aspect_ratio
+            && *aspect_ratio_components == other.aspect_ratio_components
+            && *aspect_ratio_auto == other.aspect_ratio_auto
+            && *z_index == other.z_index
+            && *relative_lengths == other.relative_lengths
+            && *relative_expressions == other.relative_expressions
+            && *order == other.order
+            && *margin_auto == other.margin_auto
+            && *align_content == other.align_content
+            && *align_content_safe == other.align_content_safe
+            && *justify_content_safe == other.justify_content_safe
+            && *align_content_keyword == other.align_content_keyword
+            && *justify_content_keyword == other.justify_content_keyword
+            && *align_items_keyword == other.align_items_keyword
+            && *justify_items_keyword == other.justify_items_keyword
+            && *align_self_keyword == other.align_self_keyword
+            && *justify_self_keyword == other.justify_self_keyword
+            && *align_items_safe == other.align_items_safe
+            && *justify_items_safe == other.justify_items_safe
+            && *align_self_safe == other.align_self_safe
+            && *justify_self_safe == other.justify_self_safe
+            && *flex_wrap_reverse == other.flex_wrap_reverse
+            && *flex_wrap_balance == other.flex_wrap_balance
+            && *align_self == other.align_self
+            && *position == other.position
+            && *float == other.float
+            && *clear == other.clear
+            && *top == other.top
+            && *right == other.right
+            && *bottom == other.bottom
+            && *left == other.left
+            && *margin_sides == other.margin_sides
+            && *padding_sides == other.padding_sides
+            && *generic == other.generic
+            && arcs_equal(source_colors, &other.source_colors)
+            && arcs_equal(shadow_source_colors, &other.shadow_source_colors)
+            && arcs_equal(image_color_origins, &other.image_color_origins)
+            && arcs_equal(border_image, &other.border_image)
+            && arcs_equal(text_shadows, &other.text_shadows)
+            && animation.iter().zip(&other.animation).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(contain_intrinsic, &other.contain_intrinsic)
+            && arcs_equal(line_break_counts, &other.line_break_counts)
+            && arcs_equal(break_controls, &other.break_controls)
+            && arcs_equal(svg_clip_path, &other.svg_clip_path)
+            && svg_geometry.iter().zip(&other.svg_geometry).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(svg_filter_properties, &other.svg_filter_properties)
+            && arcs_equal(filter_reference_scope, &other.filter_reference_scope)
+            && arcs_equal(generated_content, &other.generated_content)
+            && arcs_equal(color_scheme, &other.color_scheme)
+            && arcs_equal(transition_duration, &other.transition_duration)
+            && arcs_equal(transition_delay, &other.transition_delay)
+            && arcs_equal(transition_property, &other.transition_property)
+            && arcs_equal(transition_timing_function, &other.transition_timing_function)
+            && arcs_equal(transition_behavior, &other.transition_behavior)
+            && arcs_equal(counter_reset, &other.counter_reset)
+            && arcs_equal(counter_increment, &other.counter_increment)
+            && arcs_equal(counter_set, &other.counter_set)
+            && arcs_equal(list_style_image, &other.list_style_image)
+            && arcs_equal(grid_auto_columns, &other.grid_auto_columns)
+            && arcs_equal(grid_auto_rows, &other.grid_auto_rows)
+            && arcs_equal(grid_areas, &other.grid_areas)
+            && arcs_equal(grid_area, &other.grid_area)
+            && arcs_equal(grid_column_names, &other.grid_column_names)
+            && arcs_equal(grid_row_names, &other.grid_row_names)
+            && arcs_equal(grid_column_spec, &other.grid_column_spec)
+            && arcs_equal(grid_row_spec, &other.grid_row_spec)
+            && arcs_equal(grid_columns_source, &other.grid_columns_source)
+            && arcs_equal(grid_rows_source, &other.grid_rows_source)
+            && arcs_equal(transforms, &other.transforms)
+            && individual_transforms.iter().zip(&other.individual_transforms).all(|(a, b)| arcs_equal(a, b))
+            && arcs_equal(filters, &other.filters)
+            && arcs_equal(shadows, &other.shadows)
+            && arcs_equal(background_images, &other.background_images)
+            && arcs_equal(background_position, &other.background_position)
+            && arcs_equal(background_size, &other.background_size)
+            && arcs_equal(background_size_math, &other.background_size_math)
+            && arcs_equal(background_repeat, &other.background_repeat)
+            && arcs_equal(background_clip, &other.background_clip)
+            && arcs_equal(background_origin, &other.background_origin)
+            && arcs_equal(background_attachment, &other.background_attachment)
+            && arcs_equal(mask_images, &other.mask_images)
+            && arcs_equal(mask_position, &other.mask_position)
+            && arcs_equal(mask_size, &other.mask_size)
+            && arcs_equal(mask_repeat, &other.mask_repeat)
+            && arcs_equal(mask_origin, &other.mask_origin)
+            && arcs_equal(mask_clip, &other.mask_clip)
+            && arcs_equal(mask_mode, &other.mask_mode)
+            && arcs_equal(text_overflow_markers, &other.text_overflow_markers)
+            && arcs_equal(root_font_units, &other.root_font_units)
+            && arcs_equal(registered_query, &other.registered_query)
+            && arcs_equal(grid_columns, &other.grid_columns)
+            && arcs_equal(grid_rows, &other.grid_rows)
+            && arcs_equal(anchored, &other.anchored)
+    }
 }
 
 static INITIAL_EXTRAS: StyleExtras = StyleExtras {
@@ -3554,11 +3809,151 @@ pub struct Style {
     pub grid_row: GridPlacement,
 }
 
+/// The last anonymous child styles built, by parent style.
+struct AnonymousChildStyles {
+    busy: core::sync::atomic::AtomicBool,
+    entries: core::cell::UnsafeCell<Vec<(Style, Style)>>,
+}
+// SAFETY: entries are only read or changed while `busy` is held.
+unsafe impl Sync for AnonymousChildStyles {}
+static ANONYMOUS_CHILD_STYLES: AnonymousChildStyles = AnonymousChildStyles {
+    busy: core::sync::atomic::AtomicBool::new(false),
+    entries: core::cell::UnsafeCell::new(Vec::new()),
+};
+const MAX_ANONYMOUS_CHILD_STYLES: usize = 8;
+
+impl AnonymousChildStyles {
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<(Style, Style)>) -> R) -> Option<R> {
+        use core::sync::atomic::Ordering;
+        if self.busy.swap(true, Ordering::Acquire) { return None; }
+        // SAFETY: busy grants exclusive access until it is released below.
+        let result = f(unsafe { &mut *self.entries.get() });
+        self.busy.store(false, Ordering::Release);
+        Some(result)
+    }
+    fn find(&self, parent: &Style) -> Option<Style> {
+        self.with(|entries| entries.iter().rev().find(|(cached, _)| cached == parent).map(|(_, child)| child.clone())).flatten()
+    }
+    fn store(&self, parent: &Style, child: &Style) {
+        self.with(|entries| {
+            if entries.len() >= MAX_ANONYMOUS_CHILD_STYLES { entries.remove(0); }
+            entries.push((parent.clone(), child.clone()));
+        });
+    }
+}
+
 fn arcs_equal<T: ?Sized + PartialEq>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
         _ => false,
+    }
+}
+
+/// Styles `Style::apply_animation_snapshot` resolved, kept across effect
+/// samplings. A script that reads computed style in a loop samples every
+/// effect again after each of its own style writes, with the same captured
+/// sources for every element it did not touch. An entry is reused while all
+/// of its inputs are equal; an attribute change drops its element's entries
+/// and any other tree change drops them all, since the cascade reads
+/// attributes and tree position from the document.
+#[derive(Default)]
+pub struct SnapshotStyleMemo {
+    version: Option<u64>,
+    entries: alloc::collections::BTreeMap<(u128, u8), Vec<SnapshotMemoEntry>>,
+    len: usize,
+}
+
+struct SnapshotMemoEntry {
+    seed: Option<Arc<Style>>,
+    parent: Option<Arc<Style>>,
+    pairs: Vec<(String, String)>,
+    eligibility: EffectEligibility,
+    environment: MediaEnvironment,
+    text: Option<u64>,
+    result: Arc<Style>,
+}
+
+impl SnapshotStyleMemo {
+    const MAX_ENTRIES: usize = 4096;
+    const PER_TARGET: usize = 4;
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.len = 0;
+        self.version = None;
+    }
+
+    pub fn len(&self) -> usize { self.len }
+
+    fn forget(&mut self, node: NodeId) {
+        let key = node.key();
+        let doomed: Vec<(u128, u8)> = self.entries.range((key, 0)..=(key, u8::MAX)).map(|(key, _)| *key).collect();
+        for key in doomed {
+            if let Some(list) = self.entries.remove(&key) { self.len -= list.len(); }
+        }
+    }
+
+    /// Drop what document changes since the last use can reach.
+    fn sync(&mut self, document: &Document) {
+        let now = document.version();
+        let Some(since) = self.version else {
+            self.version = Some(now);
+            return;
+        };
+        if since == now { return; }
+        if !document.mutations_cover(since) {
+            self.clear();
+            self.version = Some(now);
+            return;
+        }
+        let mutations = document.mutations();
+        let first = mutations.partition_point(|mutation| mutation.version <= since);
+        for mutation in &mutations[first..] {
+            match &mutation.kind {
+                crate::MutationKind::Attribute(_) => self.forget(mutation.target),
+                crate::MutationKind::CharacterData => {
+                    if let Ok(Some(parent)) = document.parent(mutation.target) { self.forget(parent); }
+                }
+                _ => {
+                    self.clear();
+                    break;
+                }
+            }
+        }
+        self.version = Some(now);
+    }
+
+    /// `Style::apply_animation_snapshot` on `style`, or the style an earlier
+    /// call resolved from equal inputs.
+    pub fn apply(&mut self, style: &mut Arc<Style>, document: &Document, node: NodeId,
+        parent: Option<&Arc<Style>>, pseudo: Option<PseudoElement>, text: Option<&dyn TextShaper>,
+        environment: MediaEnvironment, pairs: &[(String, String)], eligibility: &EffectEligibility,
+    ) -> Result<(), CssError> {
+        self.sync(document);
+        let key = (node.key(), pseudo.map_or(0, |pseudo| pseudo as u8 + 1));
+        // Without a baseline the cascade starts from the style itself.
+        let seed = eligibility.baseline.is_none().then(|| style.clone());
+        let parent = parent.cloned();
+        let text_generation = text.map(TextShaper::generation);
+        let found = self.entries.get(&key).and_then(|list| list.iter().find(|entry| entry.environment == environment
+            && entry.text == text_generation && entry.pairs.as_slice() == pairs
+            && arcs_equal(&entry.seed, &seed) && arcs_equal(&entry.parent, &parent)
+            && entry.eligibility.same_snapshot_inputs(eligibility)));
+        if let Some(entry) = found {
+            *style = entry.result.clone();
+            return Ok(());
+        }
+        Arc::make_mut(style).apply_animation_snapshot(document, node, parent.as_deref(), pseudo, text, environment, pairs, eligibility)?;
+        if self.len >= Self::MAX_ENTRIES {
+            self.entries.clear();
+            self.len = 0;
+        }
+        let list = self.entries.entry(key).or_default();
+        if list.len() >= Self::PER_TARGET { list.remove(0); } else { self.len += 1; }
+        list.push(SnapshotMemoEntry { seed, parent, pairs: pairs.to_vec(), eligibility: eligibility.clone(),
+            environment, text: text_generation, result: style.clone() });
+        Ok(())
     }
 }
 
@@ -3641,6 +4036,11 @@ impl PartialEq for Style {
 }
 
 impl Style {
+    /// The families of the fonts whose metrics this style's own values may
+    /// resolve against: its own and the root's (`note_font_metric_read`).
+    pub(crate) fn font_metric_family_bits(&self) -> u64 {
+        self.font_spec().family_bits() | self.root_font_units.as_deref().map_or(0, |root| root.spec.family_bits())
+    }
     /// Whether `used`, a style layout derived from this computed style, still
     /// carries its inheritable values: layout resolves percentages and query
     /// units into the styles it passes down, but must not change these.
@@ -4185,6 +4585,16 @@ impl Style {
     /// Build the anonymous text/box style for a boxless element's contents.
     /// Descendant elements still inherit from its complete computed style.
     pub(crate) fn display_contents_child_style(&self) -> Self {
+        // Layout asks for the anonymous style of the same parent many times
+        // per pass (table rows and cells, generated boxes); it depends on the
+        // parent style alone.
+        if let Some(child) = ANONYMOUS_CHILD_STYLES.find(self) { return child; }
+        let child = self.build_display_contents_child_style();
+        ANONYMOUS_CHILD_STYLES.store(self, &child);
+        child
+    }
+
+    fn build_display_contents_child_style(&self) -> Self {
         let mut child = Self::initial();
         child.display = Display::Block;
         child.html_cell_padding_hint = self.html_cell_padding_hint;
@@ -4765,6 +5175,13 @@ impl Style {
         let slots = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
         slots.into_iter().any(|slot| self.cyclic_percentage_slot(slot))
     }
+    /// Whether a size of this box resolves against a block size: block-axis
+    /// percentages (sizes, flex basis, vertical insets), or a vertical
+    /// writing mode, where block sizes are physical widths.
+    pub(crate) fn reads_block_basis(&self) -> bool {
+        self.writing_mode != WritingMode::HorizontalTb
+            || [4, 148, 20, 35, 37, 51, 52, 88, 93, 94, 97, 98].into_iter().any(|slot| self.cyclic_percentage_slot(slot))
+    }
     pub(crate) fn has_height_percentage(&self) -> bool {
         self.cyclic_percentage_slot(4)
     }
@@ -5048,6 +5465,7 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
     fn resolve_from_font_adjust(&mut self, text: Option<&dyn TextShaper>) {
         let Some(adjust) = self.font.size_adjust.filter(|adjust| matches!(adjust.value, FontSizeAdjustValue::FromFont)) else { return; };
         if self.font_query_context_pending() { return; }
+        if text.is_some() { note_font_metric_read(None, self, None); }
         let Some(metric) = text.and_then(|text| text.first_available_font_metric(self.font_spec(), adjust.metric)) else { return; };
         self.font.size_adjust = metric.filter(|value| value.is_finite() && *value >= 0.0)
             .map(|value| FontSizeAdjust { metric: adjust.metric, value: FontSizeAdjustValue::Number(value) });
@@ -5059,6 +5477,9 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
     /// Resolve current-font consumers using actual backend metrics when supplied.
     pub fn resolve_query_context_with_text(&mut self, query: ContainerUnitContext, text:Option<&dyn TextShaper>) -> bool {
         let query = query.for_writing_mode(self.writing_mode);
+        if text.is_some() && (self.registered_query.is_some() || !self.relative_expressions.is_empty()) {
+            note_font_metric_read(None, self, None);
+        }
         if let Some(pending) = self.registered_query.clone() {
             // Unknown layout stays pending; it is not an invalid registered
             // declaration and must not acquire an invented percentage basis.
@@ -5970,7 +6391,7 @@ enum Relation {
     Following,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum LogicalBorderComponent {
     Width(f32),
     Color(Rgba),
@@ -5980,7 +6401,7 @@ enum LogicalBorderComponent {
 
 /// UA keyword sizes share one table with HTML's legacy font-size hints.
 /// Keywords remain specified values until cascade; Style stores only pixels.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FontSizeKeyword {
     Absolute(u8),
     Larger,
@@ -6045,7 +6466,7 @@ fn legacy_font_size(raw: &str) -> Option<f32> {
     Some(FontSizeKeyword::Absolute(value).resolve(16.0))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Value {
     SourceColor(usize,SourceColor),
     Appearance(Appearance),
@@ -6571,10 +6992,10 @@ impl Value {
                     style.text_align = *v;
                 }
             }
-            Self::TextIndent(v) => style.text_indent = *v,
+            Self::TextIndent(v) => if style.text_indent != *v { style.text_indent = *v },
             Self::TextIndentRaw(_) => unreachable!(),
             Self::LetterSpacing(v) => {
-                style.letter_spacing = *v;
+                if style.letter_spacing != *v { style.letter_spacing = *v; }
                 let suppress = v.is_some_and(|value| value != 0.0);
                 if style.font.disable_optional_ligatures != suppress { style.font.disable_optional_ligatures = suppress; }
             },
@@ -7203,7 +7624,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Declaration {
     value: Value,
     important: bool,
@@ -7589,6 +8010,10 @@ impl TransitionCandidates {
 
 pub struct StyleIndex {
     pub environment: MediaEnvironment,
+    /// Where styles computed with this index note the font families whose
+    /// metrics they may have read (`note_font_metric_read`); without one,
+    /// the process-wide set.
+    pub(crate) font_metric_sink: Option<Arc<core::sync::atomic::AtomicU64>>,
     /// Any parsed rule declares `z-index`; gates the stacking pre-pass.
     pub(crate) has_z_index: bool,
     /// Content declarations on `::before`/`::after` may create virtual boxes.
@@ -7614,6 +8039,8 @@ pub struct StyleIndex {
     generated_pseudo_rules: RuleBuckets,
     /// `::marker` rules, bucketed like the cascade.
     marker_pseudo_rules: RuleBuckets,
+    /// `::first-line` and `::first-letter` rules, bucketed by subject.
+    typographic_pseudo_rules: RuleBuckets,
     /// The subset of those rules which declare counter operations, counter
     /// functions or a list-item display; only these matter to the counter walk.
     counter_pseudo_rules: RuleBuckets,
@@ -7692,7 +8119,7 @@ const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 const MAX_SELECTOR_NESTING: usize = 32;
 const MAX_SELECTOR_COMPOUNDS: usize = 64;
 const MAX_SELECTOR_MATCH_DEPTH: usize = 128;
-pub const MAX_CSS_BYTES: usize = 1024 * 1024;
+pub const MAX_CSS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CSS_GRAPH_SHEETS: usize = 256;
 pub const MAX_CSS_GRAPH_IMPORTS: usize = 512;
 const MAX_CSS_GRAPH_DEPTH: usize = 32;
@@ -7837,6 +8264,10 @@ fn is_content_pseudo_rule(rule: &Rule) -> bool {
         Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
         _ => false,
     })
+}
+
+fn is_typographic_pseudo_rule(rule: &Rule) -> bool {
+    matches!(rule.selector.pseudo_element, Some(PseudoElement::FirstLine | PseudoElement::FirstLetter))
 }
 
 fn is_marker_pseudo_rule(rule: &Rule) -> bool {
@@ -8605,6 +9036,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
         } = flags;
         let uses_ancestor_bloom = ancestor_masks.iter().any(|mask| !mask.is_empty());
         Self {
+            font_metric_sink: None,
             environment: MediaEnvironment::default(),
             children_state_dependent,
             has_z_index,
@@ -8618,6 +9050,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
             has_list_item_data,
             generated_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_content_pseudo_rule),
             marker_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_marker_pseudo_rule),
+            typographic_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_typographic_pseudo_rule),
             counter_pseudo_rules: RuleBuckets::of_orders(&rules, &pseudo_rules, is_counter_pseudo_rule),
             has_validity_data,
             rules,
@@ -8810,13 +9243,64 @@ fn rule_media_matches(&self, order: usize) -> bool {
         let style = Arc::new(compute_for_named_mode(kind, parent, self, Some((document, node)), bloom,
             text, pseudo, None, Some(role), starting, false, Some(&mut eligibility), None)?);
         if !eligibility.dependent.is_empty() { eligibility.sources=Some(core::mem::take(&mut eligibility.dependent).into()); }
-        if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+        if eligibility.remember_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
             eligibility.drop_unregistered_custom_sources();
-            if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+            if eligibility.remember_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
                 return Err(CssError{offset:0,message:TRANSITION_PROVENANCE_LIMIT_MESSAGE});
             }
         }
         if pseudo.is_none() && !starting { cache.store_unattributed(document, node, role, &style); }
+        Ok((style, eligibility))
+    }
+
+    /// `compute_transition_snapshot_cached` for an element, shared with an
+    /// earlier element of the same snapshot whose cascade inputs are the same
+    /// as layout's style sharing tells them apart: share class, revalidated
+    /// selectors, box parent context and the very parent style. Their styles
+    /// and provenance are then equal, and repeated card or list markup is
+    /// cascaded once.
+    pub(crate) fn compute_transition_snapshot_shared(&self, document: &Document, node: NodeId,
+        parent: Option<&Arc<Style>>, text: Option<&dyn TextShaper>, cache: &mut StyleCache,
+        shares: &mut SnapshotShares) -> Result<(Arc<Style>, EffectEligibility), CssError> {
+        let kind = document.kind(node).map_err(|_| CssError { offset: 0, message: "invalid transition target" })?;
+        let auto_direction = match kind {
+            NodeKind::Element { namespace: Namespace::Html, name, .. } => crate::svg::local_name(name) == "bdi"
+                || document.get_attribute_ns_ref(node, None, "dir").ok().flatten().is_some_and(|value| value.eq_ignore_ascii_case("auto")),
+            _ => false,
+        };
+        let key = (matches!(kind, NodeKind::Element { .. }) && !auto_direction && document.host_gate.exact())
+            .then(|| self.style_sharing()).flatten().and_then(|keys| {
+                let class = cache.share.class_of(document, &keys, node);
+                cache.share.shareable(class).then(|| (class, keys.revalidate(self, document, node, kind)))
+            });
+        #[cfg(test)]
+        let key = key.filter(|_| !SNAPSHOT_SHARING_OFF.load(core::sync::atomic::Ordering::Relaxed));
+        let Some((class, dependent)) = key else {
+            return self.compute_transition_snapshot_cached(document, node, parent.map(|parent| &**parent), None, text, cache, false);
+        };
+        let box_parent = resolve_box_parent(document, node, parent.map(|parent| &**parent), self, cache, text)?;
+        let same_parent = |entry: &SnapshotShare| match (&entry.parent, parent) {
+            (None, None) => true,
+            (Some(cached), Some(parent)) => Arc::ptr_eq(cached, parent),
+            _ => false,
+        };
+        if let Some(entry) = shares.entries.iter().find(|entry| entry.class == class && entry.box_parent == box_parent
+            && entry.dependent == dependent && same_parent(entry)) {
+            shares.hits += 1;
+            cache.store_unattributed(document, node, box_parent, &entry.style);
+            return Ok((entry.style.clone(), entry.eligibility.clone()));
+        }
+        let (style, eligibility) = self.compute_transition_snapshot_cached(document, node, parent.map(|parent| &**parent), None, text, cache, false)?;
+        if !style.sibling_position_dependent && style.registered_query.is_none()
+            && !style.has_query_container_dependencies() && !style.has_inherited_query_container_dependencies() {
+            let entry = SnapshotShare { class, dependent, box_parent, parent: parent.cloned(), style: style.clone(), eligibility: eligibility.clone() };
+            if shares.entries.len() < style_sharing::SHARED_STYLES {
+                shares.entries.push(entry);
+            } else {
+                shares.entries[shares.next] = entry;
+                shares.next = (shares.next + 1) % style_sharing::SHARED_STYLES;
+            }
+        }
         Ok((style, eligibility))
     }
 
@@ -8837,6 +9321,11 @@ fn rule_media_matches(&self, order: usize) -> bool {
     /// snapshot of every element they reach then depends on their samples.
     pub(crate) fn has_effect_declarations(&self) -> bool {
         !self.effect_declarations.is_empty()
+    }
+
+    /// The elements installed effect samples apply to.
+    pub(crate) fn effect_declaration_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.effect_declarations.iter().map(|effect| effect.node)
     }
 
     /// Whether any rule can set a transition or animation property, or an
@@ -8952,9 +9441,10 @@ fn rule_media_matches(&self, order: usize) -> bool {
 
     pub(crate) fn compute_typographic(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: &dyn TextShaper) -> Result<Option<Style>, CssError> {
-        if !self.has_typographic_content || !self.rules.iter().enumerate().any(|(order,rule)|
-            rule.selector.pseudo_element == Some(pseudo) && rule.matches_at(document, origin)
-                && self.rule_media_matches(order)) { return Ok(None); }
+        // Bucketed by subject: layout asks this of every block, and a utility
+        // stylesheet holds thousands of rules.
+        if !self.has_typographic_content
+            || !self.pseudo_rule_may_match(&self.typographic_pseudo_rules, document, origin, pseudo) { return Ok(None); }
         let mut filtered = self.compute_pseudo_computed(document, origin, origin_style, pseudo, Some(text))?;
         filtered.direction = origin_style.direction;
         filtered.writing_mode = origin_style.writing_mode;
@@ -9553,6 +10043,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
         self.quote_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_quote_pseudo_rule);
         self.generated_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_content_pseudo_rule);
         self.marker_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_marker_pseudo_rule);
+        self.typographic_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_typographic_pseudo_rule);
         self.counter_pseudo_rules.extend_orders(&self.rules, &pseudo_rules, is_counter_pseudo_rule);
         let environment = self.environment;
         let media = self.media_results.get_mut();
@@ -9662,7 +10153,7 @@ fn rule_media_matches(&self, order: usize) -> bool {
     /// Whether `::before`/`::after` (or the marker of one) of the element can
     /// exist. False only when no rule can match it and nothing else (a quote
     /// element, an animation effect, a transition snapshot) supplies content.
-    fn generated_pseudo_may_exist(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
+    pub(crate) fn generated_pseudo_may_exist(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
         if !matches!(pseudo, PseudoElement::Before | PseudoElement::After | PseudoElement::BeforeMarker | PseudoElement::AfterMarker) {
             return true;
         }
@@ -13566,27 +14057,67 @@ const ALL_PROPERTY_IDS: [usize; ALL_PROPERTY_COUNT] = {
     ids
 };
 
+/// Property slots of the paint-only properties (`paint_only_property`).
+fn paint_only_slot(slot: usize) -> bool {
+    PAINT_ONLY.iter().any(|name| slots(name).contains(&slot))
+}
+
+impl Style {
+    /// Whether this style and `other` differ only in the computed values of
+    /// paint-only properties: their boxes lay out identically.
+    pub(crate) fn differs_only_in_paint(&self, other: &Style) -> bool {
+        if self == other { return true; }
+        let (mine, theirs) = (&**self, &**other);
+        let unpainted = |values: &[RelativeExpression]| values.iter().filter(|value| !paint_only_slot(value.slot)).cloned().collect::<Vec<_>>();
+        if unpainted(&mine.relative_expressions) != unpainted(&theirs.relative_expressions) { return false; }
+        let unpainted_colors = |values: Option<&Arc<[(usize, SourceColor)]>>| values.map_or_else(Vec::new,
+            |values| values.iter().filter(|(slot, _)| !paint_only_slot(*slot)).cloned().collect::<Vec<_>>());
+        if unpainted_colors(mine.source_colors.as_ref()) != unpainted_colors(theirs.source_colors.as_ref()) { return false; }
+        let mut probe = other.clone();
+        probe.opacity = self.opacity;
+        probe.color = self.color;
+        probe.background = self.background;
+        probe.border_color = self.border_color;
+        {
+            let extras = &mut *probe;
+            extras.logical_border_color = mine.logical_border_color;
+            extras.border_color_sides = mine.border_color_sides;
+            extras.outline = mine.outline;
+            extras.text_decoration_color = mine.text_decoration_color;
+            extras.transforms = mine.transforms.clone();
+            extras.individual_transforms = mine.individual_transforms.clone();
+            extras.relative_expressions = mine.relative_expressions.clone();
+            extras.source_colors = mine.source_colors.clone();
+        }
+        if extra_props::keyword(self, "backdrop-filter") != extra_props::keyword(other, "backdrop-filter") {
+            extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(self, "backdrop-filter"));
+        }
+        probe == *self
+    }
+}
+
+const PAINT_ONLY: &[&str] = &[
+    "opacity",
+    "transform",
+    "color",
+    "background-color",
+    "border-color",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "outline",
+    "outline-color",
+    "outline-style",
+    "outline-width",
+    "outline-offset",
+    "text-decoration-color",
+    "backdrop-filter",
+];
+
 /// Registered properties whose computed value only changes painted output,
 /// never box geometry. Unregistered, custom and unlisted names are not.
 pub(crate) fn paint_only_property(name: &str) -> bool {
-    const PAINT_ONLY: &[&str] = &[
-        "opacity",
-        "transform",
-        "color",
-        "background-color",
-        "border-color",
-        "border-top-color",
-        "border-right-color",
-        "border-bottom-color",
-        "border-left-color",
-        "outline",
-        "outline-color",
-        "outline-style",
-        "outline-width",
-        "outline-offset",
-        "text-decoration-color",
-        "backdrop-filter",
-    ];
     let name = name.trim().to_ascii_lowercase();
     PAINT_ONLY.contains(&name.as_str()) && !slots(&name).is_empty()
 }
@@ -20532,6 +21063,43 @@ fn animation_values(name: &str, raw: &str) -> Option<Vec<(usize, String)>> {
 }
 
 pub fn transition_property_longhands(name:&str)->Vec<Arc<str>> { transition_controls::longhands(name) }
+/// Whether `transition_property_longhands(name)` contains `longhand`, without allocating.
+pub fn transition_property_covers(name:&str,longhand:&str)->bool { transition_controls::covers(name,longhand) }
+/// Whether a transition of `name` can change a value descendants inherit or
+/// whether they are rendered: an inherited longhand, a custom or unknown
+/// property, `all`, or display-like properties.
+impl StyleIndex {
+    /// Whether an animation named `name` can change what descendants inherit:
+    /// some `@keyframes` of that name sets a property a transition of which
+    /// would (see `transition_reaches_descendants`). A name without keyframes
+    /// animates nothing.
+    pub(crate) fn keyframes_reach_descendants(&self,name:&str)->bool {
+        let name=name.trim_matches(|c:char|c=='"'||c=='\''||c.is_whitespace());
+        self.keyframes.iter().filter(|rule|rule.name==name).any(|rule|rule.rules.iter().any(|keyframe|
+            keyframe.style.split(';').any(|declaration|{
+                let declaration=declaration.trim();
+                if declaration.is_empty() {return false;}
+                match declaration.split_once(':') {
+                    Some((property,_))=>{
+                        let property=property.trim().to_ascii_lowercase();
+                        property!="animation-timing-function" && property!="animation-composition" && transition_reaches_descendants(&property)
+                    },
+                    None=>true,
+                }
+            })))
+    }
+}
+pub(crate) fn transition_reaches_descendants(name:&str)->bool {
+    if name.trim().eq_ignore_ascii_case("none") {return false;}
+    // `all` includes inherited longhands; expanding it would allocate one name per property.
+    if name.trim().eq_ignore_ascii_case("all") {return true;}
+    let longhands=transition_controls::longhands(name);
+    longhands.is_empty() || longhands.iter().any(|longhand| {
+        let ids=slots(longhand);
+        longhand.starts_with("--") || ids.is_empty() || ids.iter().any(|id|inherited_property(*id))
+            || matches!(longhand.as_ref(),"display"|"content-visibility"|"overlay"|"visibility")
+    })
+}
 
 /// The properties `transition-property: all` expands to, without allocating names.
 pub fn transition_all_longhands() -> impl Iterator<Item = &'static str> {
@@ -22686,6 +23254,15 @@ pub struct FontFaceDescriptors {
     pub ascent_override: Option<f32>,
     pub descent_override: Option<f32>,
     pub line_gap_override: Option<f32>,
+}
+
+impl FontFaceDescriptors {
+    /// Whether `sources[index]` may be fetched: its `format()` hint, if any,
+    /// names a container this engine decodes. Like Chrome, a loader skips the
+    /// others (`embedded-opentype`, `svg`) without requesting them.
+    pub fn source_loadable(&self, index: usize) -> bool {
+        self.source_suffixes.get(index).is_none_or(|suffix| font_face_source::format_loadable(suffix))
+    }
 }
 
 impl Default for FontFaceDescriptors {
@@ -25015,6 +25592,13 @@ impl core::ops::BitOr for AncestorBloom {
     }
 }
 
+impl core::ops::BitAnd for AncestorBloom {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self([self.0[0] & other.0[0], self.0[1] & other.0[1], self.0[2] & other.0[2], self.0[3] & other.0[3]])
+    }
+}
+
 impl core::ops::BitOrAssign for AncestorBloom {
     fn bitor_assign(&mut self, other: Self) { *self = *self | other; }
 }
@@ -25456,7 +26040,7 @@ impl Selector {
         if self.part.is_some() || self.host || self.slotted {
             return AncestorBloom::EMPTY;
         }
-        let mut mask = AncestorBloom::EMPTY;
+        let mut mask = self.logical_ancestor_mask();
         let mut current = self;
         while let Some((Relation::Child | Relation::Descendant, ancestor)) = &current.ancestor {
             if !(ancestor.host || ancestor.slotted || ancestor.part.is_some()) {
@@ -25469,8 +26053,23 @@ impl Selector {
                 for class in &ancestor.classes {
                     mask |= bloom_bits(2, class);
                 }
+                mask |= ancestor.logical_ancestor_mask();
             }
             current = &**ancestor;
+        }
+        mask
+    }
+
+    /// The ancestor keys every alternative of this compound's `:is()` and
+    /// `:where()` arguments requires. A match needs one alternative, so only
+    /// the bits all of them share are required: `:where(.space-y-4 > *)`
+    /// needs a `.space-y-4` ancestor, `:where(.dark, .dark *)` needs nothing.
+    fn logical_ancestor_mask(&self) -> AncestorBloom {
+        let mut mask = AncestorBloom::EMPTY;
+        for pseudo in &self.logical {
+            let (LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors)) = pseudo else { continue };
+            let Some((first, rest)) = selectors.split_first() else { continue };
+            mask |= rest.iter().fold(first.ancestor_mask(), |shared, selector| shared & selector.ancestor_mask());
         }
         mask
     }
@@ -26761,6 +27360,28 @@ impl RegisteredQuerySources {
     }
 }
 
+#[cfg(test)]
+pub(crate) static SNAPSHOT_SHARING_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Styles one transition snapshot computed with provenance, for elements
+/// that share them (see `StyleIndex::compute_transition_snapshot_shared`).
+#[derive(Default)]
+pub(crate) struct SnapshotShares {
+    entries: Vec<SnapshotShare>,
+    next: usize,
+    pub(crate) hits: u64,
+}
+
+struct SnapshotShare {
+    class: u32,
+    dependent: Vec<u32>,
+    box_parent: BoxParentContext,
+    // Held so that no later parent style can take its address.
+    parent: Option<Arc<Style>>,
+    style: Arc<Style>,
+    eligibility: EffectEligibility,
+}
+
 /// Compact provenance retained only by transition snapshots. Normal computed
 /// styles carry no extra mask or custom-name allocation.
 #[derive(Clone, Debug)]
@@ -26784,6 +27405,9 @@ pub struct EffectEligibility {
     query_context: Option<ContainerUnitContext>,
     light: bool,
     effects_cascaded: bool,
+    /// `checked_retained_bytes` as measured when the record was completed;
+    /// later changes that alter the charge clear it.
+    measured: Option<usize>,
 }
 impl Default for EffectEligibility {
     fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
@@ -26791,9 +27415,29 @@ impl Default for EffectEligibility {
             let mut flags = 0; for bit in 0..64 { let slot = word * 64 + bit; if slot < PROPERTY_COUNT && inherited_property(slot) { flags |= 1 << bit; } } flags
         }), baseline_font_scale: None, baseline_font_smaller: false, baseline_bolder: false, root: false,
         ua_hidden_input: false, ua_clip_input: false, ua_margin_block_em: None, query_context: None, light: false,
-        effects_cascaded: false,
+        effects_cascaded: false, measured: None,
     } }
 }
+impl EffectEligibility {
+    /// Whether `Style::apply_animation_snapshot` resolves the same style
+    /// under both: every recorded input is equal. The retained-size charge is
+    /// accounting only.
+    fn same_snapshot_inputs(&self, other: &Self) -> bool {
+        let Self { slots, inherited, protected_custom, dependent, sources, registrations, baseline, box_parent,
+            baseline_inherited, baseline_font_scale, baseline_font_smaller, baseline_bolder, root, ua_hidden_input,
+            ua_clip_input, ua_margin_block_em, query_context, light, effects_cascaded, measured: _ } = self;
+        *slots == other.slots && *inherited == other.inherited && *baseline_inherited == other.baseline_inherited
+            && *box_parent == other.box_parent && *baseline_font_scale == other.baseline_font_scale
+            && *baseline_font_smaller == other.baseline_font_smaller && *baseline_bolder == other.baseline_bolder
+            && *root == other.root && *ua_hidden_input == other.ua_hidden_input && *ua_clip_input == other.ua_clip_input
+            && *ua_margin_block_em == other.ua_margin_block_em && *query_context == other.query_context
+            && *light == other.light && *effects_cascaded == other.effects_cascaded
+            && *protected_custom == other.protected_custom && *dependent == other.dependent
+            && arcs_equal(sources, &other.sources) && arcs_equal(registrations, &other.registrations)
+            && arcs_equal(baseline, &other.baseline)
+    }
+}
+
 impl EffectEligibility {
     /// The actual old query bases accompany the old resolved snapshot; replay
     /// never looks up a newly changed container or selector input.
@@ -26825,6 +27469,18 @@ impl EffectEligibility {
     /// Conservative checked charge including the inline record and all shared
     /// referenced payloads. A document snapshot additionally caps its total.
     pub fn checked_retained_bytes(&self) -> Option<usize> {
+        match self.measured {
+            Some(bytes) => Some(bytes),
+            None => self.measure_retained_bytes(),
+        }
+    }
+    /// Measures the charge once for a completed record; a snapshot reads it
+    /// again when it admits the record.
+    fn remember_retained_bytes(&mut self) -> Option<usize> {
+        self.measured = self.measure_retained_bytes();
+        self.measured
+    }
+    fn measure_retained_bytes(&self) -> Option<usize> {
         let header=2*core::mem::size_of::<usize>();
         let mut bytes=core::mem::size_of::<Self>();
         if let Some(registrations)=&self.registrations {bytes=bytes.checked_add(checked_registration_snapshot_bytes(registrations)?)?;}
@@ -26834,7 +27490,7 @@ impl EffectEligibility {
         bytes=bytes.checked_add(self.dependent.capacity().checked_mul(core::mem::size_of::<SnapshotDeclaration>())?)?;
         let sources=self.sources.as_deref().unwrap_or(&self.dependent);
         if let Some(sources)=&self.sources {bytes=bytes.checked_add(header.checked_add(core::mem::size_of_val(sources.as_ref()))?)?;}
-        let empty_style_bytes=crate::layout::checked_style_retained_bytes(&Style::initial())?;
+        let empty_style_bytes=empty_style_retained_bytes()?;
         for source in sources {
             if let Some(url)=&source.source_url {bytes=bytes.checked_add(header.checked_add(url.len())?)?;}
             if let Some(scope)=&source.reference_scope{bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(scope.as_ref()))?;}
@@ -26848,10 +27504,11 @@ impl EffectEligibility {
                 Value::TransformRaw(raw)|Value::TransformOriginRaw(raw)|Value::ShadowsRaw(raw)|Value::TextShadowsRaw(raw)|Value::TextIndentRaw(raw)
                 |Value::IndividualTransformRaw(_,raw)|Value::TransitionTimesRaw(_,raw)|Value::BackgroundImageRaw(raw)|Value::BackgroundPositionRaw(raw)|Value::BackgroundSizeRaw(raw)|Value::BorderImageRaw(_,raw)=>raw.capacity(),
                 Value::Default(..)|Value::Revert(_)|Value::RevertLayer(_)=>0,
-                value=>{
-                    let mut projected=Style::initial();value.apply(&mut projected);
-                    crate::layout::checked_style_retained_bytes(&projected)?.checked_sub(empty_style_bytes)?
+                value if value.holds_no_heap_payload()=>{
+                    debug_assert_eq!(projected_payload_bytes(value,empty_style_bytes),Some(0),"{value:?}");
+                    0
                 }
+                value=>projected_payload_bytes(value,empty_style_bytes)?,
             };
             bytes=bytes.checked_add(payload)?;
         }
@@ -26862,6 +27519,7 @@ impl EffectEligibility {
     /// ones and the ordinary properties. Replay then resolves `var()` chains
     /// through unregistered names from the old computed values.
     fn drop_unregistered_custom_sources(&mut self) {
+        self.measured=None;
         let Some(sources)=self.sources.take() else {return;};
         let registrations=self.registrations.clone();
         let kept:Vec<SnapshotDeclaration>=sources.iter().filter(|source|match &source.declaration.value {
@@ -26885,6 +27543,41 @@ impl EffectEligibility {
     }
 }
 
+/// What applying `value` adds to an initial style's retained charge.
+fn projected_payload_bytes(value:&Value,empty_style_bytes:usize)->Option<usize>{
+    let mut projected=Style::initial();value.apply(&mut projected);
+    crate::layout::checked_style_retained_bytes(&projected)?.checked_sub(empty_style_bytes)
+}
+
+impl Value {
+    /// Values of numbers, keywords and colors only: applying one allocates
+    /// nothing a style retains, so their provenance charge is zero.
+    fn holds_no_heap_payload(&self)->bool{
+        // Only values stored in `Style`'s own fields: one kept in its extras
+        // can allocate them (an unset text decoration color does).
+        matches!(self,
+            Value::Display(_)|Value::Opacity(_)|Value::Color(_)|Value::Background(_)|Value::Width(_)|Value::MinWidth(_)
+            |Value::MaxWidth(_)|Value::Height(_)|Value::Margin(_)|Value::Padding(_)|Value::MarginSide(..)|Value::PaddingSide(..)
+            |Value::FontSize(_)|Value::BorderRadius(_)|Value::BorderWidth(_)|Value::BorderColor(_)|Value::BorderStyle(_)
+            |Value::FlexDirection(_)|Value::FlexWrap(_)|Value::Gap(_)|Value::FlexGrow(_)|Value::FlexShrink(_)
+            |Value::FlexBasis(_)|Value::BoxSizing(_)|Value::TableFixed(_)|Value::BorderSpacing(_))
+    }
+}
+
+/// The retained charge of `Style::initial()`, measured once: provenance
+/// charges each source declaration as what it adds to an initial style.
+fn empty_style_retained_bytes() -> Option<usize> {
+    static EMPTY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    match EMPTY.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let bytes = crate::layout::checked_style_retained_bytes(&Style::initial())?;
+            EMPTY.store(bytes, core::sync::atomic::Ordering::Relaxed);
+            Some(bytes)
+        }
+        bytes => Some(bytes),
+    }
+}
+
 const TRANSITION_PROVENANCE_LIMIT: usize = 2 * 1024 * 1024;
 pub(crate) const TRANSITION_PROVENANCE_LIMIT_MESSAGE: &str = "CSS transition snapshot provenance exceeds limit";
 
@@ -26901,7 +27594,7 @@ fn winning_priority(winner_at: &[u32], expanded: &[RuleCandidate<'_>], slot: usi
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SnapshotDeclaration {
     priority: Priority,
     reference_scope: Option<Arc<[NodeId]>>,
@@ -27174,9 +27867,33 @@ fn logical_radius_projection(style: &Style, logical: usize, physical: usize) -> 
     Value::BorderRadiusCorner(physical - 134, Box::new(corner))
 }
 
+/// A cascade candidate's declaration: one from a rule, one built for this
+/// element, or one of a cached `var()` expansion, shared without a copy.
+#[derive(Clone)]
+enum CandidateDeclaration<'a> {
+    Borrowed(&'a Declaration),
+    Owned(Declaration),
+    Shared(Arc<[Declaration]>, usize),
+}
+
+impl core::ops::Deref for CandidateDeclaration<'_> {
+    type Target = Declaration;
+    fn deref(&self) -> &Declaration {
+        match self {
+            Self::Borrowed(declaration) => declaration,
+            Self::Owned(declaration) => declaration,
+            Self::Shared(declarations, index) => &declarations[*index],
+        }
+    }
+}
+
+impl AsRef<Declaration> for CandidateDeclaration<'_> {
+    fn as_ref(&self) -> &Declaration { self }
+}
+
 type RuleCandidate<'a> = (
     Priority,
-    alloc::borrow::Cow<'a, Declaration>,
+    CandidateDeclaration<'a>,
     Option<Arc<str>>,
 );
 
@@ -28437,6 +29154,23 @@ struct ParentKey {
 }
 
 impl ParentKey {
+    /// A 64-bit summary of every field, for `StyleCache::parent_index`.
+    fn digest(&self) -> u64 {
+        let rgba = |c: Rgba| u32::from_le_bytes([c.r, c.g, c.b, c.a]) as u64;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for word in [
+            self.extras as u64,
+            self.custom as u64,
+            self.display as u64,
+            rgba(self.color) | rgba(self.background) << 32,
+            self.font_size as u64 | (self.opacity as u64) << 32,
+            self.gap as u64,
+        ] {
+            hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+        }
+        hash
+    }
+
     fn same_shape(&self, other: &Self) -> bool {
         Self { extras: 0, custom: 0, ..*self } == Self { extras: 0, custom: 0, ..*other }
     }
@@ -28505,6 +29239,9 @@ pub(crate) struct StyleCache {
     parents: Vec<Arc<Style>>,
     /// `parents[n]`'s cheap identity; see `ParentKey`.
     parent_keys: Vec<ParentKey>,
+    /// Positions in `parents` by `ParentKey::digest`, so an equal parent seen
+    /// any time this frame is found again instead of taking a new token.
+    parent_index: alloc::collections::BTreeMap<u64, Vec<u32>>,
     last_parent: usize,
     shared: Vec<SharedStyle>,
     next_shared: usize,
@@ -28598,6 +29335,12 @@ impl StyleCache {
             && entry.box_parent==box_parent && self.same_parent(entry.origin_token,token))
             .map(|entry|entry.generated.clone())
     }
+    /// The pseudo-element style last computed for `origin`: `Some(None)` when it
+    /// generates no box, `None` when it has not been computed.
+    pub(crate) fn latest_pseudo_style(&self, origin: NodeId, pseudo: PseudoElement) -> Option<Option<GeneratedStyle>> {
+        if self.selected.is_some() { return None; }
+        self.pseudos.get(origin.index())?.iter().rev().find(|entry| entry.origin == origin && entry.pseudo == pseudo).map(|entry| entry.generated.clone())
+    }
     #[cfg(test)]
     pub(crate) fn pseudo_style(&self, origin: NodeId, pseudo: PseudoElement) -> Option<&Option<GeneratedStyle>> {
         self.pseudos.get(origin.index())?.iter().rev().find(|entry| entry.origin == origin && entry.pseudo == pseudo).map(|entry| &entry.generated)
@@ -28653,6 +29396,13 @@ impl StyleCache {
             note_viewport_read();
         }
     }
+    /// Keep the styles computed under font generation `from` for generation
+    /// `to`: the owner invalidated what the change between them can reach.
+    pub(crate) fn adopt_text_generation(&mut self, from: u64, to: u64) {
+        if self.text_generation == Some(Some(from)) {
+            self.text_generation = Some(Some(to));
+        }
+    }
     /// Whether this cache was filled for the same text shaper generation.
     pub(crate) fn built_for_text(&self, text: Option<&dyn TextShaper>) -> bool {
         self.text_generation == Some(text.map(|text| text.generation()))
@@ -28703,6 +29453,11 @@ impl StyleCache {
     /// Replace an owner-validated read snapshot after query-context resolution.
     /// Shared cascade entries remain raw, so other nodes resolve in their own context.
     pub(crate) fn replace_snapshot_style(&mut self, document: &Document, node: NodeId, style: Style) -> Arc<Style> {
+        // A read that resolves the same style again changes nothing that was
+        // laid out with it, so it keeps the entry and the epoch.
+        if let Some(existing) = self.node_entry(node).map(|(_, _, _, existing)| existing.clone()).filter(|existing| **existing == style) {
+            return existing;
+        }
         let style = Arc::new(style);
         let box_parent=self.cached_box_parent(document,node).unwrap_or_default();
         self.store_unattributed(document, node, box_parent, &style);
@@ -28721,6 +29476,18 @@ impl StyleCache {
         *self = Self::default();self.selected=selected;self.epoch=epoch;
     }
     pub(crate) fn epoch(&self) -> u64 { self.epoch }
+    /// Every node with a retained style, for restyling them all against new
+    /// rules (`restyle_nodes`); `None` while a selected-node cache holds them.
+    pub(crate) fn styled_nodes(&self) -> Option<Vec<NodeId>> {
+        if self.selected.is_some() { return None; }
+        let mut nodes: Vec<NodeId> = self.nodes.iter().chain(&self.previous_nodes).flatten().map(|(node, ..)| *node).collect();
+        nodes.sort_unstable_by_key(|node| node.key());
+        nodes.dedup();
+        Some(nodes)
+    }
+    fn styled_count(&self) -> usize {
+        self.nodes.iter().filter(|entry| entry.is_some()).count()
+    }
     fn begin_viewport_window(&mut self) -> (u64, u64) {
         self.window_depth += 1;
         (viewport_reads(), media_reads())
@@ -28762,6 +29529,23 @@ impl StyleCache {
     /// parent's style value, so a changed parent style misses them naturally.
     pub(crate) fn invalidate_node(&mut self, node: NodeId) {
         self.drop_node(node);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+    /// Forget the styles of `roots` and their flat-tree descendants.
+    pub(crate) fn invalidate_subtrees(&mut self, document: &Document, roots: &[NodeId]) {
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(node) = stack.pop() {
+            self.forget_node_entry(node);
+            let mut child = document.first_child(node).ok().flatten();
+            while let Some(id) = child {
+                stack.push(id);
+                child = document.next_sibling(id).ok().flatten();
+            }
+            if let Ok(Some(root)) = document.shadow_root(node) {
+                stack.push(root);
+            }
+        }
+        self.reset_sharing();
         self.epoch = self.epoch.wrapping_add(1);
     }
     /// The nodes whose retained style passes `test`; `None` when a retained
@@ -28857,10 +29641,9 @@ impl StyleCache {
         }
     }
 
-    /// Drops parent styles no entry refers to any more. Token lookup only
-    /// scans recent parents, so without this every frame that asks with
-    /// parent styles seen longer ago adds tokens until `MAX_PARENT_STYLES`
-    /// stops caching altogether.
+    /// Drops parent styles no entry refers to any more, so the distinct used
+    /// parent styles layout passes over many frames do not accumulate until
+    /// `MAX_PARENT_STYLES` stops caching altogether.
     fn compact_parents(&mut self) {
         if self.selected.is_some() { return; }
         let mut tokens = vec![0u32; self.parents.len() + 1];
@@ -28883,6 +29666,10 @@ impl StyleCache {
         for entry in self.pseudos.iter_mut().flatten() { remap(&mut entry.origin_token); }
         for entry in &mut self.shared { remap(&mut entry.parent_token); }
         self.compacted_parents = kept.len();
+        self.parent_index.clear();
+        for (position, key) in kept_keys.iter().enumerate() {
+            self.parent_index.entry(key.digest()).or_default().push(position as u32);
+        }
         self.parents = kept;
         self.parent_keys = kept_keys;
         self.last_parent = 0;
@@ -28902,10 +29689,11 @@ impl StyleCache {
         if self.last_parent < self.parents.len() && same(&self.parents, &self.parent_keys, self.last_parent) {
             return Some(self.last_parent as u32 + 1);
         }
-        let found = (0..self.parents.len())
-            .rev()
-            .take(PARENT_STYLES_RECENT)
-            .find(|&position| same(&self.parents, &self.parent_keys, position));
+        let digest = key.digest();
+        let found = self.parent_index.get(&digest).and_then(|positions| {
+            positions.iter().rev().map(|&position| position as usize)
+                .find(|&position| same(&self.parents, &self.parent_keys, position))
+        });
         let position = match found {
             Some(position) => position,
             None if self.parents.len() < MAX_PARENT_STYLES => {
@@ -28920,6 +29708,7 @@ impl StyleCache {
                     .unwrap_or_else(|| Arc::new(parent.clone()));
                 self.parent_keys.push(ParentKey::of(&shared));
                 self.parents.push(shared);
+                self.parent_index.entry(digest).or_default().push(self.parents.len() as u32 - 1);
                 self.parents.len() - 1
             }
             None => return None,
@@ -28928,8 +29717,8 @@ impl StyleCache {
         Some(position as u32 + 1)
     }
 
-    /// Token lookup only scans recent parents, so an equal parent style seen
-    /// earlier can come back under a second token.
+    /// Whether two tokens name the same parent style: equal tokens, or equal
+    /// styles behind two tokens.
     fn same_parent(&self, cached: u32, token: u32) -> bool {
         cached == token || (cached != 0 && token != 0
             && self.parents.get(cached as usize - 1).zip(self.parents.get(token as usize - 1))
@@ -29326,17 +30115,19 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
             })+
         };
     }
-    paint_fields!(
+    // Shared lists compare by address first (`Arc`'s `==` does not for slices).
+    macro_rules! paint_shared_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(if !arcs_equal(&probe.$field, &new.$field) {
+                probe.$field = new.$field.clone();
+            })+
+        };
+    }
+    paint_shared_fields!(
         source_colors,
         shadow_source_colors,
         image_color_origins,
         text_shadows,
-        text_shadow_current_color,
-        border_corner_radii,
-        logical_border_radius_corners,
-        border_color_sides,
-        logical_border_color,
-        outline,
         shadows,
         background_images,
         background_position,
@@ -29353,6 +30144,14 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
         mask_origin,
         mask_clip,
         mask_mode,
+    );
+    paint_fields!(
+        text_shadow_current_color,
+        border_corner_radii,
+        logical_border_radius_corners,
+        border_color_sides,
+        logical_border_color,
+        outline,
         text_decoration,
         text_decoration_style,
         text_decoration_color,
@@ -29375,7 +30174,23 @@ pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
         column_rule_color,
     );
     if old.filters.is_some() == new.filters.is_some() {
-        paint_fields!(filters);
+        paint_shared_fields!(filters);
+    }
+    // A transform or backdrop filter that starts or stops changes stacking
+    // and containing blocks; one that changes value moves only paint.
+    if old.has_transform() == new.has_transform()
+        && (old.transforms != new.transforms || old.individual_transforms != new.individual_transforms) {
+        let unpainted = |values: &[RelativeExpression]| values.iter().filter(|value| !paint_only_slot(value.slot)).cloned().collect::<Vec<_>>();
+        let extras = &mut *probe;
+        extras.transforms = new.transforms.clone();
+        extras.individual_transforms = new.individual_transforms.clone();
+        if unpainted(&old.relative_expressions) == unpainted(&new.relative_expressions) {
+            extras.relative_expressions = new.relative_expressions.clone();
+        }
+    }
+    let backdrop = |style: &Style| extra_props::keyword(style, "backdrop-filter").is_some_and(|value| value != "none");
+    if backdrop(old) == backdrop(new) && extra_props::keyword(old, "backdrop-filter") != extra_props::keyword(new, "backdrop-filter") {
+        extra_props::set_stored(&mut probe, "backdrop-filter", extra_props::keyword(new, "backdrop-filter"));
     }
     if probe == *new { StyleDamage::Paint } else { StyleDamage::Layout }
 }
@@ -29658,6 +30473,8 @@ fn restyle_one(
     text: &dyn TextShaper,
     node: NodeId,
     forced_parent: Option<&Arc<Style>>,
+    paint: Option<&mut Vec<RestyledPaint>>,
+    keep_sharing: bool,
 ) -> Result<(StyleDamage, Option<Arc<Style>>, Option<Arc<Style>>), CssError> {
     let old = cache.node_entry(node).cloned();
     let old_pseudos: Vec<(PseudoElement, Option<GeneratedStyle>)> = if cache.selected.is_some() { Vec::new() } else {
@@ -29666,7 +30483,7 @@ fn restyle_one(
             .map(|entry| (entry.pseudo, entry.generated.clone()))
             .collect())
     };
-    cache.drop_node(node);
+    if keep_sharing { cache.forget_node_entry(node); } else { cache.drop_node(node); }
     cache.refresh_bloom(document, node);
     let Some((_, token, _, old_style)) = old else {
         return Ok((StyleDamage::Layout, None, None));
@@ -29693,10 +30510,16 @@ fn restyle_one(
     let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| generated.style.sibling_position_dependent
         || matches!(&generated.content,
         GeneratedContent::Items(items) if items.iter().any(|item| matches!(item, GeneratedContentItem::Attribute { .. }))));
+    let mut pseudo_pairs: Vec<(PseudoElement, GeneratedStyle, GeneratedStyle)> = Vec::new();
     for (position, (pseudo, generated)) in old_pseudos.iter().enumerate() {
         if old_pseudos[..position].iter().any(|(earlier, _)| earlier == pseudo) { continue; }
         if reads_attributes(generated) { damage = StyleDamage::Layout; break; }
         let current = index.compute_pseudo_cached(document, node, &style, *pseudo, Some(text), cache)?;
+        if paint.is_some() {
+            if let (Some(old), Some(new)) = (generated, &current) {
+                if old.style != new.style { pseudo_pairs.push((*pseudo, old.clone(), new.clone())); }
+            }
+        }
         let mut changed = StyleDamage::Layout;
         for (_, old) in old_pseudos.iter().filter(|(kind, _)| kind == pseudo) {
             changed = changed.min(pseudo_damage(index, &mut cache.custom_rebases, old, &current));
@@ -29715,7 +30538,26 @@ fn restyle_one(
         damage = StyleDamage::Layout;
     }
     let new_style = (damage != StyleDamage::None && style != *old_style).then(|| Arc::new(style));
+    if let Some(paint) = paint.filter(|_| damage == StyleDamage::Paint) {
+        if let Some(new) = &new_style {
+            paint.push(RestyledPaint { node, pseudo: None, old: old_style.clone(), new: new.clone(), content: None });
+        }
+        for (pseudo, old, new) in pseudo_pairs {
+            paint.push(RestyledPaint { node, pseudo: Some(pseudo), old: Arc::new(old.style), new: Arc::new(new.style),
+                content: Some((old.content, new.content)) });
+        }
+    }
     Ok((damage, new_style, Some(old_style)))
+}
+
+/// A box whose style a restyle changed with paint damage only: its style
+/// before and after, and for a pseudo-element its content before and after.
+pub(crate) struct RestyledPaint {
+    pub node: NodeId,
+    pub pseudo: Option<PseudoElement>,
+    pub old: Arc<Style>,
+    pub new: Arc<Style>,
+    pub content: Option<(GeneratedContent, GeneratedContent)>,
 }
 
 /// Recompute the retained styles of `nodes`, which a mutation may have
@@ -29727,13 +30569,15 @@ fn restyle_one(
 /// had no retained style to compare with, with the damage the change causes;
 /// nodes whose damage is `None` are omitted and the styles of all others are
 /// kept as they were. Fails when the work exceeds a bound that makes a full
-/// restyle cheaper.
+/// restyle cheaper. With `paint`, also collects the styles before and after
+/// of every box restyled with paint damage only.
 pub(crate) fn restyle_nodes(
     document: &Document,
     index: &StyleIndex,
     cache: &mut StyleCache,
     text: &dyn TextShaper,
     nodes: &[NodeId],
+    mut paint: Option<&mut Vec<RestyledPaint>>,
 ) -> Result<Vec<(NodeId, StyleDamage)>, CssError> {
     let mut order: Vec<(usize, NodeId)> = nodes.iter()
         .filter(|node| document.kind(**node).is_ok())
@@ -29746,7 +30590,16 @@ pub(crate) fn restyle_nodes(
         cache.computed = 0;
     }
     let targets: alloc::collections::BTreeSet<u128> = order.iter().map(|(_, node)| node.key()).collect();
-    let mut budget = document.node_count() / 2 + 256;
+    // Restyling every retained style (`StyleCache::styled_nodes`, after a
+    // rules change no selector analysis bounds) is a full restyle that keeps
+    // the layout of boxes whose styles come out the same: nothing cheaper
+    // remains to fall back to.
+    let full = targets.len() >= cache.styled_count();
+    let mut budget = if full { usize::MAX } else { document.node_count() / 2 + 256 };
+    // Sharing describes the document as styles were computed. A bounded
+    // restyle follows mutations, so each node drops it; a full one drops it
+    // once, and the styles it computes share with each other.
+    if full { cache.reset_sharing(); }
     let mut damage: alloc::collections::BTreeMap<u128, (NodeId, StyleDamage)> = alloc::collections::BTreeMap::new();
     let mut done: alloc::collections::BTreeSet<u128> = alloc::collections::BTreeSet::new();
     let mut pending: Vec<(NodeId, Arc<Style>, Arc<Style>)> = Vec::new();
@@ -29759,7 +30612,7 @@ pub(crate) fn restyle_nodes(
             continue;
         }
         done.insert(node.key());
-        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None)?;
+        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None, paint.as_deref_mut(), full)?;
         record(&mut damage, node, level);
         if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
             pending.push((node, new_style, old_style));
@@ -29811,7 +30664,7 @@ pub(crate) fn restyle_nodes(
                 }
                 budget -= 1;
                 done.insert(child.key());
-                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent))?;
+                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent), paint.as_deref_mut(), full)?;
                 record(&mut damage, child, level);
                 if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
                     pending.push((child, new_style, old_style));
@@ -30709,36 +31562,36 @@ fn compute_for_named_registered_inner(
         }
     }
     if let Some(parent) = parent {
-        style.color = parent.color;
+        if style.color != parent.color { style.color = parent.color; }
         if let Some(colors)=parent.source_colors.as_ref().filter(|colors|colors.len()==1 && colors[0].0==1) {
             style.source_colors=Some(colors.clone());
         }else {style.set_source_color(1,parent.source_color(1));}
-        style.font_size = parent.font_size;
+        if style.font_size != parent.font_size { style.font_size = parent.font_size; }
         if style.font != parent.font {
             style.font = parent.font.clone();
         }
-        style.svg_fill = parent.svg_fill.clone();
-        style.svg_stroke = parent.svg_stroke.clone();
+        if style.svg_fill != parent.svg_fill { style.svg_fill = parent.svg_fill.clone(); }
+        if style.svg_stroke != parent.svg_stroke { style.svg_stroke = parent.svg_stroke.clone(); }
         style.set_source_color(141,parent.source_color(141));
         style.set_source_color(142,parent.source_color(142));
-        style.svg_stroke_width = parent.svg_stroke_width;
-        style.svg_fill_opacity = parent.svg_fill_opacity;
-        style.svg_stroke_opacity = parent.svg_stroke_opacity;
+        if style.svg_stroke_width != parent.svg_stroke_width { style.svg_stroke_width = parent.svg_stroke_width; }
+        if style.svg_fill_opacity != parent.svg_fill_opacity { style.svg_fill_opacity = parent.svg_fill_opacity; }
+        if style.svg_stroke_opacity != parent.svg_stroke_opacity { style.svg_stroke_opacity = parent.svg_stroke_opacity; }
         copy_slot(254,parent,&mut style);
-        style.svg_fill_rule = parent.svg_fill_rule;
-        style.svg_clip_rule = parent.svg_clip_rule;
-        style.line_height = parent.line_height;
+        if style.svg_fill_rule != parent.svg_fill_rule { style.svg_fill_rule = parent.svg_fill_rule; }
+        if style.svg_clip_rule != parent.svg_clip_rule { style.svg_clip_rule = parent.svg_clip_rule; }
+        if style.line_height != parent.line_height { style.line_height = parent.line_height; }
         if style.line_break_counts!=parent.line_break_counts {
             style.line_break_counts=parent.line_break_counts.clone();
         }
-        style.border_spacing = parent.border_spacing;
-        style.quotes = parent.quotes.clone();
-        style.color_scheme = parent.color_scheme.clone();
-        style.list_style_type = parent.list_style_type.clone();
-        style.list_style_position = parent.list_style_position;
-        style.caption_bottom = parent.caption_bottom;
-        style.html_cell_padding_hint = parent.html_cell_padding_hint;
-        style.list_style_image = parent.list_style_image.clone();
+        if style.border_spacing != parent.border_spacing { style.border_spacing = parent.border_spacing; }
+        if style.quotes != parent.quotes { style.quotes = parent.quotes.clone(); }
+        if style.color_scheme != parent.color_scheme { style.color_scheme = parent.color_scheme.clone(); }
+        if style.list_style_type != parent.list_style_type { style.list_style_type = parent.list_style_type.clone(); }
+        if style.list_style_position != parent.list_style_position { style.list_style_position = parent.list_style_position; }
+        if style.caption_bottom != parent.caption_bottom { style.caption_bottom = parent.caption_bottom; }
+        if style.html_cell_padding_hint != parent.html_cell_padding_hint { style.html_cell_padding_hint = parent.html_cell_padding_hint; }
+        if style.list_style_image != parent.list_style_image { style.list_style_image = parent.list_style_image.clone(); }
         if style.writing_mode != parent.writing_mode {
             style.writing_mode = parent.writing_mode;
         }
@@ -30748,11 +31601,11 @@ fn compute_for_named_registered_inner(
         if style.visibility_visible != parent.visibility_visible {
             style.visibility_visible = parent.visibility_visible;
         }
-        style.visibility_collapsed = parent.visibility_collapsed;
+        if style.visibility_collapsed != parent.visibility_collapsed { style.visibility_collapsed = parent.visibility_collapsed; }
         if style.pointer_events_auto != parent.pointer_events_auto {
             style.pointer_events_auto = parent.pointer_events_auto;
         }
-        style.user_select = parent.user_select;
+        if style.user_select != parent.user_select { style.user_select = parent.user_select; }
         extra_props::inherit(parent,&mut style);
         if style.empty_cells_hide != parent.empty_cells_hide {
             style.empty_cells_hide = parent.empty_cells_hide;
@@ -30766,7 +31619,7 @@ fn compute_for_named_registered_inner(
         Value::TextTransform(parent.text_transform).apply(&mut style);
         Value::TextAlign(parent.text_align).apply(&mut style);
         Value::TextIndent(parent.text_indent).apply(&mut style);
-        style.text_indent_mode = parent.text_indent_mode;
+        if style.text_indent_mode != parent.text_indent_mode { style.text_indent_mode = parent.text_indent_mode; }
         Value::LetterSpacing(parent.letter_spacing).apply(&mut style);
         Value::WordSpacing(parent.word_spacing).apply(&mut style);
         Value::Direction(parent.direction).apply(&mut style);
@@ -31203,6 +32056,10 @@ fn compute_for_named_registered_inner(
             }
             // HTML rendering defaults remain lower priority than author CSS.
             if *namespace == Namespace::Html && html_rendering_attribute(attributes, context, "hidden").is_some() && tag != "embed" {
+                // HTML rendering: `[hidden=until-found i]:not(embed) { content-visibility: hidden }`.
+                if html_rendering_attribute(attributes, context, "hidden").is_some_and(|value| value.eq_ignore_ascii_case("until-found")) {
+                    extra_props::set_stored(&mut style, "content-visibility", Some("hidden"));
+                }
                 if matches!(tag, "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr") {
                     Value::Visibility { visible: false, collapsed: true }.apply(&mut style);
                 } else if html_rendering_attribute(attributes, context, "hidden")
@@ -31279,14 +32136,14 @@ fn compute_for_named_registered_inner(
         // against author !important. Only a direct symbol instance root
         // has the opposite mandatory UA rule (SVG2 5.4.2).
         candidates.push(((CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration { value: Value::Display(
+            CandidateDeclaration::Owned(Declaration { value: Value::Display(
                 if svg_instance_root && matches!(kind,NodeKind::Element{name,..} if crate::svg::local_name(name)=="symbol") { Display::Inline } else { Display::None }), important: true }), None));
     }
     // Presentational hints participate at author origin with zero specificity.
     // Keep them out of the UA baseline so authored `revert` returns to the
     // rendering defaults instead of reviving an HTML attribute hint.
     let mut hint = |value| { if style_seed.is_none() { candidates.push(((CascadeOrigin::Author, [0; 8], (0, 0, 0, 0), (0, 0)),
-        alloc::borrow::Cow::Owned(Declaration { value, important: false }), index.document_base_url.clone())); } };
+        CandidateDeclaration::Owned(Declaration { value, important: false }), index.document_base_url.clone())); } };
     if let Some(spacing) = html_spacing_hint { hint(Value::BorderSpacing(spacing)); }
     if let Some(padding) = html_padding_hint {
         for side in 0..4 { hint(Value::PaddingSide(side, padding)); }
@@ -31314,7 +32171,7 @@ fn compute_for_named_registered_inner(
     if pseudo_target.is_none() { html_presentational_hints(kind, context, image_dimensions, &mut hint); }
     if auto_image_containment {
         candidates.push(((CascadeOrigin::UaImportant,[usize::MAX;8],(0,1,1,0),(0,usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration{value:Value::Containment{size:true,inline_size:false,layout:false,style:false,paint:false},important:true}),None));
+            CandidateDeclaration::Owned(Declaration{value:Value::Containment{size:true,inline_size:false,layout:false,style:false,paint:false},important:true}),None));
     }
     if pseudo_target.is_none() && context.is_some_and(|(document, node)| {
         document.is_html_document() && html_rendering_tag(document, node) == Some("form")
@@ -31322,7 +32179,7 @@ fn compute_for_named_registered_inner(
                 matches!(html_rendering_tag(document, parent), Some("table" | "thead" | "tbody" | "tfoot" | "tr")))
     }) {
         candidates.push(((CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX)),
-            alloc::borrow::Cow::Owned(Declaration { value: Value::Display(Display::None), important: true }), None));
+            CandidateDeclaration::Owned(Declaration { value: Value::Display(Display::None), important: true }), None));
     }
     if pseudo_target.is_none()
         && context.is_some_and(|(document, _)| {
@@ -31344,7 +32201,7 @@ fn compute_for_named_registered_inner(
         let priority = (CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX));
         candidates.push((
             priority,
-            alloc::borrow::Cow::Owned(Declaration {
+            CandidateDeclaration::Owned(Declaration {
                 value: Value::Display(Display::None),
                 important: true,
             }),
@@ -31362,7 +32219,7 @@ fn compute_for_named_registered_inner(
             let tag = crate::svg::local_name(name);
             if let Some(matrix)=crate::svg::presentation_transform(tag,attributes,context) {
                 candidates.push(((CascadeOrigin::Author,[0;8],(0,0,0,0),(0,0)),
-                    alloc::borrow::Cow::Owned(Declaration{value:Value::Transforms(Some(Arc::from([Transform::Matrix(matrix)]))),important:false}),index.document_base_url.clone()));
+                    CandidateDeclaration::Owned(Declaration{value:Value::Transforms(Some(Arc::from([Transform::Matrix(matrix)]))),important:false}),index.document_base_url.clone()));
             }
             // SVG presentation attributes participate at author origin with zero
             // specificity, below every stylesheet declaration.
@@ -31392,7 +32249,7 @@ fn compute_for_named_registered_inner(
                     declaration.important = false;
                     candidates.push((
                         (CascadeOrigin::Author, [0; 8], (0, 0, 0, 0), (0, 0)),
-                        alloc::borrow::Cow::Owned(declaration),
+                        CandidateDeclaration::Owned(declaration),
                         index.document_base_url.clone(),
                     ));
                 }
@@ -31415,7 +32272,7 @@ fn compute_for_named_registered_inner(
                 (0, ids, classes, tags),
                 (proximity, order + 1),
             );
-            candidates.push((priority, alloc::borrow::Cow::Borrowed(declaration), source_url.clone()));
+            candidates.push((priority, CandidateDeclaration::Borrowed(declaration), source_url.clone()));
         }
     }
     if pseudo_target.is_none() && style_seed.is_none() {
@@ -31453,7 +32310,7 @@ fn compute_for_named_registered_inner(
                     );
                     candidates.push((
                         priority,
-                        alloc::borrow::Cow::Owned(declaration),
+                        CandidateDeclaration::Owned(declaration),
                         index.document_base_url.clone(),
                     ));
                 }
@@ -31461,7 +32318,7 @@ fn compute_for_named_registered_inner(
         }
     }
     candidates.extend(index.snapshot_declarations.iter().map(|snapshot|
-        (snapshot.priority, alloc::borrow::Cow::Borrowed(&snapshot.declaration), snapshot.source_url.clone())));
+        (snapshot.priority, CandidateDeclaration::Borrowed(&snapshot.declaration), snapshot.source_url.clone())));
     let mut snapshot_targets = Vec::new();
     if !index.snapshot_declarations.is_empty() {
         snapshot_targets.try_reserve_exact(index.snapshot_declarations.len()).map_err(|_| CssError { offset: 0, message: "CSS snapshot projection exceeds limit" })?;
@@ -31483,11 +32340,11 @@ fn compute_for_named_registered_inner(
             for declaration in &effect.declarations {
                 if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, true) { continue; }
                 candidates.push(((origin, [usize::MAX; 8], (0, 0, 0, 0), (0, usize::MAX)),
-                    alloc::borrow::Cow::Borrowed(declaration), index.document_base_url.clone()));
+                    CandidateDeclaration::Borrowed(declaration), index.document_base_url.clone()));
             }
         }
     }
-    candidates.sort_by_key(|(priority, _, _)| *priority);
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
     let appearance_base = candidates.iter().rev().find_map(|(_, declaration, _)| match &declaration.value {
         // `base-select` opts only drop-down boxes out of the native look.
         Value::Appearance(value) => Some(*value == Appearance::Base || *value == Appearance::BaseSelect && form_ua_select),
@@ -31503,7 +32360,7 @@ fn compute_for_named_registered_inner(
         let owner = owner_values::Owner { element: context, property: name };
         let substituted: Arc<str> = owner_values::substitute(raw, &owner).map_or_else(|| Arc::from("unset"), |text| Arc::from(text.trim()));
         let replacement = Declaration { value: Value::Custom(name.clone(), substituted), important: declaration.important };
-        *declaration = alloc::borrow::Cow::Owned(replacement);
+        *declaration = CandidateDeclaration::Owned(replacement);
     }
     let sibling_dependent=candidates.iter().any(|(_,declaration,_)|{
         if value_depends_on_sibling_position(&declaration.value){return true;}
@@ -31521,6 +32378,8 @@ fn compute_for_named_registered_inner(
     let mut blocked_registered = Vec::new();
     // Raw sources feed query replay (eligibility present) and font-cycle detection; the latter
     // asks for them on demand, so the common cascade can share the inherited map by pointer.
+    // Registered custom properties resolve their lengths with font metrics.
+    if !registrations.is_empty() && text.is_some() { note_font_metric_read(Some(index), &style, parent); }
     let initial_context: CustomContext = (style_length_context(if registrations.is_empty() { None } else { text }, &style, index.environment, None), query, style.resolved_source_color(1, style.color));
     let raw_source_context = (!registrations.is_empty() && eligibility.is_some()).then(|| initial_context.clone());
     let memoizable = eligibility.is_none();
@@ -31579,7 +32438,7 @@ fn compute_for_named_registered_inner(
                             expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
                             expanded_originals.push(original.clone());
                         }
-                        expanded.push((priority, alloc::borrow::Cow::Owned(value), source_url.clone()));
+                        expanded.push((priority, CandidateDeclaration::Owned(value), source_url.clone()));
                     }
                 }};
             }
@@ -31609,8 +32468,14 @@ fn compute_for_named_registered_inner(
                             });
                         }
                     } else {
-                        for parsed in parsed.iter().filter(|declaration| target_slots.contains(&declaration.value.slot())) {
-                            emit!(parsed.clone());
+                        for (position, parsed_declaration) in parsed.iter().enumerate().filter(|(_, declaration)| target_slots.contains(&declaration.value.slot())) {
+                            if !target.is_some_and(|target| parsed_declaration.value.slot() != target) {
+                                if track_originals {
+                                    expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
+                                    expanded_originals.push(original.clone());
+                                }
+                                expanded.push((priority, CandidateDeclaration::Shared(parsed.clone(), position), source_url.clone()));
+                            }
                         }
                     }
                 }
@@ -31627,8 +32492,14 @@ fn compute_for_named_registered_inner(
                             });
                         }
                     } else {
-                        for parsed in parsed.iter() {
-                            emit!(parsed.clone());
+                        for (position, parsed_declaration) in parsed.iter().enumerate() {
+                            if !target.is_some_and(|target| parsed_declaration.value.slot() != target) {
+                                if track_originals {
+                                    expanded_originals.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
+                                    expanded_originals.push(original.clone());
+                                }
+                                expanded.push((priority, CandidateDeclaration::Shared(parsed.clone(), position), source_url.clone()));
+                            }
                         }
                     }
                 }
@@ -31683,7 +32554,15 @@ fn compute_for_named_registered_inner(
         ($raw:expr) => {{
             match resolved_length_context {
                 Some(context) if !length_metrics_pending || !raw_may_use_font_metrics($raw) => context,
-                _ => length_context!(),
+                // A value about to resolve against the font's metrics.
+                Some(_) => {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
+                    length_context!()
+                }
+                None => {
+                    if text.is_some() && raw_may_use_font_metrics($raw) { note_font_metric_read(Some(index), &style, parent); }
+                    length_context!()
+                }
             }
         }};
     }
@@ -31988,15 +32867,17 @@ fn compute_for_named_registered_inner(
                 } else if let Value::GeneratedContent(GeneratedContent::Items(items)) =
                     &declaration.value
                 {
+                    // Font metrics only when an item may use a font-relative unit:
+                    // every computation of them is a read `length_context!` notes.
+                    let raw=serialize_generated_content_items(items);
+                    let context=length_context!(&raw);
                     style.generated_content = Some(resolve_generated_content_items(
                         items,
                         source_url.as_deref(),
-                        length_context!(),
+                        context,
                         &style.resolved_source_color(1,style.color),ContainerUnitContext::no_container(index.environment),
                     ));
                     style.content_none = false;
-                    let context=length_context!();
-                    let raw=serialize_generated_content_items(items);
                     let selected=color_scheme::select_branches(&raw,context.viewport.color_schemes.page().scheme).ok_or(CssError{offset:0,message:"invalid generated image branches"})?;
                     let (uses_font,query_dependent)=image_numeric_dependencies(&selected);
                     let current_font_pending=uses_font&&style.font_query_context_pending();
@@ -32040,7 +32921,8 @@ fn compute_for_named_registered_inner(
                     let origin=if *color_slot==1 {parent.map_or_else(||SourceColor{value:color_values::from_rgba(style.color),color_function:false,expression:None},|parent|parent.resolved_source_color(1,parent.color))}
                         else {style.resolved_source_color(1,style.color)};
                     let current=origin.value;
-                    let (sibling_index,sibling_count)=context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1));
+                    // Walking the siblings is O(siblings); only `sibling-*()` reads it.
+                    let (sibling_index,sibling_count)=if typed_numeric::may_name_sibling_function(raw) {context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1))} else {(1,1)};
                     let length=length_context!(raw);
                     let query=ContainerUnitContext::no_container(index.environment);
                     let selected=color_scheme::select_branches(raw,length.viewport.color_schemes.page().scheme).ok_or(CssError{offset:0,message:"invalid light-dark color branches"})?;
@@ -32106,7 +32988,7 @@ fn compute_for_named_registered_inner(
                     Value::Animation(166,raw) if transition_controls::needs_computation(raw)=>Some(raw.to_string()),_=>None,
                 } {
                     if transition_controls::timing_dependencies(&raw).2 {style.sibling_position_dependent=true;}
-                    let (sibling_index,sibling_count)=context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1));
+                    let (sibling_index,sibling_count)=if typed_numeric::may_name_sibling_function(&raw) {context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1))} else {(1,1)};
                     let raw=transition_controls::substitute_sibling_timings(&raw,sibling_index,sibling_count).unwrap_or(raw);
                     let (uses_font,uses_container,_)=transition_controls::timing_dependencies(&raw);
                     let pending_font=uses_font && style.font_query_context_pending();
@@ -32122,6 +33004,7 @@ fn compute_for_named_registered_inner(
                         else {style.animation[3]=Some(Arc::from(transition_controls::serialize_timings(Some(&values))));}
                     }
                 } else if let Value::FontFeatureSettings(settings) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = matches!(settings.as_deref(),Some(FontFeatureSettings::Expressions(values))
                         if values.iter().any(|value| parent_font_expression_pending(parent,&value.value)));
@@ -32141,6 +33024,7 @@ fn compute_for_named_registered_inner(
                         });
                     }
                 } else if let Value::FontStretchExpression(expression) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = parent_font_expression_pending(parent,expression);
                     if let Some(resolved) = (!pending_parent).then(|| resolve_font_width(expression, Some(length), ContainerUnitContext::default())).flatten() {
@@ -32157,6 +33041,7 @@ fn compute_for_named_registered_inner(
                         }
                     }
                 } else if let Value::FontStyleExpression(expression) = &declaration.value {
+                    if text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let length = declaration_length_context(text, &style, parent, root, slot, index.environment, None);
                     let pending_parent = parent_font_expression_pending(parent,expression);
                     if let Some(resolved) = (!pending_parent).then(|| resolve_font_angle(expression, Some(length), ContainerUnitContext::default())).flatten() {
@@ -32205,16 +33090,20 @@ fn compute_for_named_registered_inner(
                     let percent = Some(if font_pass { parent.map_or(16.0, |parent| parent.font_size) }
                         else if slot == 13 { style.font_size } else { 0.0 });
                     let metric_text = if raw_may_use_font_metrics(raw) { text } else { None };
+                    if metric_text.is_some() { note_font_metric_read(Some(index), &style, parent); }
                     let context = if pass >= 5 {
                         let base = if metric_text.is_some() { length_context!() }
                             else { resolved_length_context.expect("font and line-height phases completed") };
                         LengthContext { percent, ..base }
                     } else { declaration_length_context(metric_text, &style, parent, root, slot, index.environment, percent) };
-                    let uses_font = if slot==233 {image_numeric_dependencies(raw).0}else if slot==166 {transition_controls::timing_dependencies(raw).0}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,font_relative_unit)}else{components(raw).is_some_and(|values|values.iter().any(|raw|typed_numeric::parse_numeric_expression(raw).is_some_and(|expression|expression.contains_unit(font_relative_unit))))};
-                    let uses_line = slot == 233 && animation_controls::contains_unit(raw, |unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)) || typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(|unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)));
+                    // Parsing the value for its units is needed only while a font
+                    // query context is pending, which is rare.
+                    let uses_font = || if slot==233 {image_numeric_dependencies(raw).0}else if slot==166 {transition_controls::timing_dependencies(raw).0}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,font_relative_unit)}else{components(raw).is_some_and(|values|values.iter().any(|raw|typed_numeric::parse_numeric_expression(raw).is_some_and(|expression|expression.contains_unit(font_relative_unit))))};
+                    let uses_line = || slot == 233 && animation_controls::contains_unit(raw, |unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)) || typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(|unit| matches!(unit, typed_numeric::NumericUnit::Lh | typed_numeric::NumericUnit::Rlh)));
                     let parent_font_input = font_pass || slot == 140;
-                    let pending_current = !parent_font_input && uses_font && (style.font_query_context_pending()
-                        || (slot != 13 && uses_line && style.relative_expressions.iter().any(|expression| expression.slot == 13 && expression.query_dependent)));
+                    let pending_current = !parent_font_input && (style.font_query_context_pending()
+                        || (slot != 13 && style.relative_expressions.iter().any(|expression| expression.slot == 13 && expression.query_dependent) && uses_line()))
+                        && uses_font();
                     let pending_parent = parent_font_input && parent.is_some_and(Style::font_query_context_pending)
                         && typed_numeric::parse_numeric_expression(numeric_input).is_some_and(|expression| expression.contains_unit(font_relative_unit));
                     let uses_container = if slot==233 {image_numeric_dependencies(raw).1}else if slot==166 {transition_controls::timing_dependencies(raw).1}else if matches!(slot,164|165|166|167|206|222|223|224|225){animation_controls::contains_unit(raw,container_unit)}else if slot == 26 {
@@ -32574,7 +33463,8 @@ fn compute_for_named_registered_inner(
     }
     // The UA's list-item increment is the initial declaration for every
     // list-item box. An authored counter-increment (including `none`) replaces
-    // it through the ordinary cascade.
+    // it through the ordinary cascade; counting still increments `list-item`
+    // unless the authored value names it (`apply_counter_operations`).
     if style.is_list_item() && winner_orders[161] == 0 {
         style.counter_increment = Some(Arc::from([CounterDirective {
             name: Arc::from("list-item"),
@@ -32713,6 +33603,14 @@ fn compute_for_named_registered_inner(
     if style.text_shadow_current_color!=0 {
         let shadows=style.resolved_text_shadows();
         if shadows!=style.text_shadows {style.text_shadows=shadows;}
+    }
+    // Most elements end with the same extras as their parent but in their own
+    // allocation; sharing the parent's lets later comparisons (interning, the
+    // matched cache, restyle damage) stop at the pointer check.
+    if let Some(parent) = parent {
+        if let (Some(own), Some(inherited)) = (style.extras.as_ref(), parent.extras.as_ref()) {
+            if !Arc::ptr_eq(own, inherited) && **own == **inherited {style.extras = Some(inherited.clone());}
+        }
     }
     if let Some(scalars) = mp_pending {
         // A style computed from a host answer a worker could not get is wrong
@@ -34863,6 +35761,46 @@ mod tests {
         assert_eq!(sampled.width,Some(60.0),"sample resolves against old snapshot font, not new author style");
         assert_eq!(sampled.margin_sides[3],7.0);
         assert_eq!(sampled.custom_properties().iter().find(|(name,_)|name=="--Protected").unwrap().1.as_deref(),Some("old"));
+    }
+
+    #[test]
+    fn snapshot_style_memo_reuses_equal_inputs_until_the_element_changes() {
+        let mut document=crate::html::parse("<div id=p style='font-size:20px'><div id=t style='width:10px' data-x=1></div><div id=o></div></div>",32).unwrap();
+        let find=|document:&Document,id|crate::selector::query_selector(document,document.root(),id).unwrap().unwrap();
+        let (parent,target,other)=(find(&document,"#p"),find(&document,"#t"),find(&document,"#o"));
+        let index=StyleIndex::new(Vec::new());
+        let mut cache=StyleCache::default();
+        let (old_parent,_)=index.compute_transition_snapshot_cached(&document,parent,None,None,None,&mut cache,false).unwrap();
+        let (old,eligibility)=index.compute_transition_snapshot_cached(&document,target,Some(&old_parent),None,None,&mut cache,false).unwrap();
+        let environment=MediaEnvironment::default();
+        let pairs=[(String::from("width"),String::from("3em"))];
+        let mut direct=(*old).clone();
+        direct.apply_animation_snapshot(&document,target,Some(&old_parent),None,None,environment,&pairs,&eligibility).unwrap();
+        assert_eq!(direct.width,Some(60.0));
+        let mut memo=SnapshotStyleMemo::default();
+        let apply=|memo:&mut SnapshotStyleMemo,document:&Document,parent:&Arc<Style>,pairs:&[(String,String)]|{
+            let mut style=old.clone();
+            memo.apply(&mut style,document,target,Some(parent),None,None,environment,pairs,&eligibility).unwrap();
+            style
+        };
+        let first=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(*first==direct);
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&old_parent,&pairs)),"equal inputs resolve once");
+        let recaptured=Arc::new((*old_parent).clone());
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&recaptured,&pairs)),"a value-equal parent is the same input");
+        let wider=apply(&mut memo,&document,&old_parent,&[(String::from("width"),String::from("4em"))]);
+        assert_eq!(wider.width,Some(80.0),"other samples resolve on their own");
+        document.set_attribute(other,"class","x").unwrap();
+        assert!(Arc::ptr_eq(&first,&apply(&mut memo,&document,&old_parent,&pairs)),"another element's attributes cannot reach it");
+        document.set_attribute(target,"data-x","2").unwrap();
+        let again=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(!Arc::ptr_eq(&first,&again),"the element's own attributes drop its entries");
+        assert!(*again==direct);
+        assert_eq!(memo.len(),1);
+        document.remove(other).unwrap();
+        let after_tree=apply(&mut memo,&document,&old_parent,&pairs);
+        assert!(!Arc::ptr_eq(&again,&after_tree),"a tree change drops every entry");
+        assert_eq!(memo.len(),1);
     }
 
     #[test]
@@ -43953,7 +44891,7 @@ mod incremental_style_tests {
 
     fn restyle(document: &Document, index: &StyleIndex, cache: &mut StyleCache) -> (Vec<NodeId>, Vec<(NodeId, StyleDamage)>) {
         let targets = index.mutation_restyle_targets(document, document.mutations()).unwrap();
-        let damage = restyle_nodes(document, index, cache, &TestText, &targets).unwrap();
+        let damage = restyle_nodes(document, index, cache, &TestText, &targets, None).unwrap();
         (targets, damage)
     }
 
@@ -44237,7 +45175,7 @@ mod incremental_style_tests {
         let wrap = elements(&document, "div")[0];
         document.set_attribute(wrap, "class", "wrap big").unwrap();
         let targets = index.mutation_restyle_targets(&document, document.mutations()).unwrap();
-        assert!(restyle_nodes(&document, &index, &mut cache, &TestText, &targets).is_err());
+        assert!(restyle_nodes(&document, &index, &mut cache, &TestText, &targets, None).is_err());
     }
 
     #[test]
@@ -44294,6 +45232,7 @@ mod incremental_style_tests {
             (&left.quote_pseudo_rules, &right.quote_pseudo_rules),
             (&left.generated_pseudo_rules, &right.generated_pseudo_rules),
             (&left.marker_pseudo_rules, &right.marker_pseudo_rules),
+            (&left.typographic_pseudo_rules, &right.typographic_pseudo_rules),
             (&left.counter_pseudo_rules, &right.counter_pseudo_rules),
         ] {
             assert_eq!(a.tags, b.tags);
@@ -44434,7 +45373,7 @@ mod incremental_style_tests {
         let subjects = extended.appended_rule_subjects(&appended, &document, &cache).expect("bounded");
         assert_eq!(subjects.len(), elements(&document, "").len());
         let targets: Vec<NodeId> = subjects.iter().map(|&(node, _)| node).collect();
-        restyle_nodes(&document, &extended, &mut cache, &TestText, &targets).unwrap();
+        restyle_nodes(&document, &extended, &mut cache, &TestText, &targets, None).unwrap();
         assert_matches_full_restyle(&document, &extended, &cache);
     }
 
@@ -44480,7 +45419,7 @@ mod incremental_style_tests {
         let subjects = extended.appended_rule_subjects(&appended, &document, &cache).expect("bounded");
         let nodes: Vec<NodeId> = subjects.iter().map(|&(node, _)| node).collect();
         assert_eq!(nodes.len(), 2);
-        restyle_nodes(&document, &extended, &mut cache, &TestText, &nodes).unwrap();
+        restyle_nodes(&document, &extended, &mut cache, &TestText, &nodes, None).unwrap();
         assert_matches_full_restyle(&document, &extended, &cache);
     }
 
@@ -44601,6 +45540,7 @@ mod incremental_style_tests {
             (&extended.quote_pseudo_rules, &full.quote_pseudo_rules),
             (&extended.generated_pseudo_rules, &full.generated_pseudo_rules),
             (&extended.marker_pseudo_rules, &full.marker_pseudo_rules),
+            (&extended.typographic_pseudo_rules, &full.typographic_pseudo_rules),
             (&extended.counter_pseudo_rules, &full.counter_pseudo_rules),
         ] {
             assert_eq!(left.tags, right.tags);
@@ -44976,6 +45916,27 @@ mod incremental_style_tests {
     }
 
     #[test]
+    fn ancestor_filter_uses_ancestors_every_logical_alternative_shares() {
+        let html = "<div class=a><i id=i1 class=c>x</i><i id=i2>y</i></div><div class=b><i id=i3 class=c>z</i></div>\
+                    <section class=a><div class=d><i id=i4>w</i></div></section><i id=i5 class=a>v</i>";
+        for (css, expected, rejects) in [
+            (":where(.a > :not(:last-child)) { color: red }", vec!["i1"], true),
+            (":is(.a > *) { color: red }", vec!["i1", "i2", "i4"], true),
+            (":is(.a .d > *) { color: red }", vec!["i4"], true),
+            (":is(.a > *, .b > *) { color: red }", vec!["i1", "i2", "i3", "i4"], false),
+            (":where(.a, .a *) { color: red }", vec!["i1", "i2", "i4", "i5"], false),
+            (":is(.a *, .b > .c) .c { color: red }", vec![], false),
+            (":is(:is(.a > *)) { color: red }", vec!["i1", "i2", "i4"], true),
+            ("div:is(.a *) > i { color: red }", vec!["i4"], true),
+        ] {
+            let (reds, rejected) = filtered_reds(html, css);
+            let reds = reds.into_iter().filter(|id| id.starts_with('i')).collect::<Vec<_>>();
+            assert_eq!(reds, expected, "{css}");
+            if rejects { assert!(rejected > 0, "{css}: rejected {rejected}"); }
+        }
+    }
+
+    #[test]
     fn ancestor_filter_matches_tags_ignoring_ascii_case() {
         let html = "<div id=d class=Foo><p id=p class=bar>x</p></div>";
         for (css, expected) in [
@@ -45273,5 +46234,33 @@ mod matched_cache_hits {
         assert!(style_of(&document, &shared, node) == expected);
         assert!(shared.matched_hits.load(core::sync::atomic::Ordering::Relaxed) > hits);
         assert!(stored(&shared, "body"));
+    }
+}
+
+#[cfg(test)]
+mod parent_token_tests {
+    use super::*;
+
+    /// A large page asks for many distinct parent styles per frame. An equal parent style seen
+    /// any time before (not only among the most recent) keeps its token, so the table does not
+    /// fill with duplicates and stop caching.
+    #[test]
+    fn parent_styles_seen_long_ago_keep_their_token() {
+        let mut cache = StyleCache::default();
+        let styles: Vec<Style> = (0..4 * PARENT_STYLES_RECENT)
+            .map(|i| Style { font_size: 10.0 + i as f32, ..Style::initial() })
+            .collect();
+        let first: Vec<u32> = styles.iter().map(|style| cache.parent_token(Some(style)).unwrap()).collect();
+        for _ in 0..3 {
+            let again: Vec<u32> =
+                styles.iter().map(|style| cache.parent_token(Some(&style.clone())).unwrap()).collect();
+            assert_eq!(again, first);
+        }
+        assert_eq!(cache.parents.len(), styles.len());
+        cache.compact_parents();
+        assert!(cache.parents.is_empty(), "no entry refers to them");
+        let renewed = cache.parent_token(Some(&styles[7])).unwrap();
+        assert_eq!(cache.parent_token(Some(&styles[7])), Some(renewed));
+        assert_eq!(cache.parents.len(), 1);
     }
 }

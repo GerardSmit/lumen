@@ -29,6 +29,10 @@ impl<'a> FromArg<'a, JsHost> for FocusOptions {
 pub(crate) fn focus_element(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, options: FocusOptions) -> OpResult<()> {
     let (realm,node)=realm.resolve_adopted_node(node);
     if !allow_focus_with_context(Some(ctx),&realm) { return Ok(()); }
+    // HTML focus(): an element that is not a focusable area returns before
+    // the focusing steps, so it is never scrolled into view either. Checking
+    // here keeps a no-op focus() from forcing a layout flush.
+    if resolve_focus_target(&realm,node,false)?.is_none() { return Ok(()); }
     realm.focus(ctx, Some(node))?;
     if let Some(visible)=options.focus_visible {
         realm.focus_visible.set(if visible { realm.focused_node() } else { None });

@@ -352,9 +352,9 @@ impl Substituted {
 }
 
 const TEMPLATES: usize = 4096;
-const PAIRS: usize = 512;
-const PARSES: usize = 2048;
-const SUBSTITUTIONS: usize = 1024;
+const PAIRS: usize = 2048;
+const PARSES: usize = 4096;
+const SUBSTITUTIONS: usize = 4096;
 
 /// Everything `var()` substitution remembers: compiled templates by source text identity,
 /// substituted text by (source, custom property map) identity for multi-reference values, and

@@ -180,39 +180,134 @@ struct TransitionRecord {
     endpoint_styles:Option<(Arc<lumen_html::css::Style>,Arc<lumen_html::css::Style>)>,
 }
 
+
+thread_local! {
+    /// Counts mutable accesses to any animation hub's state.
+    static HUB_MUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn hub_mutations() -> u64 {
+    HUB_MUTATIONS.with(std::cell::Cell::get)
+}
+
+/// Hub state whose every mutable access is counted, so a flush can tell that
+/// nothing changed since the previous one.
+#[derive(Default)]
+struct Tracked<T>(T);
+
+impl<T> core::ops::Deref for Tracked<T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.0 }
+}
+
+impl<T> core::ops::DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        HUB_MUTATIONS.with(|count| count.set(count.get().wrapping_add(1)));
+        &mut self.0
+    }
+}
+
+/// What a geometry or computed-style read already flushed. Every input of the
+/// flush (hub state, style-change inputs, timeline time) is in `key`; while it
+/// holds, flushing a target again publishes exactly what it published before.
+struct FlushMemo {
+    key: FlushKey,
+    /// Targets flushed for every property (`None`), or for one property.
+    flushed: Vec<(Option<NodeId>, Option<Box<str>>)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct FlushKey {
+    realm: usize,
+    mutations: u64,
+    now: u64,
+    epoch: lumen_html::session::TransitionInputEpoch,
+    /// What progress timelines sample: the layout they read, the scroll offsets
+    /// of their sources and the samples already taken (`progress_fingerprint`).
+    progress: u64,
+}
+
+/// Everything a progress timeline sample of `realm` reads: its records' bindings
+/// and samples, the scroll offsets of their sources, and the layout they are
+/// sampled from (the display list identity, and whether it is current). Zero
+/// when the realm has none.
+fn progress_fingerprint(state:&AnimationHub,realm:&Rc<DomRealm>)->u64 {
+    let mut hash=0u64;
+    let mut mix=|value:u64|hash=(hash.rotate_left(5)^value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let session=realm.session.borrow();
+    let mut any=false;
+    for (id,record) in state.records.iter() {
+        let Some(binding)=record.progress_timeline.as_ref() else{continue};
+        if record.realm.upgrade().is_none_or(|owner|!Rc::ptr_eq(&owner,realm)) {continue;}
+        any=true;
+        mix(u64::from(*id)|u64::from(record.cancelled)<<32|u64::from(state.progress_sampled.contains(id))<<33);
+        mix(binding.sampled_time.map_or(u64::MAX,f64::to_bits));
+        mix(binding.source.map_or(u64::MAX,|source|{
+            let (x,y)=session.scroll_offset(source);
+            u64::from(x.to_bits())|u64::from(y.to_bits())<<32
+        }));
+        mix(binding.source.map_or(0,|node|node.key() as u64)^binding.subject.map_or(0,|node|(node.key() as u64).rotate_left(17)));
+    }
+    if !any {return 0;}
+    mix(session.frame_id());
+    mix(u64::from(session.completed_geometry_is_stale()));
+    hash|1
+}
+
+impl FlushMemo {
+    fn covers(&self, target: Option<NodeId>, property: Option<&str>) -> bool {
+        self.flushed.iter().any(|(node, name)| (node.is_none() || *node == target)
+            && (name.is_none() || name.as_deref() == property))
+    }
+}
+
 struct AnimationHub {
     default_realm: Weak<DomRealm>,
+
     next_id: u32,
+
     next_effect_id: u32,
+
     next_timeline_id: u32,
-    records: BTreeMap<u32, Record>,
-    effect_records: FastMap<u32, EffectRecord>,
-    wrappers: FastMap<u32, WeakValue>,
-    finished: FastMap<u32, FinishedPromise>,
-    ready: FastMap<u32, ReadyPromise>,
-    effects: FastMap<u32, WeakValue>,
-    timelines: FastMap<usize, WeakValue>,
-    default_timeline_ids: FastMap<usize, u32>,
-    timeline_values: FastMap<u32, WeakValue>,
-    overlaid_nodes: FastMap<usize, FastSet<(NodeId,Option<lumen_html::css::PseudoElement>,bool)>>,
-    css_records: FastMap<(usize, NodeId, Option<lumen_html::css::PseudoElement>, usize), (String, String, u32)>,
-    css_generations: FastMap<usize, (Weak<DomRealm>, u64)>,
-    css_events: FastMap<u32, CssEventState>,
-    transitions:FastMap<u32,TransitionRecord>,
-    running_transitions:FastMap<TransitionTarget,u32>,
-    completed_transitions:FastMap<TransitionTarget,String>,
-    transition_snapshots:FastMap<usize,(Weak<DomRealm>,Arc<lumen_html::session::TransitionSnapshot>)>,
-    after_effect_bases:FastMap<usize,AfterEffectBasis>,
-    transition_over_budget:FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
-    transition_budget_reported:FastSet<usize>,
-    animation_over_budget:FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
-    animation_budget_reported:FastSet<usize>,
-    transition_mutation_realms:Vec<Weak<DomRealm>>,
+
+    records: Tracked<BTreeMap<u32, Record>>,
+    effect_records: Tracked<FastMap<u32, EffectRecord>>,
+    wrappers: Tracked<FastMap<u32, WeakValue>>,
+    finished: Tracked<FastMap<u32, FinishedPromise>>,
+    ready: Tracked<FastMap<u32, ReadyPromise>>,
+    effects: Tracked<FastMap<u32, WeakValue>>,
+    timelines: Tracked<FastMap<usize, WeakValue>>,
+    default_timeline_ids: Tracked<FastMap<usize, u32>>,
+    timeline_values: Tracked<FastMap<u32, WeakValue>>,
+    overlaid_nodes: Tracked<FastMap<usize, FastSet<(NodeId,Option<lumen_html::css::PseudoElement>,bool)>>>,
+    css_records: Tracked<FastMap<(usize, NodeId, Option<lumen_html::css::PseudoElement>, usize), (String, String, u32)>>,
+    css_generations: Tracked<FastMap<usize, (Weak<DomRealm>, u64)>>,
+    css_events: Tracked<FastMap<u32, CssEventState>>,
+    transitions: Tracked<FastMap<u32,TransitionRecord>>,
+    running_transitions: Tracked<FastMap<TransitionTarget,u32>>,
+    completed_transitions: Tracked<FastMap<TransitionTarget,String>>,
+    transition_snapshots: Tracked<FastMap<usize,(Weak<DomRealm>,Arc<lumen_html::session::TransitionSnapshot>)>>,
+    after_effect_bases: Tracked<FastMap<usize,AfterEffectBasis>>,
+    transition_over_budget: Tracked<FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>>,
+    transition_budget_reported: Tracked<FastSet<usize>>,
+    animation_over_budget: Tracked<FastMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>>,
+    animation_budget_reported: Tracked<FastSet<usize>>,
+    transition_mutation_realms: Tracked<Vec<Weak<DomRealm>>>,
     transition_generation:u64,
+
     refreshing_transitions:bool,
-    rendered_revisions: FastMap<usize, (Weak<DomRealm>, u64, u64)>,
-    dispatching_css: FastMap<u32, usize>,
-    css_cancellations: Vec<Weak<CssCancellation>>,
+
+    rendered_revisions: Tracked<FastMap<usize, (Weak<DomRealm>, u64, u64)>>,
+    dispatching_css: Tracked<FastMap<u32, usize>>,
+    css_cancellations: Tracked<Vec<Weak<CssCancellation>>>,
+    /// The state after the last `flush_css_transitions_for_property`.
+    flush_memo: Option<FlushMemo>,
+    /// Set while a style change event (a script's style or geometry read) samples effects.
+    /// Progress timelines then keep their last sampled progress over a stale layout instead
+    /// of forcing one; the next frame's update samples them again.
+    holding_progress: bool,
+    /// Records whose progress timeline has been sampled at least once.
+    progress_sampled: Tracked<FastSet<u32>>,
 }
 
 impl Default for AnimationHub {
@@ -221,30 +316,33 @@ impl Default for AnimationHub {
             next_id: 0,
             next_effect_id: 0,
             next_timeline_id: 0,
-            records: BTreeMap::new(),
-            effect_records: FastMap::default(),
-            wrappers: FastMap::default(),
-            finished: FastMap::default(),
-            ready: FastMap::default(),
-            effects: FastMap::default(),
-            timelines: FastMap::default(),
-            default_timeline_ids: FastMap::default(),
-            timeline_values: FastMap::default(),
-            overlaid_nodes: FastMap::default(),
-            css_records: FastMap::default(),
-            css_generations: FastMap::default(),
-            css_events: FastMap::default(),
-            transitions:FastMap::default(),running_transitions:FastMap::default(),
-            completed_transitions:FastMap::default(),transition_snapshots:FastMap::default(),
-            after_effect_bases:FastMap::default(),
-            transition_over_budget:FastMap::default(),transition_budget_reported:FastSet::default(),
-            animation_over_budget:FastMap::default(),animation_budget_reported:FastSet::default(),
-            transition_mutation_realms:Vec::new(),
+            records:Tracked(BTreeMap::new()),
+            effect_records:Tracked(FastMap::default()),
+            wrappers:Tracked(FastMap::default()),
+            finished:Tracked(FastMap::default()),
+            ready:Tracked(FastMap::default()),
+            effects:Tracked(FastMap::default()),
+            timelines:Tracked(FastMap::default()),
+            default_timeline_ids:Tracked(FastMap::default()),
+            timeline_values:Tracked(FastMap::default()),
+            overlaid_nodes:Tracked(FastMap::default()),
+            css_records:Tracked(FastMap::default()),
+            css_generations:Tracked(FastMap::default()),
+            css_events:Tracked(FastMap::default()),
+            transitions:Tracked(FastMap::default()),running_transitions:Tracked(FastMap::default()),
+            completed_transitions:Tracked(FastMap::default()),transition_snapshots:Tracked(FastMap::default()),
+            after_effect_bases:Tracked(FastMap::default()),
+            transition_over_budget:Tracked(FastMap::default()),transition_budget_reported:Tracked(FastSet::default()),
+            animation_over_budget:Tracked(FastMap::default()),animation_budget_reported:Tracked(FastSet::default()),
+            transition_mutation_realms:Tracked(Vec::new()),
             transition_generation:0,refreshing_transitions:false,
-            rendered_revisions: FastMap::default(),
-            dispatching_css: FastMap::default(),
-            css_cancellations: Vec::new(),
+            rendered_revisions:Tracked(FastMap::default()),
+            dispatching_css:Tracked(FastMap::default()),
+            css_cancellations:Tracked(Vec::new()),
             default_realm: Weak::new(),
+            flush_memo: None,
+            holding_progress: false,
+            progress_sampled: Tracked(FastSet::default()),
         }
     }
 }
@@ -1515,6 +1613,22 @@ fn transition_pair_eligible(property:&str,from:&str,to:&str,allow_discrete:bool,
     }
 }
 
+/// Whether sampling these keyframe transform lists against the base list
+/// resolves a percentage against the element's reference box. Lists whose functions pair up
+/// index by index interpolate each translate's pixel and percentage parts on their
+/// own, and the percentages resolve at paint as in Blink; only the matrix
+/// fallback for mismatched functions needs the box, and with it a layout.
+fn transforms_need_reference_box(keyframes:impl Iterator<Item=Vec<lumen_html::css::Transform>>,
+    base:Option<&[lumen_html::css::Transform]>)->bool {
+    use lumen_html::css::Transform;
+    let percent=|list:&[Transform]|list.iter().any(|transform|matches!(transform,Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0));
+    let mut lists:Vec<Vec<Transform>>=keyframes.collect();
+    if let Some(base)=base {lists.push(base.to_vec());}
+    if !lists.iter().any(|list|percent(list)) {return false;}
+    let kind=|transform:&Transform|core::mem::discriminant(transform);
+    !lists.iter().all(|a|lists.iter().all(|b|a.iter().zip(b).all(|(x,y)|kind(x)==kind(y))))
+}
+
 fn interpolate_transform_animation(from:&str,to:&str,progress:f64,
     context:&(lumen_html::css::Style,lumen_html::paint::Rect,lumen_html::css::MediaEnvironment))->Option<String> {
     let (style,rect,viewport)=context;
@@ -1602,23 +1716,23 @@ fn before_change_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElement>
     inputs:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),&'a lumen_html::session::TransitionStyleInput>,
     samples:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Vec<(String,String)>>,
     transition_samples:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Vec<(String,String)>>,
-    document:&Document,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
+    document:&Document,memo:&RefCell<lumen_html::css::SnapshotStyleMemo>,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
     prepared:&mut FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Arc<lumen_html::css::Style>>,budget:&mut EffectSamplingBudget,depth:usize,
 )->OpResult<Arc<lumen_html::css::Style>> {
     if let Some(style)=prepared.get(&target) {return Ok(style.clone());}
     if depth>=512 {return Err(OpError::new("InvalidStateError","before-change style depth exceeded"));}
     let input=inputs.get(&target).ok_or_else(||OpError::new("InvalidStateError","before-change target unavailable"))?;
     let parent=input.parent.and_then(|node|inputs.get(&(node,None)).copied());
-    let resolved_parent=parent.map(|parent|before_change_style((parent.node,None),inputs,samples,transition_samples,document,environment,text,prepared,budget,depth+1)).transpose()?;
+    let resolved_parent=parent.map(|parent|before_change_style((parent.node,None),inputs,samples,transition_samples,document,memo,environment,text,prepared,budget,depth+1)).transpose()?;
     let changed_parent=parent.zip(resolved_parent.as_ref()).is_some_and(|(old,new)|!Arc::ptr_eq(&old.style,new));
     let pairs=samples.get(&target).map_or(&[][..],Vec::as_slice);
     let mut style=input.style.clone();
     if (changed_parent || !pairs.is_empty()) && document.kind(input.node).is_ok() {
-        Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+        memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
             environment,pairs,&input.eligibility).map_err(|error|OpError::new("SyntaxError",format!("before-change animation sample failed: {error:?}")))?;
     }
     if let Some(pairs)=transition_samples.get(&target).filter(|_|document.kind(input.node).is_ok()) {
-        Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+        memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
             environment,pairs,&lumen_html::css::EffectEligibility::all())
             .map_err(|error|OpError::new("SyntaxError",format!("before-change transition sample failed: {error:?}")))?;
     }
@@ -1856,7 +1970,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         let running_display=running.is_some_and(|properties|properties.iter().any(|property|property=="display"));
         let old=previous_nodes.get(&(input.node,input.pseudo)).copied().filter(|old|old.was_rendered() || running_display);
         let display_index=input.style.transition_property().map_or(Some(0),|properties|properties.iter().enumerate()
-            .filter(|(_,name)|lumen_html::css::transition_property_longhands(name).iter().any(|name|name.as_ref()=="display"))
+            .filter(|(_,name)|lumen_html::css::transition_property_covers(name,"display"))
             .map(|(index,_)|index).last());
         let parent_rendered=input.parent.and_then(|parent|effective_rendered.get(&(parent,None)).copied())
             .or_else(||input.parent.and_then(|parent|after_nodes.get(&(parent,None)).map(|input|input.was_rendered()))).unwrap_or(true);
@@ -1896,7 +2010,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         let before=if let Some(old)=old {
             let session=realm.session.borrow();
             before_change_style((old.node,old.pseudo),&previous_nodes,&sampled_animations,&sampled_transitions,
-                session.document(),session.media_environment(),text,&mut before_styles,&mut before_budget,0)?
+                session.document(),session.snapshot_style_memo(),session.media_environment(),text,&mut before_styles,&mut before_budget,0)?
         }else{starting.expect("before or starting style")};
         if running.is_none() && *before==*input.style && hub.borrow().completed_transitions.is_empty() {continue;}
 
@@ -2015,15 +2129,51 @@ pub(crate) fn flush_css_transitions_for_property(ctx:&mut Ctx,realm:&Rc<DomRealm
     let Some(hub)=RealmServices::<RefCell<AnimationHub>>::current(ctx) else{return Ok(());};
     if hub.borrow().refreshing_transitions {return Ok(());}
     if let Some(target)=target {realm.session.borrow_mut().watch_transition_target(target);}
+    // Scripts read geometry or computed style in loops. With every input of
+    // the flush unchanged since the last one, flushing a target it already
+    // covered would publish the same styles again.
+    let key=|hub:&Rc<RefCell<AnimationHub>>|->OpResult<Option<FlushKey>> {
+        let state=hub.borrow();
+        let epoch=realm.session.borrow_mut().transition_input_epoch().map_err(|error|OpError::new("InvalidStateError",format!("{error:?}")))?;
+        Ok(Some(FlushKey{realm:Rc::as_ptr(realm) as usize,
+            mutations:hub_mutations()^(u64::from(state.next_id)<<32)^state.transition_generation.rotate_left(16),
+            now:realm.timeline_sample.get().to_bits(),epoch,progress:progress_fingerprint(&state,realm)}))
+    };
+    let before=key(&hub)?;
+    let carried=match (&hub.borrow().flush_memo,before) {
+        (Some(memo),Some(before)) if memo.key==before => {
+            // A whole-realm demand covers connected elements only.
+            let connected=target.is_none_or(|node|realm.session.borrow().document().is_connected_element(node));
+            if connected && memo.covers(target,property) {return Ok(());}
+            true
+        }
+        _=>false,
+    };
     hub.borrow_mut().refreshing_transitions=true;
+    hub.borrow_mut().holding_progress=true;
+    let mut whole_realm=false;
     let result=(||{
         let now=realm.timeline_sample.get();
         refresh_css_transitions(ctx,&hub,realm,now)?;
         refresh_css_animations(ctx,&hub,realm,now)?;
         let demand=match property{Some(property)=>EffectDemand::for_property(&hub,realm,target,property)?,None=>EffectDemand::new(realm,target)?};
+        whole_realm=demand.is_whole_realm();
         apply_realm_in_phase_with_demand(&hub,realm,now,EffectStylePhase::Current,&demand)
     })();
     hub.borrow_mut().refreshing_transitions=false;
+    hub.borrow_mut().holding_progress=false;
+    // A scoped flush leaves other targets' publications in place, so what an
+    // unchanged state already covered stays covered.
+    let after=if result.is_ok() {key(&hub)?} else {None};
+    let mut state=hub.borrow_mut();
+    let mut flushed=if carried {state.flush_memo.take().map(|memo|memo.flushed).unwrap_or_default()} else {Vec::new()};
+    state.flush_memo=after.and_then(|key|{
+        if flushed.len()>=256 {flushed.clear();}
+        // An unscoped demand without detached ancestry samples every effect.
+        if whole_realm {flushed.clear();flushed.push((None,None));}
+        else {flushed.push((target,property.map(Box::from)));}
+        Some(FlushMemo{key,flushed})
+    });
     result
 }
 
@@ -2704,14 +2854,14 @@ struct EffectUnderlyingSource<'a> {order:usize,input:&'a lumen_html::session::Tr
 fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElement>),own:bool,
     inputs:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),EffectUnderlyingSource<'a>>,
     declarations:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>,bool),BTreeMap<String,String>>,
-    document:&Document,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
+    document:&Document,memo:&RefCell<lumen_html::css::SnapshotStyleMemo>,environment:lumen_html::css::MediaEnvironment,text:Option<&dyn lumen_html::paint::TextShaper>,
     prepared:&mut FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),Arc<lumen_html::css::Style>>,budget:&mut EffectSamplingBudget,depth:usize,
 )->OpResult<Arc<lumen_html::css::Style>> {
     if own {if let Some(style)=prepared.get(&target){return Ok(style.clone());}}
     if depth>=512{return Err(OpError::new("InvalidStateError","effect inheritance depth exceeded"));}
     let input=inputs.get(&target).map(|source|source.input).ok_or_else(||OpError::new("InvalidStateError","effect underlying source unavailable"))?;
     let parent=input.parent.and_then(|node|inputs.get(&(node,None)).map(|source|source.input));
-    let resolved_parent=parent.map(|parent|effect_underlying_style((parent.node,None),true,inputs,declarations,document,environment,text,prepared,budget,depth+1)).transpose()?;
+    let resolved_parent=parent.map(|parent|effect_underlying_style((parent.node,None),true,inputs,declarations,document,memo,environment,text,prepared,budget,depth+1)).transpose()?;
     if own{budget.reserve(prepared,1)?;}
     // A style captured without effects, under an unchanged parent and with no
     // samples to apply, is already its underlying style; restyling it again
@@ -2731,7 +2881,7 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
         .ok_or_else(||OpError::new("QuotaExceededError","effect underlying source limit"))?;
     budget.add(source_bytes)?;
     let mut style=input.style.clone();
-    Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+    memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
         environment,&[],&input.eligibility).map_err(|error|OpError::new("SyntaxError",format!("effect underlying inheritance failed: {error:?}")))?;
     if own {
         for transition in [false,true] {
@@ -2740,7 +2890,7 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
                 let pairs=values.iter().map(|(name,value)|(name.clone(),value.clone())).collect::<Vec<_>>();
                 let unrestricted=transition.then(lumen_html::css::EffectEligibility::all);
                 let eligibility=unrestricted.as_ref().unwrap_or(&input.eligibility);
-                Arc::make_mut(&mut style).apply_animation_snapshot(document,input.node,resolved_parent.as_deref(),input.pseudo,text,
+                memo.borrow_mut().apply(&mut style,document,input.node,resolved_parent.as_ref(),input.pseudo,text,
                     environment,&pairs,eligibility).map_err(|error|OpError::new("SyntaxError",format!("effect parent sample failed: {error:?}")))?;
                 drop(pairs);budget.bytes=checkpoint;
             }
@@ -2793,6 +2943,8 @@ fn apply_realm_with_underlying(hub:&Rc<RefCell<AnimationHub>>,realm:&Rc<DomRealm
 #[derive(Default)]
 struct EffectDemand { detached: Vec<u128>, scoped_connected:bool }
 impl EffectDemand {
+    /// Every effect of the realm is demanded.
+    fn is_whole_realm(&self)->bool {!self.scoped_connected && self.detached.is_empty()}
     fn new(realm:&DomRealm,target:Option<NodeId>)->OpResult<Self> {Self::new_with_scope(realm,target,false)}
     fn new_with_scope(realm:&DomRealm,target:Option<NodeId>,scoped_connected:bool)->OpResult<Self> {
         let mut result=Self{scoped_connected,..Self::default()};
@@ -3021,14 +3173,28 @@ fn sample_realm_in_phase(hub:&Rc<RefCell<AnimationHub>>,realm:&Rc<DomRealm>,now:
     // independently of whether its target paint/style is demanded.
     let has_progress=hub.borrow().records.values().any(|record|record.progress_timeline.is_some()
         && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && !record.cancelled);
-    if has_progress {
+    // Scroll-driven animations take their progress from a layout snapshot. A style
+    // change event between frames keeps the previous samples instead of forcing a new
+    // layout, unless the layout is current anyway or a timeline was never sampled.
+    let held=has_progress && {
+        let state=hub.borrow();
+        state.holding_progress && realm.session.borrow().completed_geometry_is_stale()
+            && state.records.values().filter(|record|!record.cancelled && record.progress_timeline.is_some()
+                && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)))
+                .all(|record|state.progress_sampled.contains(&record.id))
+    };
+    if has_progress && !held {
         realm.flush_layout()?;
         let samples=hub.borrow().records.values().filter(|record|!record.cancelled
             && record.realm.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)))
             .filter_map(|record|record.progress_timeline.as_ref().map(|binding|(record.id,progress_time(realm,binding))))
             .collect::<Vec<_>>();
+        let mut state=hub.borrow_mut();
+        let state=&mut *state;
+        state.progress_sampled.retain(|id|state.records.contains_key(id));
         for (id,time) in samples {
-            if let Some(binding)=hub.borrow_mut().records.get_mut(&id).and_then(|record|record.progress_timeline.as_mut()) {binding.sampled_time=time;}
+            if let Some(binding)=state.records.get_mut(&id).and_then(|record|record.progress_timeline.as_mut()) {binding.sampled_time=time;}
+            state.progress_sampled.insert(id);
         }
     }
     let key = Rc::as_ptr(realm) as usize;
@@ -3218,26 +3384,26 @@ let property_pass=|name:&str| {
                     let base_style=if needs_source(record) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),false,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),false,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let color_style=if pass==1&&keyframes_need_color_context(&record.keyframes) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let context_style=if keyframes_need_context(&record.keyframes) {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
-                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),
+                        Some(effect_underlying_style((node,record.pseudo),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                             session.media_environment(),shadow_text,parents,&mut underlying_budget,0)?)
                     }else{None};
                     let context_parent=if context_style.is_some() {
                         let session=realm.session.borrow();
                         let (inputs,parents)=if before_change||record.transition_origin{(&underlying_inputs,&mut underlying_parents)}else{(&current_underlying_inputs,&mut current_underlying_parents)};
                         inputs.get(&(node,record.pseudo)).and_then(|source|source.input.parent)
-                            .map(|parent|effect_underlying_style((parent,None),true,inputs,&declarations,session.document(),
+                            .map(|parent|effect_underlying_style((parent,None),true,inputs,&declarations,session.document(),session.snapshot_style_memo(),
                                 session.media_environment(),shadow_text,parents,&mut underlying_budget,0)).transpose()?
                     }else{None};
                     let mut endpoint_query=if context_style.is_some() {
@@ -3302,11 +3468,11 @@ let property_pass=|name:&str| {
                             }
                         }
                         let registered_transform_reference=transform_pass && record.keyframes.iter().any(|frame|frame.declarations.iter().any(|(property,_)|property.starts_with("--") && registered_syntax(property).is_some_and(|syntax|syntax.contains("<transform-"))));
-                        let needs_reference=registered_transform_reference || transform_pass && record.keyframes.iter().flat_map(|frame|frame.declarations.iter().map(|(property,value)|(property,value)))
-                            .any(|(property,value)|property=="transform"
-                                && lumen_html::css::parse_animation_transforms(value,&style,viewport,shadow_text)
-                                    .is_some_and(|transforms|transforms.iter().any(|transform|matches!(transform,lumen_html::css::Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0))))
-                            || transform_pass&&base_style.as_ref().is_some_and(|style|style.transforms.as_deref().is_some_and(|transforms|transforms.iter().any(|transform|matches!(transform,lumen_html::css::Transform::Translate(x,y)if x.percent!=0.0||y.percent!=0.0))));
+                        let needs_reference=registered_transform_reference || transform_pass && transforms_need_reference_box(
+                            record.keyframes.iter().flat_map(|frame|frame.declarations.iter())
+                                .filter(|(property,_)|property=="transform")
+                                .filter_map(|(_,value)|lumen_html::css::parse_animation_transforms(value,&style,viewport,shadow_text).map(|list|list.to_vec())),
+                            base_style.as_ref().and_then(|style|style.transforms.as_deref()));
                         if transform_pass && (needs_reference || style.font_query_context_pending()) && !query_geometry_ready {
                             drop(session);realm.flush_layout()?;query_geometry_ready=true;session=realm.session.borrow_mut();
                             style=match record.pseudo {
@@ -4167,7 +4333,7 @@ fn css_tree_order<'a>(owners: impl Iterator<Item = &'a Rc<DomRealm>>) -> OpResul
 }
 
 fn dispatch_css_cancellations(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>) -> OpResult<()> {
-    let mut snapshots = std::mem::take(&mut hub.borrow_mut().css_cancellations)
+    let mut snapshots = std::mem::take(&mut *hub.borrow_mut().css_cancellations)
         .into_iter().filter_map(|entry| entry.upgrade()).collect::<Vec<_>>();
     let tree_order = css_tree_order(snapshots.iter().map(|entry| &entry.owner))?;
     snapshots.sort_by_key(|entry| {
@@ -5724,6 +5890,28 @@ fn specification_animation_context_computed_endpoints_follow_sampled_font_and_li
 }
 
 #[test]
+fn repeated_geometry_reads_see_every_effect_change(){
+    let mut engine=Engine::new();
+    let realm=crate::install(engine.ctx(),"<div id=one style='width:10px;height:10px'></div><div id=two style='width:10px;height:10px'></div>",128).unwrap();
+    progress_layout(&realm);
+    // Reads in an unchanged state reuse the previous flush; any change to an
+    // effect, the document or the timeline time must be seen by the next read.
+    eval_ok(&mut engine,r#"const one=document.getElementById('one'),two=document.getElementById('two');
+        const motion=one.animate({width:['0px','100px']},{duration:1000,fill:'both'});motion.pause();motion.currentTime=250;
+        for(let i=0;i<3;i++){if(one.offsetWidth!==25||two.offsetWidth!==10)throw Error('first reads '+one.offsetWidth+' '+two.offsetWidth);}
+        motion.currentTime=500;
+        if(one.offsetWidth!==50||two.offsetWidth!==10)throw Error('seek '+one.offsetWidth);
+        const other=two.animate({width:['0px','40px']},{duration:1000,fill:'both'});other.pause();other.currentTime=500;
+        if(two.offsetWidth!==20||one.offsetWidth!==50)throw Error('new effect '+two.offsetWidth);
+        other.cancel();
+        if(two.offsetWidth!==10)throw Error('cancel '+two.offsetWidth);
+        two.style.width='30px';
+        if(two.offsetWidth!==30||one.offsetWidth!==50)throw Error('style write '+two.offsetWidth);
+        if(getComputedStyle(one).width!=='50px')throw Error('computed read '+getComputedStyle(one).width);
+    "#);
+}
+
+#[test]
 fn specification_connected_effect_demand_scopes_computed_reads_and_preserves_unrelated_overlays(){
     let mut engine=Engine::new();
     let realm=crate::install(engine.ctx(),"<div id=parent><div id=one></div></div><div id=other></div>",128).unwrap();
@@ -6252,7 +6440,15 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
         eval_ok(&mut engine,"absoluteEffect.cancel()");
         let before_transform=layouts.get();
         eval_ok(&mut engine,"globalThis.referenceEffect=shadowSamples[2].animate({transform:['translateX(0%)','translateX(100%)']},{duration:1000,fill:'both'});referenceEffect.currentTime=500");
-        assert!(layouts.get()>before_transform,"percentage transform samples retain actual reference-box layout");
+        assert_eq!(layouts.get(),before_transform,"paired percentage translates interpolate without a reference box");
+        let sample_node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),".sample:nth-child(3)").unwrap().unwrap());
+        let transforms=realm.session.borrow_mut().computed_style(sample_node).unwrap().transforms.clone();
+        assert!(matches!(transforms.as_deref(),Some([lumen_html::css::Transform::Translate(x,_)]) if x.percent==50.0 && x.pixels==0.0),
+            "the sampled translate keeps its percentage for paint to resolve: {transforms:?}");
+        eval_ok(&mut engine,"referenceEffect.cancel()");
+        let before_mismatch=layouts.get();
+        eval_ok(&mut engine,"globalThis.mismatchEffect=shadowSamples[2].animate({transform:['translateX(0%)','rotate(90deg) translateX(100%)']},{duration:1000,fill:'both'});mismatchEffect.currentTime=500");
+        assert!(layouts.get()>before_mismatch,"mismatched lists interpolate as matrices, which resolve percentages against the actual reference box");
     }
 
     #[test]
@@ -6871,6 +7067,25 @@ fn specification_css_transition_all_and_logical_lists_create_one_physical_effect
     }
 
     #[test]
+    fn a_style_read_between_frames_keeps_the_view_timeline_sample_without_layout() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<style>@keyframes anim{from{transform:translateX(100px)}to{transform:translateX(0px)}}#scroller{border:1px solid black;overflow:hidden;width:300px;height:200px}#target{margin-top:700px;margin-bottom:800px;width:100px;height:200px;animation:anim auto both linear;animation-timeline:--timeline;view-timeline:--timeline;animation-range:exit}#target.update{height:100px;margin-top:800px}</style><div id='scroller'><div id='target'></div></div><p id='other' style='color:green'>x</p>",128).unwrap();
+        let layouts=Rc::new(std::cell::Cell::new(0usize));
+        let font=Rc::new(lumen_html_text::FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap());
+        let counter=layouts.clone();
+        realm.set_layout_flusher(Rc::new(move|session|{counter.set(counter.get()+1);session.display_list(800,600,font.as_ref()).map(|_|()).map_err(|error|format!("{error:?}"))}));
+        eval_ok(&mut engine,"globalThis.scroller=document.getElementById('scroller');globalThis.target=document.getElementById('target');scroller.scrollTop=800");
+        advance(engine.ctx(),0.0).unwrap();
+        advance(engine.ctx(),16.0).unwrap();
+        assert!((progress_translation(&realm)-50.0).abs()<0.01);
+        let before=layouts.get();
+        eval_ok(&mut engine,"target.classList.add('update');getComputedStyle(document.getElementById('other')).color");
+        assert_eq!(layouts.get(),before,"a computed style read between frames lays nothing out for the view timeline");
+        advance(engine.ctx(),32.0).unwrap();
+        assert!((progress_translation(&realm)-100.0).abs()<0.01,"the next frame samples the new subject bounds");
+    }
+
+    #[test]
     fn commented_css_animation_inventory_uses_real_pending_ready_lifecycle() {
         let mut engine = Engine::new();
         let realm = crate::install(engine.ctx(),
@@ -6971,7 +7186,7 @@ fn specification_css_transition_all_and_logical_lists_create_one_physical_effect
         // New author inputs must not replace the retained BEFORE lineage.
         eval_ok(&mut engine,"document.getElementById('parent').style.fontSize='10px'");
         let old=realm.with_session(|session|before_change_style((leaf,None),&inputs,&samples,&FastMap::default(),
-            session.document(),session.media_environment(),None,&mut prepared,&mut budget,0)).unwrap();
+            session.document(),session.snapshot_style_memo(),session.media_environment(),None,&mut prepared,&mut budget,0)).unwrap();
         assert_eq!(old.left,Some(60.0));
         assert!(prepared.len()<8,"unrelated old snapshot entries were reconstructed");
         assert!(prepared.contains_key(&(parent,None)) && prepared.contains_key(&(leaf,None)));

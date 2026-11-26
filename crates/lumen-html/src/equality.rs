@@ -38,7 +38,7 @@ fn attributes_equal(left: &Document, a: NodeId, right: &Document, b: NodeId) -> 
         let mut keys = Vec::new();
         keys.try_reserve_exact(attributes.len()).map_err(|_| Error::LimitExceeded)?;
         for (name, value) in attributes { keys.push(("", name.as_str(), value.as_str())); }
-        if let Some((_, namespaces)) = document.attribute_namespaces.iter().find(|(owner, _)| *owner == id) {
+        if let Some((_, namespaces)) = document.attribute_namespaces.get(id) {
             for (index, uri) in namespaces {
                 keys[*index].0 = uri.as_ref();
                 keys[*index].1 = attribute_local(keys[*index].1, Some(uri));

@@ -476,6 +476,11 @@ fn run_task_source(engine: &mut lumen::Engine, budget: usize, navigation_only: b
         return errors;
     };
     for _ in 0..count {
+        // A terminated realm runs no more script: each remaining task would
+        // only throw the termination and report it again.
+        if engine.is_terminated() {
+            break;
+        }
         let task = queue.as_ref().and_then(|queue| {
             let mut queue = queue.0.borrow_mut();
             let task = if queue.tasks.front().is_some_and(|task| task.id <= boundary && task.eligible_this_turn && task_ready(task)) {

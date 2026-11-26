@@ -647,14 +647,46 @@ impl Default for SettleOptions {
 
 #[derive(Default)]
 pub struct GlyphCache {
-    glyphs: HashMap<(u64, u16, u32), (GlyphCoverage, u64)>,
-    recency: std::collections::BTreeMap<u64, (u64, u16, u32)>,
+    /// Coverage and the tick of its last use. Eviction drops the least
+    /// recently used quarter in one pass, so a hit only stamps its tick.
+    glyphs: lumen_common::fasthash::FastMap<(u64, u16, u32), (std::sync::Arc<GlyphCoverage>, u64)>,
+    /// Coverage other caches of the same frame already rasterized, so parallel
+    /// raster workers rasterize each glyph once between them.
+    shared: Option<std::sync::Arc<SharedGlyphs>>,
     tick: u64,
     bytes: usize,
     hits: u64,
     misses: u64,
     shadow_masks: HashMap<shadow::MaskKey, std::sync::Arc<[u8]>>,
     shadow_bytes: usize,
+}
+
+/// Glyph coverage shared between the caches of parallel raster workers. Hits
+/// stay in each worker's own cache; only a local miss takes this lock.
+#[derive(Default)]
+pub struct SharedGlyphs {
+    glyphs: std::sync::Mutex<(lumen_common::fasthash::FastMap<(u64, u16, u32), std::sync::Arc<GlyphCoverage>>, usize)>,
+}
+
+impl SharedGlyphs {
+    fn get(&self, key: &(u64, u16, u32)) -> Option<std::sync::Arc<GlyphCoverage>> {
+        self.glyphs.lock().ok()?.0.get(key).cloned()
+    }
+
+    fn insert(&self, key: (u64, u16, u32), coverage: std::sync::Arc<GlyphCoverage>) {
+        let Ok(mut shared) = self.glyphs.lock() else { return };
+        let (glyphs, bytes) = &mut *shared;
+        // Workers keep what they use; the shared map only bridges them, so
+        // a full map starts over rather than tracking recency.
+        if *bytes + coverage.alpha.len() > GLYPH_CACHE_BYTES || glyphs.len() >= GLYPH_CACHE_ENTRIES {
+            glyphs.clear();
+            *bytes = 0;
+        }
+        *bytes += coverage.alpha.len();
+        if let Some(old) = glyphs.insert(key, coverage) {
+            *bytes = bytes.saturating_sub(old.alpha.len());
+        }
+    }
 }
 
 /// Cumulative glyph coverage cache counters; callers diff two reads for a frame.
@@ -680,17 +712,30 @@ impl GlyphCache {
         }
     }
 
+    /// Shares rasterized coverage with every other cache given the same `shared`.
+    pub fn share(&mut self, shared: &std::sync::Arc<SharedGlyphs>) {
+        if !self.shared.as_ref().is_some_and(|own| std::sync::Arc::ptr_eq(own, shared)) {
+            self.shared = Some(shared.clone());
+        }
+    }
+
     fn lookup(&mut self, key: &(u64, u16, u32)) -> Option<&GlyphCoverage> {
+        if !self.glyphs.contains_key(key) {
+            let found = self.shared.as_ref().and_then(|shared| shared.get(key));
+            let Some(coverage) = found else {
+                self.misses += 1;
+                return None;
+            };
+            self.store(*key, coverage);
+        }
         let Some((coverage, used)) = self.glyphs.get_mut(key) else {
             self.misses += 1;
             return None;
         };
         self.hits += 1;
         self.tick += 1;
-        self.recency.remove(used);
         *used = self.tick;
-        self.recency.insert(self.tick, *key);
-        Some(&*coverage)
+        Some(&**coverage)
     }
 
     fn shadow_mask(&self, key: &shadow::MaskKey) -> Option<std::sync::Arc<[u8]>> {
@@ -715,24 +760,41 @@ impl GlyphCache {
         self.shadow_masks.clear();
         self.shadow_bytes = 0;
         self.glyphs.clear();
-        self.recency.clear();
         self.bytes = 0;
     }
 
+    /// Drops the least recently used quarter of the entries (at least one).
     fn evict_oldest(&mut self) -> bool {
-        let Some((_, key)) = self.recency.pop_first() else {
+        if self.glyphs.is_empty() {
             return false;
-        };
-        if let Some((coverage, _)) = self.glyphs.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(coverage.alpha.len());
         }
+        let mut ticks: Vec<u64> = self.glyphs.values().map(|(_, used)| *used).collect();
+        let drop = (ticks.len() / 4).max(1);
+        let (_, cutoff, _) = ticks.select_nth_unstable(drop - 1);
+        let cutoff = *cutoff;
+        let mut freed = 0;
+        self.glyphs.retain(|_, (coverage, used)| {
+            let keep = *used > cutoff;
+            if !keep {
+                freed += coverage.alpha.len();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
         true
     }
 
     fn insert(&mut self, key: (u64, u16, u32), coverage: GlyphCoverage) {
+        let coverage = std::sync::Arc::new(coverage);
+        if let Some(shared) = &self.shared {
+            shared.insert(key, coverage.clone());
+        }
+        self.store(key, coverage);
+    }
+
+    fn store(&mut self, key: (u64, u16, u32), coverage: std::sync::Arc<GlyphCoverage>) {
         let bytes = coverage.alpha.len();
-        if let Some((old, used)) = self.glyphs.remove(&key) {
-            self.recency.remove(&used);
+        if let Some((old, _)) = self.glyphs.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.alpha.len());
         }
         while (self.bytes + bytes > GLYPH_CACHE_BYTES || self.glyphs.len() >= GLYPH_CACHE_ENTRIES)
@@ -740,8 +802,24 @@ impl GlyphCache {
         {}
         self.tick += 1;
         self.bytes += bytes;
-        self.recency.insert(self.tick, key);
         self.glyphs.insert(key, (coverage, self.tick));
+    }
+}
+
+/// The glyph-cache key of the last face looked up. A run's glyphs nearly all
+/// share one face, and a provider's `face_key` is fixed while it is borrowed
+/// for a replay, so asking once per face change is enough.
+#[derive(Default)]
+struct FaceKeyMemo(Option<(u64, u64)>);
+
+impl FaceKeyMemo {
+    fn get(&mut self, font: &dyn FontProvider, face: u64) -> Result<u64, &'static str> {
+        if let Some((last, key)) = self.0 {
+            if last == face { return Ok(key); }
+        }
+        let key = font.face_key(face)?;
+        self.0 = Some((face, key));
+        Ok(key)
     }
 }
 
@@ -1237,10 +1315,11 @@ impl ReplaySink for Raster<'_> {
             return;
         };
         let clip=self.current_clip();
+        let mut face_keys = FaceKeyMemo::default();
         for glyph in glyphs {
             let scaled_size = size * glyph.size_scale * self.scale;
             let key = (
-                match font.face_key(glyph.face) {
+                match face_keys.get(font, glyph.face) {
                     Ok(id) => id,
                     Err(error) => {
                         self.error = Some(ImageError::Font(error));
@@ -2332,7 +2411,16 @@ fn resource_edge_coordinate(value:i64,length:u32,edge:lumen_common::filter::reso
     };usize::try_from(mapped).ok()
 }
 fn resource_premultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSpace,opaque:bool) {
-    use lumen_common::color::Color;
+    use lumen_common::color::{Color,ColorSpace};
+    if space==ColorSpace::Srgb{
+        // sRGB to sRGB converts nothing; skip the per-pixel colour conversion.
+        for pixel in image.pixels.chunks_exact_mut(4){
+            let alpha=if opaque{1.0}else{f32::from(pixel[3])/255.0};
+            for channel in 0..3{pixel[channel]=(f32::from(pixel[channel])/255.0*alpha*255.0).round().clamp(0.0,255.0) as u8;}
+            if opaque{pixel[3]=255;}
+        }
+        return;
+    }
     for pixel in image.pixels.chunks_exact_mut(4){
         let color=Color::rgba8([pixel[0],pixel[1],pixel[2],pixel[3]]).to(space);
         let alpha=if opaque{1.0}else{color.alpha};
@@ -2341,7 +2429,12 @@ fn resource_premultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSp
     }
 }
 fn resource_demultiply(image:&mut Rgba8Image,space:lumen_common::color::ColorSpace) {
-    use lumen_common::color::Color;
+    use lumen_common::color::{Color,ColorSpace};
+    if space==ColorSpace::Srgb{
+        for pixel in image.pixels.chunks_exact_mut(4){let alpha=f32::from(pixel[3])/255.0;
+            for channel in 0..3{pixel[channel]=if alpha>0.0{((f32::from(pixel[channel])/255.0/alpha).clamp(0.0,1.0)*255.0+0.5) as u8}else{0};}}
+        return;
+    }
     for pixel in image.pixels.chunks_exact_mut(4){let alpha=f32::from(pixel[3])/255.0;
         let components=if alpha>0.0{core::array::from_fn(|channel|(f32::from(pixel[channel])/255.0/alpha).clamp(0.0,1.0))}else{[0.0;3]};
         pixel.copy_from_slice(&Color::new(space,components,alpha,0).to_rgba8());}
@@ -2416,11 +2509,16 @@ fn blur_resource_image(input:Rgba8Image,input_region:FilterPixelRegion,target:Fi
     let occupied=bytes.checked_add(output.pixels.len()).ok_or(ImageError::TooLarge)?;
     let pixels=(expanded.width as usize).checked_mul(expanded.height as usize).ok_or(ImageError::TooLarge)?;
     let sizes=parameters.kernel_sizes();
+    // A true Gaussian costs O(sigma) per pixel; from 2 device pixels on, three box
+    // passes per axis approximate it within the error Filter Effects allows.
+    let operating=sigma.map(|sigma|sigma*scale);let boxed=operating.iter().all(|sigma|*sigma>=2.0);
+    // Box passes: the channel plane and one scratch plane (the ring is a few KiB).
     // Maintained gray backend: input/output u8 planes, two f32 planes,
     // convolution f32 transient plus both vertical padding arenas, row arena,
     // original/scanned/symmetric kernels and borrowed column-row references.
-    let scratch=pixels.checked_mul(18).and_then(|bytes|bytes.checked_add((expanded.width as usize).checked_mul(4)?))
-        .and_then(|bytes|bytes.checked_add((sizes[0] as usize).checked_add(sizes[1] as usize)?.checked_mul(64)?)).ok_or(ImageError::TooLarge)?;
+    let scratch=if boxed{pixels.checked_mul(2).and_then(|bytes|bytes.checked_add(64*1024))}else{
+        pixels.checked_mul(18).and_then(|bytes|bytes.checked_add((expanded.width as usize).checked_mul(4)?))
+        .and_then(|bytes|bytes.checked_add((sizes[0] as usize).checked_add(sizes[1] as usize)?.checked_mul(64)?))}.ok_or(ImageError::TooLarge)?;
     occupied.checked_add(scratch).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
     let left=usize::try_from(target.left.checked_sub(expanded.left).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
     let top=usize::try_from(target.top.checked_sub(expanded.top).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
@@ -2428,9 +2526,13 @@ fn blur_resource_image(input:Rgba8Image,input_region:FilterPixelRegion,target:Fi
         let mut plane=Vec::new();plane.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
         occupied.checked_add(scratch).and_then(|bytes|bytes.checked_add(plane.capacity().saturating_sub(pixels))).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
         plane.extend(working.pixels.chunks_exact(4).map(|pixel|pixel[channel]));
-        let source=image::GrayImage::from_raw(expanded.width,expanded.height,plane).ok_or(ImageError::InvalidViewport)?;
-        let blurred=image::imageops::blur_advanced(&source,parameters);
-        for y in 0..target.height as usize{for x in 0..target.width as usize{output.pixels[(y*target.width as usize+x)*4+channel]=blurred.as_raw()[(y+top)*expanded.width as usize+x+left];}}
+        let blurred=if boxed{
+            shadow::box_blur_plane_axes(&mut plane,expanded.width as usize,expanded.height as usize,operating,occupied)?;plane
+        }else{
+            let source=image::GrayImage::from_raw(expanded.width,expanded.height,plane).ok_or(ImageError::InvalidViewport)?;
+            image::imageops::blur_advanced(&source,parameters).into_raw()
+        };
+        for y in 0..target.height as usize{for x in 0..target.width as usize{output.pixels[(y*target.width as usize+x)*4+channel]=blurred[(y+top)*expanded.width as usize+x+left];}}
     }
     resource_demultiply(&mut output,space);
     Ok(output)
@@ -3512,7 +3614,11 @@ fn resolve_layer_region_tiles(source:&[Command],filters:Option<&[lumen_common::f
     graph.source_index=Some(std::collections::BTreeMap::new());
     let first_pending=graph.nodes.len();
     let mut output=DisplayList::default();
-    let count=(region.height as usize).checked_add(31).ok_or(ImageError::TooLarge)?/32;
+    // Each band re-evaluates its inputs with the filters' full reach, so thin
+    // bands under a large blur repeat most of the work. Bands hold about
+    // MAX_LAYER_BYTES/16 of output, and at least 32 rows.
+    let band_rows=u32::try_from((MAX_LAYER_BYTES/16)/(region.width as usize).max(1).saturating_mul(4)).unwrap_or(u32::MAX).max(32);
+    let count=(region.height as usize).checked_add(band_rows as usize-1).ok_or(ImageError::TooLarge)?/band_rows as usize;
     let root_bytes=count.checked_mul(core::mem::size_of::<(FilterPixelRegion,usize)>()).ok_or(ImageError::TooLarge)?;
     bytes.checked_add(root_bytes).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
     let mut roots=Vec::new();roots.try_reserve_exact(count).map_err(|_|ImageError::TooLarge)?;
@@ -3523,7 +3629,7 @@ fn resolve_layer_region_tiles(source:&[Command],filters:Option<&[lumen_common::f
     let source_id=graph.register_source(FilterGraphSource{view,end:view.start+source.len(),layer:None,capture,filters:Arc::from(filters),resource:None,geometric_support:None},reserved)?;
     let mut index=std::collections::BTreeMap::new();let mut row=0u32;
     while row<region.height {
-        let tile=FilterPixelRegion{height:(region.height-row).min(32),top:region.top+i64::from(row),..region};
+        let tile=FilterPixelRegion{height:(region.height-row).min(band_rows),top:region.top+i64::from(row),..region};
         let root=graph.add(source_id,filters.len(),tile,reserved,&mut index)?;
         graph.nodes[root].uses=graph.nodes[root].uses.checked_add(1).ok_or(ImageError::TooLarge)?;
         roots.push((tile,root));row+=tile.height;
@@ -4240,9 +4346,10 @@ fn paint_bounds(
                 glyphs,
             } if color.a != 0 => {
                 let font = font.ok_or(ImageError::Font("font required"))?;
+                let mut face_keys = FaceKeyMemo::default();
                 for glyph in glyphs.iter() {
                     let key = (
-                        font.face_key(glyph.face).map_err(ImageError::Font)?,
+                        face_keys.get(font, glyph.face).map_err(ImageError::Font)?,
                         glyph.id,
                         (size * glyph.size_scale * scale).to_bits(),
                     );
@@ -6520,6 +6627,44 @@ mod tests {
     }
 
     #[test]
+    fn srgb_resource_premultiply_matches_the_colour_conversion() {
+        use lumen_common::color::{Color,ColorSpace};
+        let mut pixels=Vec::with_capacity(256*256*4);
+        for alpha in 0..=255u8 {for value in 0..=255u8 {pixels.extend_from_slice(&[value,255-value,value/3,alpha]);}}
+        let image=Rgba8Image{width:256,height:256,pixels};
+        for opaque in [false,true] {
+            let mut fast=image.clone();resource_premultiply(&mut fast,ColorSpace::Srgb,opaque);
+            for (pixel,input) in fast.pixels.chunks_exact(4).zip(image.pixels.chunks_exact(4)) {
+                let color=Color::rgba8([input[0],input[1],input[2],input[3]]).to(ColorSpace::Srgb);
+                let alpha=if opaque{1.0}else{color.alpha};
+                for channel in 0..3 {assert_eq!(pixel[channel],(color.components[channel]*alpha*255.0).round().clamp(0.0,255.0) as u8,"premultiply {input:?} opaque={opaque}");}
+            }
+        }
+        let mut fast=image.clone();resource_demultiply(&mut fast,ColorSpace::Srgb);
+        for (pixel,input) in fast.pixels.chunks_exact(4).zip(image.pixels.chunks_exact(4)) {
+            let alpha=f32::from(input[3])/255.0;
+            let components=if alpha>0.0{core::array::from_fn(|channel|(f32::from(input[channel])/255.0/alpha).clamp(0.0,1.0))}else{[0.0;3]};
+            assert_eq!(pixel,&Color::new(ColorSpace::Srgb,components,alpha,0).to_rgba8(),"demultiply {input:?}");
+        }
+    }
+
+    #[test]
+    fn per_axis_box_blur_approximates_the_exact_gaussian() {
+        let (w,h)=(200usize,160usize);
+        let mut plane=vec![0u8;w*h];
+        for y in 50..110 {for x in 60..140 {plane[y*w+x]=if (x/7+y/9)%2==0 {255} else {180};}}
+        for sigma in [[2.0f32,2.0],[6.0,6.0],[12.0,4.0],[3.0,15.0]] {
+            let exact=image::imageops::blur_advanced(&image::GrayImage::from_raw(w as u32,h as u32,plane.clone()).unwrap(),
+                image::imageops::GaussianBlurParameters::new_anisotropic_sigma(sigma[0],sigma[1])).into_raw();
+            let mut fast=plane.clone();
+            shadow::box_blur_plane_axes(&mut fast,w,h,sigma,0).unwrap();
+            let mut sum=0u64;let mut max=0u8;
+            for (a,b) in fast.iter().zip(&exact) {let d=a.abs_diff(*b);sum+=u64::from(d);max=max.max(d);}
+            assert!(max<=16 && (sum as f64/exact.len() as f64)<1.5,"sigma {sigma:?}: max {max} mean {}",sum as f64/exact.len() as f64);
+        }
+    }
+
+    #[test]
     fn opaque_destination_composite_matches_float_path() {
         for alpha in 1..=254u8 {
             for (channel,dest) in [(0u8,255u8),(77,13),(200,128),(255,1)] {
@@ -7634,6 +7779,19 @@ mod tests {
     }
 
     #[test]
+    fn an_svg_image_blurs_a_filter_region_far_larger_than_its_canvas() {
+        // Figma exports glows as userSpaceOnUse filter regions several times the
+        // canvas with deviations near 100: the visible window must fit the budget.
+        let svg=r##"<svg xmlns="http://www.w3.org/2000/svg" width="626" height="626" viewBox="0 0 626 626"><g clip-path="url(#c)"><rect width="626" height="626" fill="#0B0F0A"/><g filter="url(#f)"><ellipse cx="313" cy="953" rx="370" ry="404" fill="#3D5AFE"/></g></g><defs><filter id="f" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB" x="-758" y="24.5" width="2142" height="1858"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur stdDeviation="87.5"/></filter><clipPath id="c"><rect width="626" height="626"/></clipPath></defs></svg>"##;
+        let image=decode_image_with_limit(svg.as_bytes(),256<<20).unwrap();
+        assert_eq!((image.width,image.height),(626,626));
+        let pixel=|x:usize,y:usize|&image.pixels[(y*626+x)*4..(y*626+x)*4+4];
+        assert!(pixel(313,620)[2]>120,"the glow reaches the bottom edge: {:?}",pixel(313,620));
+        assert!(pixel(313,10)[2]<20,"the top stays the dark background: {:?}",pixel(313,10));
+        assert!(pixel(313,450)[2]>pixel(313,300)[2],"the glow fades upward");
+    }
+
+    #[test]
     fn specification_filter_output_windows_bound_large_root_and_fixed_source() {
         let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
         let root="<style>html,body{margin:0}html{filter:blur(0px)}div{width:2000px;height:2000px;background:lightgreen}i{position:fixed;left:150px;top:100px;width:100px;height:100px;background:green}</style><div></div><i></i>";
@@ -7651,8 +7809,9 @@ mod tests {
         let mut bytes=0;
         let resolved=resolve_layers_region(&list.0,1.0,Some(&font),&mut GlyphCache::default(),&mut bytes,false,Some(viewport)).unwrap();
         assert!(bytes<=MAX_LAYER_BYTES,"retained output uses the existing total layer budget");
-        assert!(resolved.0.iter().any(|command|matches!(command,Command::Image{image,..}if image.height<=32)),
-            "large source resolves through bounded device rows");
+        let bands=resolved.0.iter().filter_map(|command|match command{Command::Image{image,..}=>Some(image.pixels.len()),_=>None}).collect::<Vec<_>>();
+        assert!(bands.len()>1 && bands.iter().all(|bytes|*bytes<=MAX_LAYER_BYTES/16),
+            "large source resolves through bounded device rows: {bands:?}");
         assert_exact_spatial_pixels(&render_with_font(&resolved,800,600,1.0,true,&font).unwrap(),&actual,"resolved row replay");
     }
 
@@ -9250,6 +9409,22 @@ mod tests {
     }
 
     #[test]
+    fn glyph_cache_evicts_the_least_recently_used_glyphs() {
+        let coverage = || GlyphCoverage { x_min: 0, y_min: 0, width: 1, height: 1, alpha: vec![255] };
+        let mut cache = GlyphCache::default();
+        for id in 0..GLYPH_CACHE_ENTRIES as u16 {
+            cache.insert((1, id, 0), coverage());
+        }
+        assert!(cache.lookup(&(1, 0, 0)).is_some());
+        cache.insert((2, 0, 0), coverage());
+        assert!(cache.glyphs.len() < GLYPH_CACHE_ENTRIES && cache.bytes() == cache.glyphs.len());
+        assert!(cache.lookup(&(1, 0, 0)).is_some(), "a glyph used since its insert survives");
+        assert!(cache.lookup(&(2, 0, 0)).is_some());
+        assert!(cache.lookup(&(1, 1, 0)).is_none(), "the oldest unused glyph goes first");
+        assert!(cache.lookup(&(1, GLYPH_CACHE_ENTRIES as u16 - 1, 0)).is_some());
+    }
+
+    #[test]
     fn glyph_cache_reuses_rasters_across_frames_and_separates_fonts() {
         let document = lumen_html::html::parse("<p>Hello</p>", 8).unwrap();
         let font = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
@@ -9264,7 +9439,28 @@ mod tests {
         let other = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
         render_with_font_cached(&list, 80, 30, 1.0, true, &other, &mut cache).unwrap();
         assert_eq!(cache.glyphs.len(), entries * 2);
-    }    #[test]
+    }
+
+    #[test]
+    fn caches_that_share_glyphs_rasterize_each_glyph_once() {
+        let document = lumen_html::html::parse("<p>Hello</p>", 8).unwrap();
+        let font = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
+        let list = lumen_html::layout::display_list(&document, 80, 30, &font).unwrap();
+        let shared = Arc::new(SharedGlyphs::default());
+        let (mut first, mut second) = (GlyphCache::default(), GlyphCache::default());
+        first.share(&shared);
+        second.share(&shared);
+        let drawn = render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut first).unwrap();
+        assert!(first.stats().misses > 0);
+        assert_eq!(render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut second).unwrap(), drawn);
+        assert_eq!(second.stats().misses, 0, "the second cache takes every glyph from the first");
+        assert_eq!(second.glyphs.len(), first.glyphs.len());
+        let mut alone = GlyphCache::default();
+        assert_eq!(render_with_font_cached(&list, 80, 30, 1.0, true, &font, &mut alone).unwrap(), drawn);
+        assert_eq!(alone.stats().misses, first.stats().misses);
+    }
+
+    #[test]
     fn specification_background_size_math_actual_query_font_and_nonlinear_raster() {
         let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
         for (area, width) in [(40,20),(100,50),(200,80)] {

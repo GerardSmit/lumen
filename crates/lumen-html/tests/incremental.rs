@@ -793,6 +793,28 @@ diff!(
 );
 
 diff!(
+    has_with_nested_combinators_and_where_keyed_groups,
+    "<style>body{margin:0}.v:not(:is(:where(.group):has([data-lg]) *)){height:20px}\
+     .h:has(:is(.peer .x)){padding:4px}.s:has(:is(.peer ~ *)){margin-left:7px}\
+     .g:is(:where(.group):not(:has(:is(:where(.peer):not([data-active])~*))) *){border-top:3px solid}</style>\
+     <main id=m><section id=sec><div class=h id=in><i class=x>1</i></div></section>\
+     <div class=group id=grp><p id=p>t</p><b class=v id=v1>v</b><u class=peer id=pe>a</u><u class=g id=g1>b</u></div></main>\
+     <div class=h id=far><i class=x>2</i></div><div class=s id=sib><u id=u1>a</u><u>b</u></div>",
+    [
+        |s| attr(s, "#p", "data-lg", ""),
+        |s| attr(s, "#sec", "class", "peer"),
+        |s| attr(s, "#u1", "class", "peer"),
+        |s| attr(s, "#pe", "data-active", ""),
+        |s| {
+            add(s, "#grp", "i", &[("class", "x"), ("id", "nx")], Some("n"), Some("#v1"));
+        },
+        |s| unattr(s, "#p", "data-lg"),
+        |s| del(s, "#pe"),
+        |s| attr(s, "#sec", "class", ""),
+    ]
+);
+
+diff!(
     hover_free_deep_tree_ancestor_changes,
     "<style>body{margin:0}.l1 .l3{color:red}.l2 > .l3 + .l3{height:30px}.hot .l2{padding:5px}</style>\
      <div class=l1 id=r><div class=l2 id=m><div class=l3 id=a>a</div><div class=l3 id=b>b</div></div></div>",
@@ -1084,6 +1106,84 @@ diff!(
 );
 
 diff!(
+    flex_and_grid_items_replay_beside_changed_siblings,
+    "<style>body{margin:0}.row{display:flex;gap:4px;align-items:flex-start}.col{display:flex;flex-direction:column}\
+     .grid{display:grid;grid-template-columns:repeat(3,1fr)}.item{flex:1;padding:2px;border:1px solid}\
+     .tall{height:40px}.rel{position:relative;top:3px}.fade{opacity:.5}.z{position:relative;z-index:2}</style>\
+     <div class=row><div id=a class=item>a<p>a1</p></div><div id=b class=item>b<p>b1</p></div><div id=c class='item rel'>c<b class=z>z</b></div></div>\
+     <div class=col><div id=d class=item>d</div><div id=e class='item fade'>e<p>e1</p></div><div id=f class=item>f</div></div>\
+     <div class=grid><div id=g>g</div><div id=h class=rel>h<p>h1</p></div><div id=i>i</div><div id=j>j</div></div>",
+    [
+        |s| attr(s, "#a", "class", "item tall"),
+        |s| attr(s, "#e", "class", "item fade tall"),
+        |s| attr(s, "#g", "class", "tall"),
+        |s| attr(s, "#c", "class", "item"),
+        |s| attr(s, "#b", "style", "flex:2"),
+        |s| attr(s, "#h", "class", "z"),
+        |s| unattr(s, "#a", "class"),
+        |s| del(s, "#d"),
+        |s| attr(s, "#i", "style", "grid-column:span 2"),
+    ]
+);
+
+diff!(
+    boxes_replay_inside_transformed_ancestors,
+    "<style>body{margin:0}.spin{transform:rotate(10deg) scale(.8);padding:4px}.move{transform:translate(5px,7px)}\
+     .card{border:1px solid;padding:2px;margin:2px}.inner{transform:scale(1.5)}.stick{position:sticky;top:0}</style>\
+     <div id=s class=spin><div id=a class=card>a<p>a1</p></div><div id=b class=card>b</div>\
+     <div class=move><div id=c class=card>c<div class=inner><p id=d>d</p></div></div><div id=e class=card>e</div></div></div>\
+     <div class=move><div id=f class=card>f<p class=stick>s</p></div><div id=g class=card>g</div></div>",
+    [
+        |s| text(s, "#b", "b b b"),
+        |s| attr(s, "#s", "style", "transform:rotate(20deg)"),
+        |s| text(s, "#c", "c c"),
+        |s| attr(s, "#a", "style", "height:30px"),
+        |s| unattr(s, "#s", "style"),
+        |s| text(s, "#g", "g g g"),
+        |s| attr(s, "#e", "class", "card inner"),
+        |s| del(s, "#b"),
+        |s| attr(s, "#a", "style", "height:12px;transform:skewX(8deg)"),
+        |s| text(s, "#d", "d d d"),
+        |s| attr(s, "#f", "style", "transform:translate(-3px,2px) rotate(3deg)"),
+        |s| text(s, "#g", "g"),
+        |s| attr(s, "#a", "style", "transform:skewX(8deg)"),
+    ]
+);
+
+diff!(
+    z_indexed_boxes_replay_in_their_stacking_order,
+    "<style>body{margin:0}.r{position:relative;margin-top:-6px;height:20px;border:1px solid}.lo{z-index:-1;background:#fc0}\
+     .hi{z-index:3;background:#0cf}.mid{z-index:1;background:#c0f}.row{display:flex}.row>div{z-index:2;margin-left:-4px;background:#0f0;width:30px}</style>\
+     <div id=a class='r hi'>a<div class='r lo'>a1</div></div><div id=b class='r lo'>b</div><div id=c class='r mid'>c<p>c1</p></div>\
+     <div class=row><div id=d>d</div><div id=e style='z-index:-2'>e</div><div id=f>f</div></div><div id=g class=r>g</div>",
+    [
+        |s| text(s, "#b", "b b"),
+        |s| attr(s, "#g", "class", "r hi"),
+        |s| attr(s, "#a", "style", "height:30px"),
+        |s| text(s, "#e", "e e e"),
+        |s| attr(s, "#c", "class", "r lo"),
+        |s| attr(s, "#d", "style", "z-index:5"),
+        |s| unattr(s, "#a", "style"),
+        |s| del(s, "#b"),
+    ]
+);
+
+diff!(
+    relative_and_group_boxes_replay_inside_flex_rows,
+    "<style>body{margin:0}.row{display:flex}.cell{flex:1;position:relative}.cell span{position:absolute;right:0;top:0;z-index:1}\
+     .glass{opacity:.8}.big{height:60px}</style>\
+     <div class=row><div id=r1 class=cell>one<span>x</span></div><div id=r2 class='cell glass'>two<span>y</span></div><div id=r3 class=cell>three</div></div>\
+     <div class=row><div id=s1 class=cell>four</div><div id=s2 class=cell>five<span>z</span></div></div>",
+    [
+        |s| attr(s, "#r1", "class", "cell big"),
+        |s| attr(s, "#s2", "class", "cell glass"),
+        |s| attr(s, "#r3", "class", "cell big"),
+        |s| attr(s, "#r2", "class", "cell"),
+        |s| del(s, "#s1"),
+    ]
+);
+
+diff!(
     stacking_escapes_with_floats,
     "<style>body{margin:0}#hd{position:sticky;top:0;z-index:2;height:30px}#fl{float:left;width:90px;height:70px}\
      p{margin:2px;height:20px}.zc{position:relative;z-index:3;display:block;height:10px}.tall{height:50px}</style>\
@@ -1117,6 +1217,19 @@ fn assert_reuse(mut session: RenderSession, n: usize, target: &str) {
     let laid_out = after.boxes_laid_out - before.boxes_laid_out;
     assert!(laid_out < (n / 3) as u64, "boxes laid out: {laid_out} of {n} paragraphs");
     assert!(after.fragments_replayed > before.fragments_replayed, "no fragment was replayed");
+}
+
+#[test]
+fn leaf_toggle_in_a_flex_column_reuses_its_sibling_items() {
+    let n = 300;
+    let source = format!(
+        "<style>body{{margin:0}}#w{{display:flex;flex-direction:column}}p{{margin:1px;height:14px}}.on{{height:30px;background:#eee}}</style><div id=w>{}</div>",
+        paras(n)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    assert_reuse(session, n, "#p150");
 }
 
 #[test]
@@ -1222,7 +1335,9 @@ fn grid_with_definite_fixed_and_zero_minimum_tracks_measures_no_items() {
     let fixed = measured("400px 100px", "60px");
     let auto_rows = measured("400px 100px", "auto");
     assert!(content_based >= 120, "a content-minimum track measured {content_based}");
-    assert!(auto_rows >= 120, "an auto row measured {auto_rows}");
+    // An auto row over fixed columns needs only the items' block sizes at the
+    // column widths, which are layouts, not intrinsic measurements.
+    assert!(auto_rows < 12, "an auto row measured {auto_rows}");
     assert!(zero_minimum < 12, "minmax(0,1fr) measured {zero_minimum} boxes");
     assert!(fixed < 12, "fixed tracks measured {fixed} boxes");
 }
@@ -1674,5 +1789,248 @@ diff!(
     [
         |s| { animate(s, "#a", &[("transform", "translateX(-10px)")]); animate(s, "#b", &[("transform", "translateX(-10px)")]); },
         |s| { animate(s, "#a", &[("transform", "translateX(-33.25px)")]); animate(s, "#b", &[("transform", "translateX(-33.25px)")]); },
+    ]
+);
+
+/// Every paint-only property with two values to animate between.
+const PAINT_ONLY_SAMPLES: &[(&str, &str, &str)] = &[
+    ("opacity", "0.5", "0.25"),
+    ("transform", "translateX(5px) scale(1.5)", "translateX(9px) scale(0.5)"),
+    ("color", "red", "blue"),
+    ("background-color", "#123456", "#654321"),
+    ("border-color", "red", "blue"),
+    ("border-top-color", "red", "blue"),
+    ("border-right-color", "red", "blue"),
+    ("border-bottom-color", "red", "blue"),
+    ("border-left-color", "red", "blue"),
+    ("outline", "2px solid red", "4px dashed blue"),
+    ("outline-color", "red", "blue"),
+    ("outline-style", "dotted", "double"),
+    ("outline-width", "3px", "6px"),
+    ("outline-offset", "2px", "5px"),
+    ("text-decoration-color", "red", "blue"),
+    ("backdrop-filter", "blur(2px)", "blur(4px)"),
+];
+
+const PAINT_PAGE: &str = "<style>body{margin:0}#clip{overflow:hidden;width:400px;height:300px}\
+     .b{width:120px;height:40px;border:3px solid black;outline:1px solid green;background:#eee;text-decoration:underline}\
+     .b::before{content:'gen';border:2px solid black;outline:1px solid green;background:yellow;text-decoration:underline}\
+     .b span{border:1px solid black;outline:1px solid green;background:#ddd}#k::before{display:block;width:30px}\
+     #u{margin:20px}</style>\
+     <div id=clip><div class=b id=t>text <span id=s>inline</span></div><div class=b id=k>x</div></div>\
+     <div class=b id=u>free</div><p>after</p>";
+
+#[derive(Clone, Copy, Debug)]
+enum PaintTarget {
+    Element(&'static str),
+    Before(&'static str),
+}
+
+/// How a sample reaches the style.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PaintChannel {
+    Animation,
+    StyleAttribute,
+    Class,
+}
+
+fn paint_page(target: PaintTarget, name: &str, first: &str, second: &str) -> String {
+    let rules = match target {
+        PaintTarget::Element(sel) => format!("{sel}.pa{{{name}:{first}}}{sel}.pb{{{name}:{second}}}"),
+        PaintTarget::Before(sel) => format!("{sel}.pa::before{{{name}:{first}}}{sel}.pb::before{{{name}:{second}}}"),
+    };
+    format!("{PAINT_PAGE}<style>{rules}</style>")
+}
+
+fn set_paint(s: &mut RenderSession, channel: PaintChannel, target: PaintTarget, name: &str, value: &str, sample: usize) {
+    let (sel, pseudo) = match target {
+        PaintTarget::Element(sel) => (sel, None),
+        PaintTarget::Before(sel) => (sel, Some(lumen_html::css::PseudoElement::Before)),
+    };
+    let node = q(s, sel);
+    match channel {
+        PaintChannel::Animation => {
+            let declarations = vec![(name.to_string(), value.to_string())];
+            s.set_pseudo_effect_declarations(node, pseudo, lumen_html::css::EffectOrigin::Animation, declarations).unwrap();
+        }
+        PaintChannel::StyleAttribute => s.document_mut().set_attribute(node, "style", &format!("{name}:{value}")).unwrap(),
+        PaintChannel::Class => {
+            let base = if sel == "#s" { "" } else { "b " };
+            let class = format!("{base}{}", ["pa", "pb"][sample]);
+            s.document_mut().set_attribute(node, "class", &class).unwrap();
+        }
+    }
+}
+
+/// Samples every paint-only property on every kind of box twice, through
+/// animations, inline styles and class changes; the second sample must
+/// rewrite the painted frame without a layout pass and match a fresh layout
+/// of the same state.
+#[test]
+fn paint_only_samples_patch_the_frame_without_layout() {
+    let targets = [PaintTarget::Element("#t"), PaintTarget::Element("#s"), PaintTarget::Before("#t"),
+        PaintTarget::Before("#k"), PaintTarget::Element("#u")];
+    let mut failures = Vec::new();
+    for channel in [PaintChannel::Animation, PaintChannel::StyleAttribute, PaintChannel::Class] {
+        for target in targets {
+            if channel == PaintChannel::StyleAttribute && matches!(target, PaintTarget::Before(_)) { continue; }
+            for (name, first, second) in PAINT_ONLY_SAMPLES {
+                let page = paint_page(target, name, first, second);
+                let mut session = RenderSession::new(html::parse(&page, MAX_NODES).unwrap());
+                session.set_verify_incremental(false);
+                render(&mut session);
+                set_paint(&mut session, channel, target, name, first, 0);
+                render(&mut session);
+                let passes = session.invalidation_stats().layout_passes;
+                set_paint(&mut session, channel, target, name, second, 1);
+                let actual = render(&mut session).clone();
+                let mut fresh = RenderSession::new(html::parse(&page, MAX_NODES).unwrap());
+                set_paint(&mut fresh, channel, target, name, second, 1);
+                let expected = render(&mut fresh).clone();
+                if !actual.approx_eq(&expected, 1e-3) {
+                    let index = actual.0.iter().zip(expected.0.iter()).position(|(a, b)| a != b).unwrap_or(actual.0.len().min(expected.0.len()));
+                    failures.push(format!("{channel:?} {target:?} {name}: patched frame differs from a fresh layout at {index}: {:?} vs {:?}",
+                        actual.0.get(index), expected.0.get(index)));
+                } else if session.invalidation_stats().layout_passes != passes {
+                    failures.push(format!("{channel:?} {target:?} {name}: laid out again"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "paint-only samples:\n{}", failures.join("\n"));
+}
+
+/// A pulsing dot: an endless opacity and scale animation on a positioned
+/// `::before` repaints the frame without laying it out.
+#[test]
+fn pulsing_pseudo_element_animation_does_not_lay_out() {
+    let page = "<style>body{margin:0}.dot{position:relative;display:inline-block;width:12px;height:12px}\
+        .dot::before{content:'';position:absolute;left:0;top:0;width:12px;height:12px;border-radius:50%;background:#36c}</style>\
+        <p>text <span class=dot id=d></span> more</p><p>after</p>";
+    let mut session = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    let node = q(&session, "#d");
+    let sample = |session: &mut RenderSession, step: u32| {
+        let t = step as f32 / 10.0;
+        let declarations = vec![("opacity".to_string(), format!("{}", 1.0 - t * 0.9)),
+            ("transform".to_string(), format!("scale({})", 1.0 + t))];
+        session.set_pseudo_effect_declarations(node, Some(lumen_html::css::PseudoElement::Before),
+            lumen_html::css::EffectOrigin::Animation, declarations).unwrap();
+        render(session).clone()
+    };
+    sample(&mut session, 1);
+    let passes = session.invalidation_stats().layout_passes;
+    let mut last = None;
+    for step in 2..10 { last = Some(sample(&mut session, step)); }
+    assert_eq!(session.invalidation_stats().layout_passes, passes, "pulsing samples lay out the page");
+    let mut fresh = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    let node = q(&fresh, "#d");
+    fresh.set_pseudo_effect_declarations(node, Some(lumen_html::css::PseudoElement::Before), lumen_html::css::EffectOrigin::Animation,
+        vec![("opacity".to_string(), format!("{}", 1.0 - 0.9 * 0.9)), ("transform".to_string(), "scale(1.9)".to_string())]).unwrap();
+    assert_same("pulsing", "patched", &last.unwrap(), render(&mut fresh));
+    // The dot overflows its box, so a geometry query lays out again and reads
+    // the overflow of the current sample.
+    let dot = q(&session, "#d");
+    session.with_forced_layout(|session| { render(session); });
+    assert_eq!(session.invalidation_stats().layout_passes, passes + 1, "a geometry query refreshes the overflow areas");
+    let dot_fresh = q(&fresh, "#d");
+    fresh.with_forced_layout(|session| { render(session); });
+    assert_eq!(session.scroll_extent(dot), fresh.scroll_extent(dot_fresh));
+}
+
+/// An opacity animation through 1 keeps its layer, so every sample after the
+/// first rewrites the frame; back below 1 it matches a fresh layout.
+#[test]
+fn opacity_animation_through_one_keeps_its_layer() {
+    let page = "<style>body{margin:0}#f{width:50px;height:20px;background:#36c}</style><div id=f></div><p>after</p>";
+    let mut session = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    animate(&mut session, "#f", &[("opacity", "0.5")]);
+    render(&mut session);
+    let passes = session.invalidation_stats().layout_passes;
+    for value in ["0.8", "1", "1", "0.6", "0.3"] {
+        animate(&mut session, "#f", &[("opacity", value)]);
+        render(&mut session);
+    }
+    assert_eq!(session.invalidation_stats().layout_passes, passes, "opacity samples through 1 lay out the page");
+    let actual = render(&mut session).clone();
+    let mut fresh = RenderSession::new(html::parse(page, MAX_NODES).unwrap());
+    animate(&mut fresh, "#f", &[("opacity", "0.3")]);
+    assert_same("opacity through one", "patched", &actual, render(&mut fresh));
+}
+
+#[test]
+fn tailwind_group_and_peer_has_variants_restyle_partially() {
+    let source = "<style>body{margin:0}.v:not(:is(:where(.group):has([data-lg]) *)){height:20px}\
+        .g:is(:where(.group):not(:has(:is(:where(.peer):not([data-active])~*))) *){border-top:3px solid}</style>\
+        <div class=group id=grp><p id=p>t</p><b class=v>v</b><u class=peer id=pe>a</u><u class=g>b</u></div>\
+        <div id=list><p id=q>q</p></div>";
+    let mut session = RenderSession::new(html::parse(source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    let before = counts(&session);
+    attr(&mut session, "#p", "data-lg", "");
+    render(&mut session);
+    attr(&mut session, "#pe", "data-active", "");
+    render(&mut session);
+    add(&mut session, "#list", "p", &[("id", "fresh")], Some("fresh"), None);
+    render(&mut session);
+    assert_eq!(counts(&session).full, before.full, "a keyed or nested-combinator :has() fell back to a full restyle");
+}
+
+#[test]
+fn grid_row_measurement_replays_unchanged_item_contents() {
+    // An auto row needs each item's block size at its column width. After an
+    // edit inside an item, its unchanged contents replay in that measurement
+    // instead of being laid out again.
+    let source = format!(
+        "<style>body{{margin:0}}#g{{display:grid;grid-template-columns:200px 1fr}}p{{margin:2px}}</style>\
+         <div id=g><div id=side>side</div><div id=main>{}</div></div>",
+        paras(300)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    text(&mut session, "#p150", "warm");
+    render(&mut session);
+    let before = session.invalidation_stats().boxes_measured;
+    text(&mut session, "#p150", "edited paragraph text");
+    render(&mut session);
+    let measured = session.invalidation_stats().boxes_measured - before;
+    assert!(measured < 100, "an edit inside the item measured {measured} boxes");
+}
+
+#[test]
+fn grid_item_contents_replay_after_the_item_height_changes() {
+    // The row, and so the stretched item's definite height, grows; contents
+    // that resolve nothing against that height still replay.
+    let source = format!(
+        "<style>body{{margin:0}}#g{{display:grid;grid-template-columns:200px 1fr}}p{{margin:2px}}</style>\
+         <div id=g><div id=side>side</div><div id=main>{}</div></div>",
+        paras(300)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    attr(&mut session, "#p150", "style", "height:30px");
+    render(&mut session);
+    let before = counts(&session);
+    attr(&mut session, "#p150", "style", "height:60px");
+    render(&mut session);
+    let laid_out = counts(&session).boxes - before.boxes;
+    assert!(laid_out < 100, "a taller paragraph laid out {laid_out} boxes");
+}
+
+diff!(
+    grid_item_percentage_contents_follow_the_item_height,
+    "<style>body{margin:0}#g{display:grid;grid-template-columns:100px 1fr;grid-template-rows:auto}\
+     #pct{height:50%;background:red}p{margin:2px}</style>\
+     <div id=g><div id=side>side</div><div id=main><div id=pct>half</div><p id=a>a</p><p id=b>b</p></div></div>",
+    [
+        |s| attr(s, "#side", "style", "height:300px"),
+        |s| attr(s, "#a", "style", "height:80px"),
+        |s| attr(s, "#side", "style", "height:40px"),
     ]
 );

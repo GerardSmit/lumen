@@ -399,6 +399,10 @@ pub enum LayoutError {
     /// The customizable select requires its genuine picker/shadow tree.
     UnsupportedWidgetAppearance,
     CommandLimit,
+    /// A column flex container's guess that its items fill its minimum
+    /// height was wrong (`Layout::column_flex_in_place`); the layout runs
+    /// again without guessing and never returns this.
+    FlexSpeculation,
     /// No longer returned by layout: an image that is still loading lays out
     /// with placeholder geometry and paints nothing (see
     /// `RenderSession::images_pending`).
@@ -628,6 +632,16 @@ pub fn unsupported_svg_features(
 fn svg_element_with_id(document: &Document, id: &str) -> Result<Option<NodeId>, LayoutError> {
     if id.is_empty() || id.len() > 1024 {
         return Ok(None);
+    }
+    // The document's id index names the first element with this id in tree order.
+    // If it is an SVG element it is also the first SVG one; if no element has the
+    // id, none does. Otherwise a non-SVG element shadows it and the walk decides.
+    match document.indexed_element_by_id(id) {
+        Some(None) => return Ok(None),
+        Some(Some(node)) if matches!(document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Svg, .. })) => {
+            return Ok(Some(node));
+        }
+        _ => {}
     }
     let mut pending = Vec::new();
     let mut child = document
@@ -1366,7 +1380,9 @@ fn parse_svg_stop_offset(input: &str) -> Option<f32> {
     value.is_finite().then_some(value)
 }
 
-const MAX_DISPLAY_COMMANDS: usize = 16 * 1024;
+// Large front pages (news sites) emit tens of thousands of commands; the
+// display list stays bounded by MAX_DISPLAY_LIST_BYTES.
+const MAX_DISPLAY_COMMANDS: usize = 128 * 1024;
 const MAX_TEXT_PATH_GLYPHS: usize = 4096;
 /// Screens of content emitted beyond the viewport, on each side, across the
 /// document's block axis when its root scroll moves the retained frame. The
@@ -1374,11 +1390,14 @@ const MAX_TEXT_PATH_GLYPHS: usize = 4096;
 pub(crate) const ROOT_SCROLL_WINDOW_SCREENS: f32 = 4.0;
 // Chromium's LayoutUnit granularity: absolute f32 coordinates must not push an exactly fitting word onto the next line.
 const INLINE_FIT_TOLERANCE: f64 = 1.0 / 64.0;
-const MAX_DISPLAY_LIST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DISPLAY_LIST_BYTES: usize = 64 * 1024 * 1024;
+/// The whole document's rendered text (innerText, selection, find). One
+/// paragraph stays within the bidi limit; a long page holds far more.
+const MAX_RENDERED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// Largest charge for one retained fragment.
 const MAX_RETAINED_FRAGMENT_BYTES: usize = 1 * 1024 * 1024;
 const DEFAULT_RETAINED_ENTRIES: usize = 16384;
-const DEFAULT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 /// Styles shared between neighbouring retained fragments.
 const RETAINED_STYLE_POOL: usize = 32;
 
@@ -1401,12 +1420,17 @@ const MAX_COLLAPSED_BORDER_CANDIDATES: usize = 64 * 1024;
 pub struct RetainedLayoutCacheStats {
     pub hits: usize,
     pub misses: usize,
+    /// Block size measurements served from a fragment, then those that were not,
+    /// by what differed: no fragment, its constraints, placement-free inputs,
+    /// its style, its parent style. Counted over the cache's lifetime.
+    pub measured: [u64; 6],
     pub entries: usize,
     pub bytes: usize,
 }
 
 /// Inputs of a box's layout other than its styles and its position. A
-/// fragment is replayed at another position when `anchored` is `None`.
+/// fragment is replayed at another position when `anchored` is `None`, or
+/// when it is translatable (see `RetainedFragmentKey::serves_translated`).
 #[derive(Clone, PartialEq)]
 struct RetainedFragmentKey {
     node: NodeId,
@@ -1432,7 +1456,6 @@ struct RetainedKeyRare {
     fixed_containing_block: Option<Rect>,
     fixed_containing_block_node: Option<NodeId>,
     sticky_bounds: Option<Rect>,
-    scroll_hazards: usize,
     transform_depth: usize,
     svg_geometry_capture: bool,
     source_capture: bool,
@@ -1450,6 +1473,25 @@ struct RetainedKeyRare {
 impl RetainedFragmentKey {
     fn decorations(&self) -> &[TextDecoration] {
         self.rare.as_deref().map_or(&[], |rare| &rare.decorations)
+    }
+
+    /// Whether a translatable fragment laid out under `self` serves `other`.
+    /// Such a fragment holds no absolutely positioned or fixed descendant,
+    /// which are the only boxes that resolve against the containing block's
+    /// position, so the box position and containing block origin may differ;
+    /// the containing block size is still compared, as intrinsic sizes do.
+    fn serves_translated(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.available == other.available
+            && self.floats_above == other.floats_above
+            && self.depth == other.depth
+            && self.parent_height == other.parent_height
+            && self.containing_block.map(sized_only) == other.containing_block.map(sized_only)
+            && self.containing_block_node == other.containing_block_node
+            && self.cull == other.cull
+            && self.viewport == other.viewport
+            && self.container_units == other.container_units
+            && self.rare == other.rare
     }
 }
 
@@ -1578,6 +1620,7 @@ struct RetainedFragment {
     viewport_fixed_nodes: SharedSlice<NodeId>,
     scroll_regions: SharedSlice<ScrollRegion>,
     control_text_runs: SharedSlice<ControlTextRun>,
+    paint_sources: SharedSlice<PaintSource>,
     overflow_lines: Option<Arc<[OverflowLinePaint]>>,
     paint_phases: Option<Arc<RetainedPaintPhases>>,
     rendered_text_collected: bool,
@@ -1589,6 +1632,12 @@ struct RetainedFragment {
     /// Layout of this subtree consulted the text shaper, so its commands and
     /// geometry depend on loaded fonts.
     has_text: bool,
+    /// The font families (`font_family_bit`s) the box's text was shaped with,
+    /// apart from text inside retained fragments of its own.
+    own_families: u64,
+    /// A box inside resolved a size against a block size, which the parent's
+    /// definite height (`key.parent_height`) can supply.
+    reads_block_basis: bool,
     /// Loading images this subtree was laid out around (placeholder geometry),
     /// and the resolver generation they were last known to be loading at. The
     /// fragment replays while they are all still loading.
@@ -1608,6 +1657,11 @@ struct CountingShaper<'a> {
     inner: &'a dyn TextShaper,
     uses: core::cell::Cell<u64>,
     memo: RefCell<ShapeMemo>,
+    /// The families of the fonts shaped with (`TextShaper::family_record`).
+    families: core::cell::Cell<u64>,
+    /// The family list last noted with its `FontSpec::family_bits`: shaping
+    /// asks for the same few lists over and over. Holding it keeps its address.
+    last_families: RefCell<Option<(Arc<[crate::paint::FontFamily]>, u64)>>,
 }
 
 const MAX_SHAPE_MEMO_ENTRIES: usize = 8192;
@@ -1707,8 +1761,17 @@ struct ShapeQuery<'q> {
 impl ShapeQuery<'_> {
     fn hash(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        // A word at a time: runs are hashed on every shaping question.
         let mut mix = |bytes: &[u8]| {
-            for &byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3); }
+            let mut word = |value: u64| hash = (hash.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+            let mut chunks = bytes.chunks_exact(8);
+            for chunk in &mut chunks {
+                word(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+            }
+            let rest = chunks.remainder();
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            word(u64::from_le_bytes(tail) ^ (bytes.len() as u64) << 56);
         };
         mix(&[self.kind as u8, u8::from(self.rtl)]);
         mix(&self.size.to_bits().to_le_bytes());
@@ -1717,6 +1780,12 @@ impl ShapeQuery<'_> {
         mix(&self.font.weight.to_le_bytes());
         mix(&self.font.weight_fraction.to_le_bytes());
         mix(&self.font.stretch.to_bits().to_le_bytes());
+        // The family list's address, not its names: a rule's list is shared by
+        // every style it reaches, so different families get different buckets
+        // and an equal list meets `Arc`'s pointer test in `matches` instead of
+        // comparing names. An equal list in another allocation only misses.
+        let families = self.font.families.as_ref().map_or(0, |families| Arc::as_ptr(families).cast::<u8>() as usize);
+        mix(&(families as u64).to_le_bytes());
         mix(self.language.map_or(&[0xff][..], str::as_bytes));
         mix(self.text.as_bytes());
         hash
@@ -1735,8 +1804,23 @@ impl CountingShaper<'_> {
         self.uses.set(self.uses.get().wrapping_add(1));
     }
 
+    fn note(&self, font: &FontSpec) {
+        let Some(families) = font.families.as_ref() else { return };
+        let mut last = self.last_families.borrow_mut();
+        let bits = match last.as_ref() {
+            Some((known, bits)) if Arc::ptr_eq(known, families) => *bits,
+            _ => {
+                let bits = font.family_bits();
+                *last = Some((Arc::clone(families), bits));
+                bits
+            }
+        };
+        self.families.set(self.families.get() | bits);
+    }
+
     fn memoized<T: ShapeMemoResult>(&self, query: ShapeQuery<'_>, compute: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
         self.bump();
+        self.note(query.font);
         if query.text.len() > MAX_SHAPE_MEMO_TEXT { return compute(); }
         let hash = query.hash();
         let hit = self.memo.borrow().entries.get(&hash)
@@ -1791,6 +1875,9 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
     fn generation(&self) -> u64 {
         self.inner.generation()
     }
+    fn family_record(&self) -> Option<&core::cell::Cell<u64>> {
+        Some(&self.families)
+    }
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()> {
         self.bump();
         self.inner.shape(text, size)
@@ -1838,22 +1925,27 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
     }
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
+        self.note(font);
         self.inner.underline_metrics_styled(size, font)
     }
     fn strike_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
+        self.note(font);
         self.inner.strike_metrics_styled(size, font)
     }
     fn font_unit_metrics_styled(&self, size: f32, font: &FontSpec, vertical: bool, upright_zero: bool) -> crate::paint::FontUnitMetrics {
         self.bump();
+        self.note(font);
         self.inner.font_unit_metrics_styled(size, font, vertical, upright_zero)
     }
     fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> FontRelativeMetrics {
         self.bump();
+        self.note(font);
         self.inner.font_relative_metrics_styled(size, font)
     }
     fn primary_character_widths_styled(&self, size: f32, font: &FontSpec) -> Option<crate::paint::PrimaryCharacterWidths> {
         self.bump();
+        self.note(font);
         self.inner.primary_character_widths_styled(size, font)
     }
     fn ascent(&self, size: f32) -> f32 {
@@ -1880,9 +1972,25 @@ fn retained_node_key(node: NodeId) -> RetainedNodeKey {
     (node.document, node.index, node.generation)
 }
 
+/// A retained fragment's slot: its node and the inline size it was laid
+/// out in. A box that a layout sizes at two widths each frame (a grid item
+/// measured at one and placed at another, say) keeps both fragments, up to
+/// `RETAINED_WAYS` of them.
+type RetainedSlotKey = (RetainedNodeKey, u32);
+
+const RETAINED_WAYS: usize = 2;
+
+fn retained_slot_key(key: &RetainedFragmentKey) -> RetainedSlotKey {
+    (retained_node_key(key.node), key.available.to_bits())
+}
+
+fn retained_node_slots(node: RetainedNodeKey) -> core::ops::RangeInclusive<RetainedSlotKey> {
+    (node, 0)..=(node, u32::MAX)
+}
+
 /// Bytes charged per entry for its slot-index and recency-index nodes.
 const RETAINED_INDEX_ENTRY_BYTES: usize =
-    2 * (core::mem::size_of::<(RetainedNodeKey, usize)>() + core::mem::size_of::<usize>() * 4);
+    2 * (core::mem::size_of::<(RetainedSlotKey, usize)>() + core::mem::size_of::<usize>() * 4);
 
 /// Retained intrinsic sizes each hold a full `Style`; bound them across frames.
 const MAX_RETAINED_INTRINSICS: usize = 8192;
@@ -1910,16 +2018,61 @@ pub(crate) struct IntrinsicSizes {
     /// Measurements made and cache hits served since `begin_frame`.
     measured: core::cell::Cell<usize>,
     reused: core::cell::Cell<usize>,
+    /// Boxes measurement layouts laid out since `begin_frame`.
+    boxes_measured: core::cell::Cell<usize>,
+    /// Boxes laid out or replayed whose size resolves against a block size
+    /// (`Style::reads_block_basis`), counted like `Layout::text_uses` so a
+    /// retained fragment knows whether its parent's definite height mattered.
+    block_basis_reads: core::cell::Cell<u64>,
     /// Flow children built by a flex or grid container's first intrinsic
     /// pass, kept for the other mode's pass of the same frame.
     children: RefCell<Vec<IntrinsicChildren>>,
-    /// Block sizes of stretched column flex items laid out this frame, so
-    /// nested column flex containers measure each item once per width.
-    stretched: RefCell<Vec<StretchedFlexHeight>>,
+    /// Block sizes of stretched column flex items and grid items laid out at
+    /// a width, so nested flex and grid containers measure each item once per
+    /// width. They live as long as the item's intrinsic slot: whatever drops
+    /// that (a change inside the item, a resize of an axis it read) drops them.
+    stretched: RefCell<StretchedFlexMemo>,
     /// Source-ancestry computed styles of list items, which the marker
     /// origin resolves in both intrinsic sizing and box layout.
     tree_styles: RefCell<BTreeMap<u128, TreeStyleEntry>>,
+    /// Table cell content measurements by cell node index, dropped with the
+    /// node's intrinsic sizes: every table that encloses a cell measures it
+    /// again, in every frame.
+    cells: RefCell<BTreeMap<usize, Vec<CellMeasure>>>,
 }
+
+/// A measurement of a table cell's content box (`measure_table_cell_size`),
+/// valid for an equal cell, styles, table axes, inline size and context, or
+/// of its max-content (mode 1) or min-content (mode 2) size
+/// (`intrinsic_table_cell_size`), valid for an equal intrinsic context too.
+struct CellMeasure {
+    node: u128,
+    origin: Arc<Style>,
+    used: Arc<Style>,
+    axes: (GridAxesKey, [usize; 4]),
+    inline: u32,
+    depth: usize,
+    context: CellMeasureContext,
+    mode: u8,
+    intrinsic: Option<IntrinsicContext>,
+    provenance: IntrinsicProvenance,
+    result: ((f32, f32), Option<FlowBaselines>),
+}
+
+type GridAxesKey = (bool, bool, bool);
+
+/// The measurement layout's inputs that come from the measuring layout.
+#[derive(Clone, Copy, PartialEq)]
+struct CellMeasureContext {
+    percentage_basis: Option<(f32, Option<f32>)>,
+    multicol_depth: usize,
+    export_block_table_baselines: bool,
+    container_units: ContainerUnitContextKey,
+}
+
+/// Cell measurements kept across frames, and per cell.
+const MAX_CELL_MEASURES: usize = 8192;
+const CELL_MEASURE_WAYS: usize = 4;
 
 /// The newest measurement of a slot and earlier ones with other styles,
 /// newest first: a box is measured with its own style and with used variants
@@ -1971,7 +2124,6 @@ struct IntrinsicChildren {
 const MAX_INTRINSIC_CHILDREN_MEMO: usize = 64;
 
 struct StretchedFlexHeight {
-    frame: u32,
     id: NodeId,
     width: f32,
     inline_size: f32,
@@ -1980,21 +2132,82 @@ struct StretchedFlexHeight {
     container: Style,
     context: IntrinsicContext,
     axes: u8,
+    /// Images still loading when the item was measured, with the resolver
+    /// generation then; the height holds while they stay pending.
+    pending: Option<(Arc<[(PendingLookup, bool)]>, u64)>,
     height: f32,
+    /// Whether the measurement resolved a size against a block size
+    /// (`Style::reads_block_basis`); one that did not holds whatever the
+    /// parent's definite height.
+    reads_block_basis: bool,
 }
 
-const MAX_STRETCHED_FLEX_MEMO: usize = 256;
+/// Nested column flex containers measure each item by laying it out, and
+/// laying out an item measures its own items again: without the memo that
+/// work doubles at every level, and a page with a few hundred such items
+/// needs thousands of entries to keep them.
+const MAX_STRETCHED_FLEX_MEMO: usize = 8192;
+
+/// The measured heights of column flex items by node, oldest entry evicted
+/// first.
+#[derive(Default)]
+struct StretchedFlexMemo {
+    nodes: BTreeMap<usize, Vec<StretchedFlexHeight>>,
+    len: usize,
+    /// Node of each entry in insertion order; a dropped entry may leave its
+    /// node here until it is popped.
+    order: alloc::collections::VecDeque<usize>,
+}
+
+impl StretchedFlexMemo {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn entries(&self, node: NodeId) -> &[StretchedFlexHeight] {
+        self.nodes.get(&node.index()).map_or(&[], Vec::as_slice)
+    }
+    fn push(&mut self, entry: StretchedFlexHeight) {
+        while self.len >= MAX_STRETCHED_FLEX_MEMO {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(entries) = self.nodes.get_mut(&oldest) {
+                if !entries.is_empty() { entries.remove(0); self.len -= 1; }
+                if entries.is_empty() { self.nodes.remove(&oldest); }
+            }
+        }
+        if self.order.len() >= 2 * MAX_STRETCHED_FLEX_MEMO {
+            self.order = self.nodes.iter().flat_map(|(&node, entries)| core::iter::repeat_n(node, entries.len())).collect();
+        }
+        let node = entry.id.index();
+        self.order.push_back(node);
+        self.nodes.entry(node).or_default().push(entry);
+        self.len += 1;
+    }
+    fn remove_node(&mut self, node: usize) {
+        if let Some(entries) = self.nodes.remove(&node) { self.len -= entries.len(); }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&StretchedFlexHeight) -> bool) {
+        let mut len = 0;
+        self.nodes.retain(|_, entries| { entries.retain(&mut keep); len += entries.len(); !entries.is_empty() });
+        self.len = len;
+    }
+}
 
 impl IntrinsicSizes {
     fn clear(&self) {
         self.children.borrow_mut().clear();
         self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
+        *self.cells.borrow_mut() = BTreeMap::new();
         *self.slots.borrow_mut() = BTreeMap::new();
         self.languages.borrow_mut().clear();
     }
     fn drop_slot(&self, slot: usize) {
         self.slots.borrow_mut().remove(&slot);
+        self.drop_cell(slot / 2);
+        self.stretched.borrow_mut().remove_node(slot / 2);
+    }
+    fn drop_cell(&self, index: usize) {
+        self.cells.borrow_mut().remove(&index);
     }
     /// The margin escapes measured with the primary size of `slot`.
     fn margins(&self, slot: usize) -> Option<BlockMargins> {
@@ -2017,11 +2230,13 @@ impl IntrinsicSizes {
     fn begin_frame(&self) {
         self.measured.set(0);
         self.reused.set(0);
+        self.boxes_measured.set(0);
         self.children.borrow_mut().clear();
-        self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
+        let mut cells = self.cells.borrow_mut();
+        if cells.values().map(Vec::len).sum::<usize>() > MAX_CELL_MEASURES { *cells = BTreeMap::new(); }
     }
     /// Keep at most `limit` retained sizes, dropping the oldest frames first.
     fn retain_newest(&self, limit: usize) {
@@ -2052,6 +2267,11 @@ impl IntrinsicSizes {
     /// Drop the entries that read a viewport axis which changed.
     fn retain_for_resize(&self, width: bool, height: bool) {
         let changed = u8::from(width) | (u8::from(height) << 1);
+        self.stretched.borrow_mut().retain(|entry| entry.axes & changed == 0);
+        self.cells.borrow_mut().retain(|_, entries| {
+            entries.retain(|entry| entry.provenance.axes & changed == 0);
+            !entries.is_empty()
+        });
         let mut slots = self.slots.borrow_mut();
         for slot in slots.values_mut() {
             if slot.primary.as_ref().is_some_and(|entry| entry.provenance.axes & changed != 0 || entry.provenance.context.is_none()) {
@@ -2083,6 +2303,13 @@ std::thread_local! {
     static INTRINSIC_CHILDREN_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static FLEX_SHORTCUTS_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static ANONYMOUS_TEXT_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CELL_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Table cell content measurements laid out (not served from the memo) by this thread.
+#[cfg(test)]
+pub(crate) fn cell_measurements() -> usize {
+    CELL_MEASUREMENTS.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2184,9 +2411,31 @@ impl PartialEq for ComputedParent {
 
 impl IntrinsicContext {
     fn same_for_slot(&self, other: &Self, slot: usize) -> bool {
+        self == other && self.same_computed_parent_for_slot(other, slot)
+    }
+
+    /// `same_for_slot` for a measurement made in a fresh measurement layout
+    /// (`Layout::measurement_layout`), which starts without the caller's
+    /// containing blocks and sticky bounds, so they cannot change its result.
+    fn same_for_fresh_measurement(&self, other: &Self, slot: usize, reads_block_basis: bool) -> bool {
+        let positioned_free = |context: &Self| Self {
+            parent_height: if reads_block_basis { context.parent_height } else { None },
+            containing_block: None,
+            containing_block_node: None,
+            fixed_containing_block: None,
+            fixed_containing_block_node: None,
+            sticky_bounds: None,
+            computed_parent: ComputedParent(None),
+            ..context.clone()
+        };
+        positioned_free(self) == positioned_free(other) && self.computed_parent == other.computed_parent
+            && self.same_computed_parent_for_slot(other, slot)
+    }
+
+    fn same_computed_parent_for_slot(&self, other: &Self, slot: usize) -> bool {
         let own = |context: &Self| context.computed_parent.0.as_ref()
             .filter(|(node, _)| node.index() == slot / 2).map(|(_, style)| style.clone());
-        self == other && own(self) == own(other)
+        own(self) == own(other)
     }
 }
 
@@ -2215,15 +2464,18 @@ struct GeneratedScan {
 pub(crate) struct RetainedLayoutCache {
     intrinsics: Rc<IntrinsicSizes>,
     entries: Vec<Rc<RetainedFragment>>,
-    index: BTreeMap<RetainedNodeKey, usize>,
-    lru: BTreeMap<u64, RetainedNodeKey>,
+    index: BTreeMap<RetainedSlotKey, usize>,
+    lru: BTreeMap<u64, RetainedSlotKey>,
     bytes: usize,
     budget: RetainedLayoutBudget,
     /// Fragments with at most this many commands are not retained.
     min_commands: usize,
     clock: u64,
+    /// `clock` when the current frame began.
+    frame_clock: u64,
     hits: usize,
     misses: usize,
+    measured: core::cell::Cell<[u64; 6]>,
     /// Misses of the frame by what differed: no fragment, its constraints,
     /// its style, its parent style, its position.
     miss_reasons: [usize; 5],
@@ -2246,6 +2498,14 @@ pub(crate) struct RetainedLayoutCache {
     /// the new one and is otherwise equal.
     custom_rebases: Vec<css::CustomRebase>,
     last_successful: anchor_layout::LastSuccessful,
+    /// Font families (`font_family_bit`s) of text no retained fragment owns:
+    /// laid out outside every retained box, or owned by a fragment evicted
+    /// while boxes that replay it stay. A load of one of them drops all text.
+    orphan_families: u64,
+    /// Column flex containers whose items did not fill their minimum height
+    /// (`Layout::column_flex_in_place`): they are not guessed for again.
+    /// Kept by `clear`, which drops only what layouts produced.
+    flex_speculation_failed: BTreeSet<RetainedNodeKey>,
 }
 
 fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
@@ -2288,6 +2548,17 @@ impl RetainedLayoutCache {
             if !grew { break; }
         }
         false
+    }
+
+    fn flex_speculation_failed(&self, container: NodeId) -> bool {
+        self.flex_speculation_failed.contains(&retained_node_key(container))
+    }
+
+    fn note_flex_speculation_failed(&mut self, container: NodeId) {
+        const LIMIT: usize = 4096;
+        if self.flex_speculation_failed.len() < LIMIT {
+            self.flex_speculation_failed.insert(retained_node_key(container));
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -2364,7 +2635,8 @@ impl RetainedLayoutCache {
                 return;
             }
         }
-        let mut victims: Vec<usize> = fragments.iter().filter_map(|key| self.index.get(key).copied()).collect();
+        let mut victims: Vec<usize> = fragments.iter()
+            .flat_map(|&key| self.index.range(retained_node_slots(key)).map(|(_, &slot)| slot)).collect();
         let intrinsics = Rc::clone(&self.intrinsics);
         let drop_slots = |index: usize| {
             for slot in [index * 2, index * 2 + 1] {
@@ -2372,6 +2644,9 @@ impl RetainedLayoutCache {
             }
         };
         for &(_, index, _) in &sizes { drop_slots(index as usize); }
+        // A cell's measurement includes its baselines, which a size boundary
+        // inside it does not keep, so it goes with the cell's fragment.
+        for &(_, index, _) in &fragments { intrinsics.drop_cell(index as usize); }
         let mut pending: Vec<NodeId> = subtrees.to_vec();
         let mut visited = 0usize;
         while let Some(node) = pending.pop() {
@@ -2380,7 +2655,7 @@ impl RetainedLayoutCache {
                 self.clear();
                 return;
             }
-            if let Some(&slot) = self.index.get(&retained_node_key(node)) { victims.push(slot); }
+            victims.extend(self.index.range(retained_node_slots(retained_node_key(node))).map(|(_, &slot)| slot));
             drop_slots(node.index());
             let mut child = document.first_child(node).ok().flatten();
             while let Some(id) = child {
@@ -2438,6 +2713,11 @@ impl RetainedLayoutCache {
         self.laid_out
     }
 
+    /// Boxes laid out by measurement layouts this frame.
+    pub(crate) fn boxes_measured(&self) -> usize {
+        self.intrinsics.boxes_measured.get()
+    }
+
     /// Intrinsic sizes measured and served from the retained sizes this frame.
     pub(crate) fn intrinsics_measured(&self) -> (usize, usize) {
         (self.intrinsics.measured.get(), self.intrinsics.reused.get())
@@ -2458,6 +2738,7 @@ impl RetainedLayoutCache {
 
     fn clear_fragments(&mut self) {
         if !self.entries.is_empty() { self.clears += 1; }
+        self.orphan_families = 0;
         self.custom_rebases.clear();
         self.entries = Vec::new();
         self.index.clear();
@@ -2480,6 +2761,7 @@ impl RetainedLayoutCache {
         self.miss_reasons = [0; 5];
         self.laid_out = 0;
         self.clock = self.clock.saturating_add(1);
+        self.frame_clock = self.clock;
         self.intrinsics.begin_frame();
     }
 
@@ -2487,6 +2769,7 @@ impl RetainedLayoutCache {
         RetainedLayoutCacheStats {
             hits: self.hits,
             misses: self.misses,
+            measured: self.measured.get(),
             entries: self.entries.len(),
             bytes: self.bytes,
         }
@@ -2497,6 +2780,7 @@ impl RetainedLayoutCache {
     /// their descendants' commands.
     pub(crate) fn invalidate_fonts(&mut self) {
         self.generated_current = false;
+        self.orphan_families = 0;
         self.intrinsics.clear();
         if !self.entries.iter().any(|entry| entry.has_text) {
             return;
@@ -2545,24 +2829,86 @@ impl RetainedLayoutCache {
         self.generated_current = false;
         if !self.drop_intrinsics_around(document, targets, false) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
-        self.entries.retain(|entry| {
-            !targets
-                .iter()
-                .any(|target| document_is_ancestor(document, entry.key.node, *target))
-        });
+        // The fragments of the targets and of their ancestors go.
+        match target_chains(document, targets) {
+            Some(chains) => self.entries.retain(|entry| !chains.contains(&retained_node_key(entry.key.node))),
+            None => self.entries.clear(),
+        }
         self.rebuild_indexes();
+    }
+
+    /// Drops what text shaped with a font of `families` (`font_family_bit`s)
+    /// went into: the fragments owning such text and those replaying them
+    /// (their ancestors), and the intrinsic sizes inside and around the
+    /// owners. Fragments inside an owner own none of that text and validate
+    /// themselves. Whether anything was dropped; None when some such text
+    /// has no owner, and `invalidate_fonts` must drop all text instead.
+    pub(crate) fn invalidate_font_families(&mut self, document: &Document, families: u64) -> Option<bool> {
+        if families == 0 { return Some(false); }
+        if self.orphan_families & families != 0 { return None; }
+        let owners: BTreeSet<RetainedNodeKey> = self.entries.iter()
+            .filter(|entry| entry.own_families & families != 0)
+            .map(|entry| retained_node_key(entry.key.node)).collect();
+        if owners.is_empty() { return Some(false); }
+        let mut doomed: BTreeSet<RetainedNodeKey> = owners.clone();
+        // Owners inside no other owner; intrinsic sizes go around each.
+        let mut roots: Vec<NodeId> = Vec::new();
+        for entry in &self.entries {
+            let key = retained_node_key(entry.key.node);
+            if !owners.contains(&key) || roots.contains(&entry.key.node) { continue; }
+            let mut nested = false;
+            let mut current = document.composed_parent(entry.key.node).ok().flatten();
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                let ancestor = retained_node_key(id);
+                nested |= owners.contains(&ancestor);
+                doomed.insert(ancestor);
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() { return None; }
+            if !nested { roots.push(entry.key.node); }
+        }
+        self.generated_current = false;
+        if !self.drop_intrinsics_around(document, &roots, true) { self.intrinsics.clear(); }
+        self.entries.retain(|entry| !doomed.contains(&retained_node_key(entry.key.node)));
+        self.rebuild_indexes();
+        Some(true)
     }
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.generated_current = false;
         if !self.drop_intrinsics_around(document, targets, true) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
+        // A fragment goes when its box is a target, contains one or lies
+        // inside one. The targets' ancestor chains are collected once, and the
+        // walk up from each fragment stops at an ancestor already decided.
+        let Some(chains) = target_chains(document, targets) else {
+            self.entries.clear();
+            self.rebuild_indexes();
+            return;
+        };
+        let roots: BTreeSet<RetainedNodeKey> = targets.iter().map(|target| retained_node_key(*target)).collect();
+        let mut below: BTreeMap<RetainedNodeKey, bool> = BTreeMap::new();
+        let mut path = Vec::new();
         self.entries.retain(|entry| {
-            document.kind(entry.key.node).is_ok()
-                && !targets.iter().any(|target| {
-                    document_is_ancestor(document, entry.key.node, *target)
-                        || document_is_ancestor(document, *target, entry.key.node)
-                })
+            let node = entry.key.node;
+            if document.kind(node).is_err() || chains.contains(&retained_node_key(node)) { return false; }
+            path.clear();
+            let mut current = Some(node);
+            let inside = loop {
+                let Some(id) = current else { break false };
+                let key = retained_node_key(id);
+                if roots.contains(&key) { break true; }
+                if let Some(&known) = below.get(&key) { break known; }
+                if path.len() > 512 { break true; }
+                path.push(key);
+                match document.composed_parent(id) {
+                    Ok(parent) => current = parent,
+                    Err(_) => break true,
+                }
+            };
+            for key in path.drain(..) { below.insert(key, inside); }
+            !inside
         });
         self.rebuild_indexes();
     }
@@ -2578,11 +2924,17 @@ impl RetainedLayoutCache {
     ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
         self.clock = self.clock.saturating_add(1);
         let mut reason = 0;
-        if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
+        if let Some(&slot) = self.index.get(&retained_slot_key(key))
+            .or_else(|| self.index.range(retained_node_slots(retained_node_key(key.node))).next().map(|(_, slot)| slot)) {
             let entry = &self.entries[slot];
-            reason = if entry.key != *key { 1 }
+            // A fragment that resolved no size against a block size does not
+            // depend on its parent's definite height (`reads_block_basis`).
+            let unread = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: None, ..key.clone() };
+            let key = &if entry.reads_block_basis { key.clone() } else { unread(key) };
+            let entry_key = if entry.reads_block_basis { entry.key.clone() } else { unread(&entry.key) };
+            reason = if entry_key != *key && !(entry.translatable && entry_key.serves_translated(key)) { 1 }
                 else if !self.same_style(&entry.style, style) { 2 }
-                else if !self.same_style(&entry.parent_style, parent_style) { 3 }
+                else if !self.same_parent_style(entry, parent_style) { 3 }
                 else { 4 };
             if reason == 4 {
                 if let Some(shift) = entry.shift_to(at, key.cull) {
@@ -2597,20 +2949,102 @@ impl RetainedLayoutCache {
         None
     }
 
+    /// `lookup` for a block size measurement, which keeps only the advance
+    /// and discards the commands. Inputs that place a fragment's contents
+    /// without changing its advance do not matter: the paint cull, its
+    /// position (`anchored`), the containing blocks of positioned and sticky
+    /// descendants, the root's paint propagation sources, and the depth,
+    /// which only bounds recursion.
+    fn measured(
+        &self,
+        key: &RetainedFragmentKey,
+        parent_style: &Style,
+        style: &Style,
+        at: (f32, f32),
+    ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
+        let count = |reason: usize| {
+            let mut counts = self.measured.get();
+            counts[reason] = counts[reason].saturating_add(1);
+            self.measured.set(counts);
+        };
+        let Some(&slot) = self.index.get(&retained_slot_key(key))
+            .or_else(|| self.index.range(retained_node_slots(retained_node_key(key.node))).next().map(|(_, slot)| slot)) else {
+            count(1);
+            return None;
+        };
+        let entry = &self.entries[slot];
+        let placement = |rare: &RetainedKeyRare| RetainedKeyRare {
+            fixed_containing_block: None,
+            fixed_containing_block_node: None,
+            sticky_bounds: None,
+            canvas_background_source: None,
+            viewport_overflow_source: None,
+            ..rare.clone()
+        };
+        let rare = |key: &RetainedFragmentKey| key.rare.as_deref().map(placement).unwrap_or_default();
+        let unplaced = |key: &RetainedFragmentKey| RetainedFragmentKey {
+            anchored: None,
+            depth: 0,
+            containing_block: None,
+            containing_block_node: None,
+            cull: Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+            rare: None,
+            ..key.clone()
+        };
+        // The parent's definite height reaches the subtree only through
+        // sizes resolved against it, which `reads_block_basis` records.
+        let parent_height = |key: &RetainedFragmentKey| if entry.reads_block_basis { key.parent_height } else { None };
+        let same_parent = self.same_parent_style(entry, parent_style);
+        let compared = |key: &RetainedFragmentKey| RetainedFragmentKey { parent_height: parent_height(key), ..unplaced(key) };
+        let reason = if compared(&entry.key) != compared(key) { 2 }
+            else if rare(&entry.key) != rare(key) { 3 }
+            else if !self.same_style(&entry.style, style) { 4 }
+            else if !same_parent { 5 }
+            else { 0 };
+        count(reason);
+        if reason != 0 {
+            return None;
+        }
+        let shift = (at.0 - entry.origin.0, at.1 - entry.origin.1);
+        (shift.0.is_finite() && shift.1.is_finite()).then(|| (Rc::clone(entry), shift))
+    }
+
+    /// The parent's style matches, or differs only in a height the fragment
+    /// never resolved anything against (`RetainedFragment::reads_block_basis`).
+    fn same_parent_style(&self, entry: &RetainedFragment, parent_style: &Style) -> bool {
+        self.same_style(&entry.parent_style, parent_style) || !entry.reads_block_basis
+            && entry.parent_style.writing_mode == css::WritingMode::HorizontalTb
+            && entry.parent_style.height != parent_style.height
+            && self.same_style(&{ let mut retained = (*entry.parent_style).clone(); retained.height = parent_style.height; retained }, parent_style)
+    }
+
+    /// Removes a fragment that boxes replaying it may outlive: its text's
+    /// families become orphans.
+    fn evict_slot(&mut self, slot: usize) {
+        self.orphan_families |= self.entries[slot].own_families;
+        self.remove_slot(slot);
+    }
+
     fn remove_slot(&mut self, slot: usize) {
         let removed = self.entries.swap_remove(slot);
         self.bytes = self.bytes.saturating_sub(removed.bytes);
         self.release_style(&removed.parent_style);
         self.release_style(&removed.style);
-        self.index.remove(&retained_node_key(removed.key.node));
+        self.index.remove(&retained_slot_key(&removed.key));
         self.lru.remove(&removed.lru_stamp.get());
         if let Some(moved) = self.entries.get(slot) {
-            self.index.insert(retained_node_key(moved.key.node), slot);
+            self.index.insert(retained_slot_key(&moved.key), slot);
         }
     }
 
     /// Removes the least recently used fragment.
     fn evict_oldest(&mut self) -> bool {
+        self.evict_oldest_before(u64::MAX)
+    }
+
+    /// Evicts the least recently used fragment, unless it was stored or used
+    /// at `limit` or later.
+    fn evict_oldest_before(&mut self, limit: u64) -> bool {
         loop {
             let Some((&stamp, &node)) = self.lru.iter().next() else { return false };
             let Some(&slot) = self.index.get(&node) else {
@@ -2624,7 +3058,8 @@ impl RetainedLayoutCache {
                 self.lru.insert(used, node);
                 continue;
             }
-            self.remove_slot(slot);
+            if used >= limit { return false; }
+            self.evict_slot(slot);
             return true;
         }
     }
@@ -2672,15 +3107,16 @@ impl RetainedLayoutCache {
         bytes
     }
 
-    fn store(&mut self, mut fragment: RetainedFragment) {
+    /// Keeps the fragment; false when it is not retained.
+    fn store(&mut self, mut fragment: RetainedFragment) -> bool {
         let parent_style = self.intern_style(Arc::clone(&fragment.parent_style));
         let style = self.intern_style(Arc::clone(&fragment.style));
-        let (Some(parent_bytes), Some(style_bytes)) = (retained_style_bytes(&parent_style), retained_style_bytes(&style)) else { return };
-        let Some(owned) = fragment.bytes.checked_add(parent_bytes).and_then(|owned| owned.checked_add(style_bytes)) else { return };
+        let (Some(parent_bytes), Some(style_bytes)) = (retained_style_bytes(&parent_style), retained_style_bytes(&style)) else { return false };
+        let Some(owned) = fragment.bytes.checked_add(parent_bytes).and_then(|owned| owned.checked_add(style_bytes)) else { return false };
         fragment.parent_style = parent_style;
         fragment.style = style;
         let Some(charged) = owned.checked_add(RETAINED_INDEX_ENTRY_BYTES) else {
-            return;
+            return false;
         };
         if fragment.bytes == 0
             || charged > MAX_RETAINED_FRAGMENT_BYTES
@@ -2688,28 +3124,38 @@ impl RetainedLayoutCache {
             || self.budget.max_entries == 0
             || (self.min_commands > 0 && fragment.commands.len() <= self.min_commands)
         {
-            return;
+            return false;
         }
         let own_bytes = charged - parent_bytes - style_bytes;
         fragment.bytes = own_bytes;
         self.clock = self.clock.saturating_add(1);
         fragment.last_used.set(self.clock);
         fragment.lru_stamp.set(self.clock);
-        let node = retained_node_key(fragment.key.node);
+        let node = retained_slot_key(&fragment.key);
         if let Some(&slot) = self.index.get(&node) {
-            self.remove_slot(slot);
+            self.evict_slot(slot);
+        }
+        // Past `RETAINED_WAYS` widths, the least recently used one goes.
+        let ways: Vec<usize> = self.index.range(retained_node_slots(node.0)).map(|(_, &slot)| slot).collect();
+        if ways.len() >= RETAINED_WAYS {
+            if let Some(&oldest) = ways.iter().min_by_key(|&&slot| self.entries[slot].last_used.get()) {
+                self.evict_slot(oldest);
+            }
         }
         while self.entries.len() >= self.budget.max_entries
             || self.bytes.saturating_add(fragment.bytes).saturating_add(
                 self.unheld_style_bytes([(&fragment.parent_style, parent_bytes), (&fragment.style, style_bytes)]),
             ) > self.budget.max_bytes
         {
-            if !self.evict_oldest() {
-                return;
+            // A full cache keeps what this frame stored or replayed: the
+            // boxes laid out first are the descendants of those stored last,
+            // which hold copies of them and go as soon as one inside changes.
+            if !self.evict_oldest_before(self.frame_clock) {
+                return false;
             }
         }
         if self.entries.try_reserve(1).is_err() {
-            return;
+            return false;
         }
         self.bytes += fragment.bytes;
         self.acquire_style(&fragment.parent_style, parent_bytes);
@@ -2717,6 +3163,7 @@ impl RetainedLayoutCache {
         self.index.insert(node, self.entries.len());
         self.lru.insert(fragment.lru_stamp.get(), node);
         self.entries.push(Rc::new(fragment));
+        true
     }
 
     fn rebuild_indexes(&mut self) {
@@ -2731,9 +3178,9 @@ impl RetainedLayoutCache {
                 self.acquire_style(style, retained_style_bytes(style).unwrap_or(0));
             }
             entry.lru_stamp.set(entry.last_used.get());
-            self.index.insert(retained_node_key(entry.key.node), slot);
+            self.index.insert(retained_slot_key(&entry.key), slot);
             self.lru
-                .insert(entry.last_used.get(), retained_node_key(entry.key.node));
+                .insert(entry.last_used.get(), retained_slot_key(&entry.key));
             self.bytes += entry.bytes;
         }
     }
@@ -2804,21 +3251,21 @@ fn changed_generated_nodes<T: PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) 
     changed
 }
 
-fn document_is_ancestor(document: &Document, ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    for _ in 0..=512 {
-        let Some(id) = current else {
-            return false;
-        };
-        if id == ancestor {
-            return true;
+/// The targets and their composed ancestors, or `None` when a chain cannot
+/// be read to its root (it may then hold any box).
+fn target_chains(document: &Document, targets: &[NodeId]) -> Option<BTreeSet<RetainedNodeKey>> {
+    let mut chains = BTreeSet::new();
+    for &target in targets {
+        let mut current = Some(target);
+        let mut bounded = false;
+        for _ in 0..=512 {
+            let Some(id) = current else { bounded = true; break };
+            if !chains.insert(retained_node_key(id)) && id != target { bounded = true; break; }
+            current = document.composed_parent(id).ok()?;
         }
-        current = match document.composed_parent(id) {
-            Ok(parent) => parent,
-            Err(_) => return true,
-        };
+        if !bounded { return None; }
     }
-    true
+    Some(chains)
 }
 
 fn clone_arc_slice<T: Clone>(values: &[T]) -> Option<Arc<[T]>> {
@@ -4416,6 +4863,9 @@ struct Layout<'a> {
     document: &'a Document,
     text: &'a dyn TextShaper,
     text_uses: &'a core::cell::Cell<u64>,
+    /// The box whose retained fragment the last `RetainedLayoutCache::store`
+    /// kept, so the box's caller knows its text's families have an owner.
+    retained_owner: Option<NodeId>,
     rules: &'a StyleIndex,
     images: Option<&'a dyn ImageResolver>,
     commands: Vec<Command>,
@@ -4446,11 +4896,13 @@ struct Layout<'a> {
     float_floor: core::cell::Cell<f32>,
     float_frame: FloatFrame,
     active_box: Option<NodeId>,
+    /// The box whose own style the commands pushed now are drawn from.
+    paint_owner: Option<(NodeId, Option<css::PseudoElement>)>,
     canvas_root_box: Option<Rect>,
     initial_clearances: Vec<(NodeId, Option<css::PseudoElement>, f32)>,
     initial_margin_summaries: RefCell<BTreeMap<(u128, u8, u32, bool), (MarginStrut, Option<MarginStrut>, bool)>>,
     initial_margin_origin: Option<f32>,
-    initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,f32)>>,
+    initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,Option<f32>)>>,
     anchor_index: RefCell<anchor_layout::AnchorIndex>,
     last_successful: anchor_layout::LastSuccessful,
     position_area_outer: Option<(NodeId, Rect)>,
@@ -4471,6 +4923,12 @@ struct Layout<'a> {
     /// Bumped by content whose position does not follow its scroll container
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
+    /// Lookups that `html_image_presentation` made for paint-only `<img>`
+    /// elements, for `LayoutGeometry::culled_images`.
+    img_lookups: core::cell::RefCell<Vec<PendingLookup>>,
+    /// The `scroll_hazards` a retained fragment cannot carry: all but those
+    /// of absolutely positioned boxes, whose count a replay adds again.
+    unretainable_hazards: usize,
     gap_capture: Option<css::gap_decorations::Input>,
     /// Viewport-fixed and viewport-sticky boxes recorded as scroll anchors
     /// (`ScrollRegion::anchor`) for scrolling the document by translation.
@@ -4539,6 +4997,11 @@ struct Layout<'a> {
     /// In-flow `position: relative; z-index: auto` subtrees, kept with the
     /// nearest block walk so later positioned siblings can retain tree order.
     positioned_flow_paints: Vec<PositionedFlowPaint>,
+    /// Counts every rewrite, removal or drain of entries already in
+    /// `pending_escapes` or `positioned_flow_paints` (appends are not counted),
+    /// so a retained box over many outer records sees that its layout left
+    /// them alone without copying them.
+    outer_paint_edits: u64,
     positioned_clip_policies: Vec<PositionedClipPolicy>,
     overflow_clip_commands: BTreeMap<usize,(NodeId,Option<css::PseudoElement>)>,
     content_range_fragments: BTreeMap<FlowContentRanges,Vec<FlowContentRanges>>,
@@ -4567,6 +5030,10 @@ struct Layout<'a> {
     counter_positions: Cow<'a, [CounterNodeValues]>,
     /// Session-owned bounded subtree command/geometry cache.
     retained_fragments: Option<&'a mut RetainedLayoutCache>,
+    /// A measurement's read-only view of the layout's retained fragments: a
+    /// block size measurement replays an unchanged subtree's fragment instead
+    /// of laying it out again (see `RetainedLayoutCache::measured`).
+    retained_read: Option<&'a RetainedLayoutCache>,
     /// Cell borders are painted once by the collapsed-border conflict pass.
     suppressed_border_node: Option<NodeId>,
     table_surface_painted: Option<(NodeId,usize)>,
@@ -4718,6 +5185,7 @@ impl<'a> Layout<'a> {
         document,
         text,
         text_uses,
+        retained_owner: None,
         rules,
         images,
         commands: Vec::new(),
@@ -4744,6 +5212,7 @@ impl<'a> Layout<'a> {
         viewport_overflow_source: None,
         viewport_scroll_axes: (true, true),
         active_box: None,
+        paint_owner: None,
         canvas_root_box: None,
         initial_clearances: Vec::new(),
         initial_margin_summaries: RefCell::new(BTreeMap::new()),
@@ -4759,6 +5228,8 @@ impl<'a> Layout<'a> {
         cull: viewport,
         paint_extent: None,
         scroll_hazards: 0,
+        img_lookups: Default::default(),
+        unretainable_hazards: 0,
         gap_capture: None,
         root_anchors: 0,
         root_scroll_hazards: 0,
@@ -4800,6 +5271,7 @@ impl<'a> Layout<'a> {
         pending_escapes: Vec::new(),
         negative_source_order: None,
         positioned_flow_paints: Vec::new(),
+        outer_paint_edits: 0,
         positioned_clip_policies: Vec::new(),
         overflow_clip_commands: BTreeMap::new(),
         content_range_fragments: BTreeMap::new(),
@@ -4812,6 +5284,7 @@ impl<'a> Layout<'a> {
         quote_positions: Cow::Owned(Vec::new()),
         counter_positions: Cow::Owned(Vec::new()),
         retained_fragments,
+        retained_read: None,
         suppressed_border_node: None,
         table_surface_painted: None,
         table_cell_projection: None,
@@ -4845,7 +5318,7 @@ fn is_css_box_namespace(namespace: &Namespace) -> bool {
 
 fn css_layout_tag<'a>(name: &'a str, namespace: &Namespace) -> &'a str {
     if matches!(namespace, Namespace::Other(_)) { "" } else {
-        crate::xml::split_qname(name).map(|(_, local)| local).unwrap_or(name)
+        crate::xml::local_part(name)
     }
 }
 
@@ -4876,8 +5349,16 @@ impl Layout<'_> {
         self.resolve_style_percentages_for_box(style, Some(width), height, Some(width))
     }
 
+    fn note_block_basis_read(&self) {
+        let reads = &self.intrinsics.block_basis_reads;
+        reads.set(reads.get().wrapping_add(1));
+    }
+
     fn resolve_style_percentages_for_box(&self, style: &Style, width: Option<f32>,
         height: Option<f32>, inline: Option<f32>) -> Style {
+        if style.reads_block_basis() {
+            self.note_block_basis_read();
+        }
         let context = self.container_units.get();
         let mut resolved=style.clone();
         let _ = resolved.resolve_query_context_with_text(context,Some(self.text));
@@ -8197,6 +8678,7 @@ impl Layout<'_> {
     }
 
     fn discard_positioned_flow_in(&mut self, commands: Range<usize>, hits: Range<usize>) {
+        self.outer_paint_edits = self.outer_paint_edits.wrapping_add(1);
         self.positioned_flow_paints.retain(|paint| {
             !(paint.commands.start >= commands.start
                 && paint.commands.end <= commands.end
@@ -8231,8 +8713,13 @@ struct BlockMargins { lead: MarginStrut, lead_add: f32, trail: MarginStrut, trai
 
 #[derive(Clone, Copy)]
 struct InitialClearance { node: NodeId, pseudo: Option<css::PseudoElement>, clear: Clear, float_count: usize }
-#[derive(Clone, Copy)]
-struct InitialFloat { left: f32, available: f32, width: f32, height: f32, side: Float, clear: Clear }
+/// A float met by the hypothetical margin pass. Its size matters only when a
+/// later box clears it, so an element float is measured then: measuring lays
+/// out its whole content (sciencedaily.com's floated multi-column body).
+#[derive(Clone)]
+struct InitialFloat { left: f32, available: f32, size: InitialFloatSize, side: Float, clear: Clear }
+#[derive(Clone)]
+enum InitialFloatSize { Measured { width: f32, height: f32 }, Element { node: NodeId, style: Rc<Style>, depth: usize } }
 #[derive(Clone,Copy)]
 enum FloatAvoidanceSource<'a> {Node(NodeId),Generated(&'a VirtualGeneratedChild),AnonymousTable(&'a AnonymousTableBox)}
 
@@ -8308,7 +8795,7 @@ struct BoxChildOverride {
     cell_height_phase: Option<TableCellHeightPhase>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct PositionedClipPolicy {
     source: (NodeId,Option<css::PseudoElement>),
     containing_block: Option<NodeId>,
@@ -8381,6 +8868,9 @@ struct FlexItem {
     main_baselines: Option<FlowBaselines>,
     cross_shift: f32,
     content_ranges: Option<FlowContentRanges>,
+    /// Laid out once at its automatic block size, which then is its main
+    /// size (`Layout::column_flex_in_place`).
+    in_place: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -9343,6 +9833,10 @@ struct InlineFrame {
     line_background: Range<usize>,
 }
 
+impl InlineFrame {
+    fn paint_owner(&self) -> (NodeId, Option<css::PseudoElement>) { (self.node, self.virtual_pseudo) }
+}
+
 /// Sparse operation-local paint owners. Ordinary inline frames carry no
 /// layer or range vector; only an actual filter allocates this record.
 struct InlineFilterOwner {
@@ -9934,6 +10428,18 @@ fn apply_counter_operations(
             let tick = reversed.tick;
             reversed.record(counter.instance, CounterEvent::Increment { amount, tick })?;
         }
+    }
+    // CSS Lists 3 §4.5: a list item increments `list-item` by one unless its
+    // `counter-increment` names that counter itself; an authored increment of
+    // other counters (or `none`) keeps it.
+    if style.is_list_item() && !style.counter_increment.as_deref().is_some_and(|increments|
+        increments.iter().any(|increment| &*increment.name == "list-item")) {
+        let index = ensure_counter(&Arc::from("list-item"), scope, active, mutation_floor)?;
+        let counter = active.get_mut(index).ok_or(LayoutError::InvalidTree)?;
+        let amount = if counter.reversed { -1 } else { 1 };
+        counter.value = clamp_counter(counter.value.saturating_add(amount));
+        let tick = reversed.tick;
+        reversed.record(counter.instance, CounterEvent::Increment { amount, tick })?;
     }
     if let Some(sets) = style.counter_set.as_deref() {
         for set in sets {
@@ -10866,6 +11372,8 @@ fn is_word_separator(grapheme: &str) -> bool {
 
 #[derive(Clone, PartialEq)]
 struct TextDecoration {
+    /// The decorating box, which owns the lines drawn across its descendants.
+    owner: Option<(NodeId, Option<css::PseudoElement>)>,
     lines: u8,
     style: css::TextDecorationStyle,
     position: css::TextUnderlinePosition,
@@ -10878,7 +11386,7 @@ struct TextDecoration {
 
 impl TextDecoration {
     fn from_style(style: &Style) -> Self {
-        Self { lines: style.text_decoration, style: style.text_decoration_style,
+        Self { owner: None, lines: style.text_decoration, style: style.text_decoration_style,
             position: style.text_underline_position, source: style.clone(), under_edge: None, color: style.text_decoration_color.unwrap_or(style.color),
             size: style.font_size, font: style.font.clone() }
     }
@@ -11136,6 +11644,17 @@ pub(crate) fn transformed_bounds(
     })
 }
 
+/// The element (or pseudo-element) whose own style a paint command was drawn
+/// from: its opacity group, background, borders, outline, text or text
+/// decoration. Lets a paint-only style change rewrite the commands in place
+/// instead of laying the page out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaintSource {
+    pub(crate) command: usize,
+    pub(crate) node: NodeId,
+    pub(crate) pseudo: Option<css::PseudoElement>,
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutGeometry {
     pub transform_timeline_values:Option<alloc::boxed::Box<crate::animation::progress_timelines::TransformTimelineValues>>,
@@ -11175,9 +11694,21 @@ pub(crate) struct LayoutGeometry {
     /// laid out at its scroll offset.
     pub origin_layout_refused: bool,
     pub control_text_runs: Vec<ControlTextRun>,
+    /// Owners of the commands a paint-only style change can rewrite.
+    pub(crate) paint_sources: Vec<PaintSource>,
     /// Paint-only images which were still loading when this was laid out; see
     /// [`DeferredImage`].
     pub deferred_images: Vec<DeferredImage>,
+    /// Lookups of paint-only `<img>` elements that were still loading. One
+    /// that has no record in `deferred_images` painted nothing (it is hidden,
+    /// or outside the culled area), so its arrival changes no command of this
+    /// frame, unless a background asked for it too (`background_lookups`).
+    pub(crate) culled_images: Vec<PendingLookup>,
+    /// Lookups of background images that were still loading; a nested
+    /// cross-fade image among them paints without a record.
+    pub(crate) background_lookups: Vec<PendingLookup>,
+    /// More lookups than these lists keep were made.
+    pub(crate) lookups_incomplete: bool,
     /// `(deferred image, command)` of the deferred backgrounds, found when a
     /// frame is first scrolled and kept until a deferred image is retired.
     pub(crate) deferred_commands: Option<Vec<(usize, usize)>>,
@@ -11661,6 +12192,22 @@ pub(crate) struct HitTransform {
 }
 
 impl LayoutGeometry {
+    /// Whether two layouts hit-test alike: the same hit regions in the same
+    /// order, with rectangles and transforms equal within `tolerance`.
+    pub(crate) fn hits_approx_eq(&self, other: &LayoutGeometry, tolerance: f32) -> bool {
+        let near = |a: f32, b: f32| (a - b).abs() <= tolerance || a == b;
+        let rect = |a: &Rect, b: &Rect| near(a.x, b.x) && near(a.y, b.y) && near(a.width, b.width) && near(a.height, b.height);
+        self.hits.len() == other.hits.len()
+            && self.transforms.len() == other.transforms.len()
+            && self.hits.iter().zip(&other.hits).all(|(a, b)| {
+                a.node == b.node && a.pseudo == b.pseudo && a.hit_testable == b.hit_testable && rect(&a.rect, &b.rect)
+            })
+            && self.transforms.iter().zip(&other.transforms).all(|(a, b)| {
+                let (m, n) = (a.matrix, b.matrix);
+                a.hits == b.hits && near(m.a, n.a) && near(m.b, n.b) && near(m.c, n.c) && near(m.d, n.d) && near(m.e, n.e) && near(m.f, n.f)
+            })
+    }
+
     pub(crate) fn clip_transforms<'a>(&'a self,clip:&'a HitClip)->impl DoubleEndedIterator<Item=Affine>+'a {
         clip.source_transform.iter().map(|matrix|**matrix).chain(
             self.transforms[clip.first_transform..].iter().filter(move |transform|
@@ -11923,8 +12470,29 @@ impl LayoutGeometry {
     }
 
     /// Drops `arrived` deferred images, once they are painted into the frame.
+    /// Notes paint-only lookups made since `mark` in `culled_images` (an
+    /// `<img>`) or `background_lookups`.
+    fn note_paint_only_lookups(&mut self, images: &dyn ImageResolver, mark: usize, image: bool) {
+        if images.pending_mark() == mark { return; }
+        for (lookup, _) in images.pending_since(mark) { self.note_lookup(lookup, image); }
+    }
+
+    fn note_lookup(&mut self, lookup: PendingLookup, image: bool) {
+        let list = if image { &mut self.culled_images } else { &mut self.background_lookups };
+        if list.contains(&lookup) { return; }
+        if list.len() >= 4096 { self.lookups_incomplete = true; return; }
+        list.push(lookup);
+    }
+
+    /// Whether an arrived `lookup` with no record painted nothing.
+    pub(crate) fn painted_nothing(&self, lookup: &PendingLookup) -> bool {
+        !self.lookups_incomplete && self.culled_images.contains(lookup) && !self.background_lookups.contains(lookup)
+    }
+
     pub(crate) fn retire_deferred_images(&mut self, arrived: &[PendingLookup]) {
         self.deferred_images.retain(|record| !arrived.contains(&record.lookup));
+        self.culled_images.retain(|lookup| !arrived.contains(lookup));
+        self.background_lookups.retain(|lookup| !arrived.contains(lookup));
         self.deferred_commands = None;
     }
 
@@ -14127,7 +14695,9 @@ fn generated_image_command(image:&GeneratedImage,rect:Rect,style:&Style,images:O
     let scheme=style.used_color_scheme(environment).scheme;
     let paint=images.and_then(|images|viewport_background_paint(&image.source,&image.paint,images,rect.width,rect.height,scheme,0)).unwrap_or_else(||image.paint.clone());
     match paint {
-        BackgroundPaint::Image(image)=>Command::Image{rect,image},
+        // A pending or failed url() keeps its 0x0 placeholder, which only
+        // a background fill accepts; it paints nothing either way.
+        BackgroundPaint::Image(image) if image.is_valid()=>Command::Image{rect,image},
         paint=>Command::FillBackground(Box::new(crate::paint::BackgroundFill{corners:None,rect,radius:0.0,positioning_rect:rect,image_rect:rect,repeat:[BackgroundRepeat::NoRepeat;2],image:computed_procedural_paint(&paint,style,rect,rect.width,rect.height,0)})),
     }
 }
@@ -14320,6 +14890,160 @@ fn border(rect: Rect, style: &Style) -> Command {
         style.border_style_sides[0].map_or(style.border_pattern, css::BorderStyle::pattern),
     )
 }
+/// Moves paint sources to the commands' new positions (`usize::MAX` for a
+/// removed command) and gives each reopened copy of a source scope its own.
+fn remap_paint_sources(sources:&mut Vec<PaintSource>,index:impl Fn(usize)->usize,reopened:&[(usize,usize)]) {
+    let mut copies=Vec::new();
+    for &(original,copy) in reopened {
+        if let Some(source)=sources.iter().find(|source|source.command==original) {
+            if copies.try_reserve(1).is_err(){sources.clear();return;}
+            copies.push(PaintSource{command:copy,..*source});
+        }
+    }
+    for source in sources.iter_mut() { source.command=index(source.command); }
+    if sources.try_reserve(copies.len()).is_err(){sources.clear();return;}
+    sources.extend(copies);
+    sources.retain(|source|source.command!=usize::MAX);
+}
+
+/// A box whose computed style changed only in paint values
+/// (`Style::differs_only_in_paint`).
+pub(crate) struct PaintChange<'a> {
+    pub(crate) node: NodeId,
+    pub(crate) pseudo: Option<css::PseudoElement>,
+    pub(crate) old: &'a Style,
+    pub(crate) new: &'a Style,
+    /// The box draws text of its own (decorations: text anywhere inside it).
+    pub(crate) has_text: bool,
+    /// The box was drawn: it has a hit region or owns commands.
+    pub(crate) rendered: bool,
+}
+
+fn side_colors(style: &Style) -> [Rgba; 4] {
+    core::array::from_fn(|side| style.border_color_sides[side].unwrap_or(style.border_color))
+}
+
+fn decoration_color(style: &Style) -> Rgba { style.text_decoration_color.unwrap_or(style.color) }
+
+fn outline_drawn(style: &Style) -> bool { outline_command(Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }, style).is_some() }
+
+/// Whether two commands are equal but for rounding of their numbers.
+fn commands_close(a: &Command, b: &Command) -> bool {
+    a == b || DisplayList(alloc::vec![a.clone()]).approx_eq(&DisplayList(alloc::vec![b.clone()]), 1e-3)
+}
+
+/// The replacements of the commands drawn from the paint values of `changes`,
+/// or `None` when a change reaches paint that cannot be rewritten in place
+/// (a command appears or disappears, or its value has another origin) and the
+/// frame must be laid out again. `sources` are sorted by command.
+pub(crate) fn patch_paint_commands(list: &[Command], sources: &[PaintSource], changes: &[PaintChange<'_>])
+    -> Option<Vec<(usize, Command)>> {
+    let owner_key = |node: NodeId, pseudo: Option<css::PseudoElement>| (node.key(), pseudo.map_or(0, |pseudo| pseudo as u8 + 1));
+    let mut by_owner: BTreeMap<(u128, u8), Vec<usize>> = BTreeMap::new();
+    for source in sources { by_owner.entry(owner_key(source.node, source.pseudo)).or_default().push(source.command); }
+    let mut replacements: Vec<(usize, Command)> = Vec::new();
+    for change in changes {
+        let (old, new) = (change.old, change.new);
+        if !old.visibility_visible && !new.visibility_visible { continue; }
+        let color_changed = old.color != new.color;
+        let background_changed = old.background != new.background;
+        let borders_changed = side_colors(old) != side_colors(new);
+        let outline_changed = old.outline != new.outline || (outline_drawn(old) && old.outline.color.is_none() && color_changed);
+        let decoration_changed = old.text_decoration != 0 && decoration_color(old) != decoration_color(new);
+        let opacity_changed = old.opacity != new.opacity;
+        // Values painted through paths that are not rewritten here.
+        if color_changed && (old.background_images.is_some() || old.border_image.is_some() || old.mask_images.is_some()
+            || old.text_shadows.is_some() || old.shadows.is_some() || old.filters.is_some() || css::columns::active(old)
+            || old.appearance != css::Appearance::None) { return None; }
+        if (background_changed || borders_changed) && (old.border_image.is_some() || old.background_images.is_some() || old.shadows.is_some()) { return None; }
+        if decoration_changed && old.text_decoration_style == css::TextDecorationStyle::Wavy { return None; }
+        // An opacity animation keeps its box a stacking context and isolation
+        // group throughout, so a sample at 1 keeps the layer at opacity 1 and a
+        // later sample below 1 rewrites it again. A mask paints its own group.
+        if opacity_changed && old.paints_as_group() != new.paints_as_group() && (old.has_mask() || new.has_mask()) { return None; }
+        if (old.background.a == 0) != (new.background.a == 0) { return None; }
+        if borders_changed && (has_nonuniform_border(old) != has_nonuniform_border(new)
+            || side_colors(old).iter().zip(side_colors(new)).any(|(a, b)| (a.a == 0) != (b.a == 0))) { return None; }
+        if outline_drawn(old) != outline_drawn(new) { return None; }
+        if !(color_changed || background_changed || borders_changed || outline_changed || decoration_changed || opacity_changed) { continue; }
+        let owned = by_owner.get(&owner_key(change.node, change.pseudo)).map_or(&[][..], Vec::as_slice);
+        let (mut text, mut background, mut border, mut outline, mut decoration, mut layer) = (false, false, false, false, false, false);
+        for &index in owned {
+            let current = replacements.iter().rev().find(|(at, _)| *at == index).map(|(_, command)| command)
+                .or_else(|| list.get(index))?;
+            let mut command = current.clone();
+            match &mut command {
+                Command::PushLayer { opacity, filters, svg_clip, clip: false, .. } if opacity_changed => {
+                    if *filters != old.filters || !old.paints_as_group() && (*opacity != 1.0 || svg_clip.is_some()) { continue; }
+                    if *opacity == old.opacity { *opacity = new.opacity; }
+                    else if *opacity == old.opacity.clamp(0.0, 1.0) { *opacity = new.opacity.clamp(0.0, 1.0); }
+                    else { continue; }
+                    layer = true;
+                }
+                Command::GlyphRun { color, .. } if color_changed => {
+                    if *color != old.color { return None; }
+                    *color = new.color;
+                    text = true;
+                }
+                Command::FillRect { color, .. } | Command::FillRoundedRect { color, .. } => {
+                    let mut candidates: Vec<(Rgba, Rgba, u8)> = alloc::vec![(old.background, new.background, 1)];
+                    let widths = border_widths(old);
+                    for (side, (a, b)) in side_colors(old).into_iter().zip(side_colors(new)).enumerate() {
+                        if widths[side] > 0.0 { candidates.push((a, b, 2)); }
+                    }
+                    if old.text_decoration != 0 { candidates.push((decoration_color(old), decoration_color(new), 4)); }
+                    let matching: Vec<&(Rgba, Rgba, u8)> = candidates.iter().filter(|(from, _, _)| *from == *color).collect();
+                    let Some(&&(_, to, _)) = matching.first() else { continue };
+                    if matching.iter().any(|(_, other, _)| *other != to) { return None; }
+                    if to == *color { continue; }
+                    for (_, _, kind) in &matching {
+                        match kind { 1 => background = true, 2 => border = true, _ => decoration = true }
+                    }
+                    *color = to;
+                }
+                Command::StrokeBorder { rect, .. } | Command::StrokePatternBorder { rect, .. } => {
+                    let expansion = old.outline.offset + old.outline.used_width();
+                    let inner = Rect { x: rect.x + expansion, y: rect.y + expansion,
+                        width: rect.width - 2.0 * expansion, height: rect.height - 2.0 * expansion };
+                    if outline_command(inner, old).is_some_and(|expected| commands_close(&expected, current)) {
+                        if !outline_changed { continue; }
+                        command = outline_command(inner, new)?;
+                        outline = true;
+                    } else if borders_changed {
+                        let (Command::StrokeBorder { color, .. } | Command::StrokePatternBorder { color, .. }) = &mut command else { continue };
+                        if *color != side_colors(old)[0] { continue; }
+                        *color = side_colors(new)[0];
+                        border = true;
+                    } else { continue; }
+                }
+                Command::StrokeBoxBorder(paint) if borders_changed => {
+                    if paint.colors != side_colors(old) { return None; }
+                    paint.colors = side_colors(new);
+                    border = true;
+                }
+                _ => continue,
+            }
+            replacements.push((index, command));
+        }
+        if !change.rendered { continue; }
+        let visible = old.visibility_visible;
+        if opacity_changed && (old.paints_as_group() || new.paints_as_group()) && !layer { return None; }
+        if visible && color_changed && change.has_text && !text { return None; }
+        if visible && background_changed && old.background.a != 0 && !background { return None; }
+        if visible && borders_changed && border_widths(old).iter().any(|width| *width > 0.0) && !border { return None; }
+        if visible && outline_changed && outline_drawn(old) && !outline { return None; }
+        if visible && decoration_changed && change.has_text && !decoration { return None; }
+    }
+    Some(replacements)
+}
+
+/// Commands whose values a paint-only style change of their box can rewrite.
+fn paint_source_command(command: &Command) -> bool {
+    matches!(command, Command::PushLayer { .. } | Command::FillRect { .. } | Command::FillRoundedRect { .. }
+        | Command::StrokeBorder { .. } | Command::StrokeBoxBorder(_) | Command::StrokePatternBorder { .. }
+        | Command::GlyphRun { .. })
+}
+
 fn outline_command(rect: Rect, style: &Style) -> Option<Command> {
     let outline = style.outline;
     let width = outline.used_width();
@@ -15404,7 +16128,19 @@ fn resolved_gap(pixels: f32, fraction: f32, basis: Option<f32>) -> f32 {
 type StackingEscape=(usize,usize,usize,usize,usize,usize,i32,(NodeId,Option<css::PseudoElement>),u64,bool);
 
 struct RetainedPaintPhases {
-    contexts:Arc<[PaintContext]>,completed:Arc<[usize]>,escapes:Arc<[StackingEscape]>,surfaces:Arc<[StackingEscape]>,order_advance:u64,
+    contexts:Arc<[PaintContext]>,completed:Arc<[usize]>,escapes:Arc<[StackingEscape]>,surfaces:Arc<[StackingEscape]>,
+    /// `positioned_flow_paints` entries the box added, relative to its first
+    /// command, hit and paint order.
+    positioned:Arc<[PositionedFlowPaint]>,
+    /// The clip policies of absolutely positioned descendants, relative to
+    /// the box's first command and hit, and the scroll hazards they added.
+    clips:Arc<[PositionedClipPolicy]>,
+    /// `overflow_clip_commands` of the box when it has `clips`.
+    clip_owners:Arc<[(usize,(NodeId,Option<css::PseudoElement>))]>,
+    hazards:usize,
+    /// The container unit records of size containers inside the box.
+    containers:Arc<[ContainerUnitRecord]>,
+    order_advance:u64,
 }
 
 #[derive(Clone,Copy)]
@@ -15527,7 +16263,9 @@ struct PaintScopeAdoption<'a> {
     pieces:&'a [Range<usize>],
 }
 
-struct PaintPermutation { segments: Vec<(core::ops::Range<usize>,usize)>, destinations: Vec<usize>, cycles: Vec<usize>, output_len:usize, scope_copies:Vec<(usize,usize)>, track_scope_copies:bool }
+struct PaintPermutation { segments: Vec<(core::ops::Range<usize>,usize)>, destinations: Vec<usize>, cycles: Vec<usize>, output_len:usize, scope_copies:Vec<(usize,usize)>, track_scope_copies:bool,
+    /// `(original, copy)` of every scope push reopened by the permutation.
+    reopened:Vec<(usize,usize)> }
 struct PaintScopeIndex {tops:Vec<usize>,parents:Vec<usize>}
 impl PaintScopeIndex {
     fn new(commands:&[Command])->Result<Self,LayoutError> {
@@ -15616,7 +16354,7 @@ impl PaintPermutation {
         for (range,start) in &segments { for index in range.clone() { destinations[index]=start+index-range.start; } }
         let mut cycles=Vec::new();cycles.try_reserve_exact(total).map_err(|_|LayoutError::CommandLimit)?;
         cycles.extend_from_slice(&destinations);
-        Ok(Self{segments,destinations,cycles,output_len:total,scope_copies:Vec::new(),track_scope_copies:false})
+        Ok(Self{segments,destinations,cycles,output_len:total,scope_copies:Vec::new(),track_scope_copies:false,reopened:Vec::new()})
     }
     fn index(&self,index:usize)->usize { self.destinations.get(index).copied().unwrap_or(self.output_len) }
     fn scoped_commands(&mut self,commands:&mut Vec<Command>,owners:&mut BTreeMap<usize,(NodeId,Option<css::PseudoElement>)>)->Result<(),LayoutError> {
@@ -15704,11 +16442,11 @@ impl PaintPermutation {
             while old_path.last().is_some() && old_path.last()==new_path.last() {old_path.pop();new_path.pop();}
             for &scope in &old_path {
                 let pop=paint_scope_pop(&commands[scope])?;
-                if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((*destination,pop,None,None));
+                if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((*destination,pop,None,None,None));
             }
             for &scope in new_path.iter().rev() {
                 if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                transitions.push((*destination,commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope)));
+                transitions.push((*destination,commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope),Some(scope)));
             }
             current=tops[range.end];current_adoption=adoption;
         }
@@ -15721,23 +16459,24 @@ impl PaintPermutation {
         while old_path.last().is_some() && old_path.last()==new_path.last() {old_path.pop();new_path.pop();}
         for &scope in &old_path {
             let pop=paint_scope_pop(&commands[scope])?;
-            if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((commands.len(),pop,None,None));
+            if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;transitions.push((commands.len(),pop,None,None,None));
         }
         for &scope in new_path.iter().rev() {
             if transitions.len()>=transition_limit{return Err(LayoutError::CommandLimit);}transitions.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-            transitions.push((commands.len(),commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope)));
+            transitions.push((commands.len(),commands[scope].clone(),owners.get(&scope).copied(),self.track_scope_copies.then_some(scope),Some(scope)));
         }
         let size=commands.len().checked_add(transitions.len()).filter(|size|*size<=MAX_DISPLAY_COMMANDS).ok_or(LayoutError::CommandLimit)?;
         let mut output=Vec::new();output.try_reserve_exact(size).map_err(|_|LayoutError::CommandLimit)?;
         self.apply(commands)?;
         let mut transitions=transitions.into_iter().peekable();let mut extra=0;let mut segment=0;let mut new_owners=BTreeMap::new();
         for (index,command) in commands.drain(..).enumerate() {
-            while transitions.peek().is_some_and(|(at,..)|*at==index) {let (_,scope,owner,source)=transitions.next().ok_or(LayoutError::InvalidTree)?;if let Some(owner)=owner{new_owners.insert(output.len(),owner);}if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}output.push(scope);extra+=1;}
+            while transitions.peek().is_some_and(|(at,..)|*at==index) {let (_,scope,owner,source,original)=transitions.next().ok_or(LayoutError::InvalidTree)?;if let Some(owner)=owner{new_owners.insert(output.len(),owner);}if let Some(original)=original{self.reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.reopened.push((original,output.len()));}if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}output.push(scope);extra+=1;}
             output.push(command);
             // Segments remain affine between synthetic scope boundaries.
             if segment<order.len() && order[segment].1==index {order[segment].1+=extra;segment+=1;}
         }
-        for (_,scope,owner,source) in transitions {
+        for (_,scope,owner,source,original) in transitions {
+            if let Some(original)=original{self.reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.reopened.push((original,output.len()));}
             if let Some(source)=source{self.scope_copies.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.scope_copies.push((source,output.len()));}
             if let Some(owner)=owner{new_owners.insert(output.len(),owner);}
             output.push(scope);
@@ -15828,8 +16567,9 @@ fn raised_index(index: usize, moved: &core::ops::Range<usize>, end: usize) -> us
     range.start
 }
 
-/// Paint records pending outside a retained box are compared before and after
-/// its layout; more than this many make that comparison too costly.
+/// Paint records pending outside a retained box are copied and compared before
+/// and after its layout up to this many; past it the copy would cost more than
+/// the layout, and `outer_paint_edits` with the lengths decide instead.
 const RETAINED_OUTER_PAINT_RECORDS: usize = 256;
 
 /// Slack around everything a retained fragment emitted, for ink the
@@ -16529,17 +17269,13 @@ impl Layout<'_> {
                     let node=match &child.kind{FlattenedBoxChildKind::Node(node)=>*node,
                         FlattenedBoxChildKind::Generated(generated)=>generated.origin,
                         FlattenedBoxChildKind::AnonymousTable(_)=>continue};
-                    let (floated,width,intrinsic_height)=if let FlattenedBoxChildKind::Generated(generated)=&child.kind {
-                        self.prepare_generated_float_box(generated,available)?
-                    } else {self.prepare_float_box(node,child_style.clone(),available,depth+1)?};
-                    // Both intrinsic_size and box_edges already return the outer
-                    // margin-box extent. Use it once in hypothetical occupancy,
-                    // exactly as in the real float encounter pass.
-                    let height=floated.height.map_or(intrinsic_height,|height|
-                        constrained_height(&floated,content_height_dimension(&floated,height))+box_edges(&floated,false));
+                    let size=if let FlattenedBoxChildKind::Generated(generated)=&child.kind {
+                        let (floated,width,intrinsic_height)=self.prepare_generated_float_box(generated,available)?;
+                        InitialFloatSize::Measured{width,height:Self::initial_float_height(&floated,intrinsic_height)}
+                    } else {InitialFloatSize::Element{node,style:Rc::new(child_style.clone()),depth:depth+1}};
                     if result.floats.len()==4096{return Err(LayoutError::CommandLimit);}
                     result.floats.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                    result.floats.push(InitialFloat{left:0.0,available,width,height:height.max(0.0),side:floated.float,clear:floated.clear});
+                    result.floats.push(InitialFloat{left:0.0,available,size,side:child_style.float,clear:child_style.clear});
                 }
                 continue;
             }
@@ -16604,6 +17340,13 @@ impl Layout<'_> {
         Ok(result)
     }
 
+/// A float's outer height for hypothetical occupancy: its used height, else the
+/// intrinsic one. Both are margin-box extents, as in the real float pass.
+fn initial_float_height(floated:&Style,intrinsic_height:f32)->f32 {
+    floated.height.map_or(intrinsic_height,|height|
+        constrained_height(floated,content_height_dimension(floated,height))+box_edges(floated,false)).max(0.0)
+}
+
 fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
     depth:usize,generated:Option<&VirtualGeneratedChild>)->Result<MarginStrut,LayoutError> {
     let key=(id.key(),generated.map_or(0,|child|child.pseudo as u8+1),available.to_bits(),establishes_formatting_context(style,parent));
@@ -16631,9 +17374,16 @@ fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
         let mut admitted_floats=0;
         for clearance in initial.clearances {
             while admitted_floats<clearance.float_count {
-                let float=initial.floats[admitted_floats];
-                let (x,y)=place_float_in(bands.iter().copied(),outer_x+float.left,float.available,hypothetical,float.width,float.side,float.clear);
-                bands.push((Rect{x,y,width:float.width,height:float.height},float.side));admitted_floats+=1;
+                let float=&initial.floats[admitted_floats];
+                let (width,height)=match &float.size {
+                    InitialFloatSize::Measured{width,height}=>(*width,*height),
+                    InitialFloatSize::Element{node,style,depth}=>{
+                        let (floated,width,intrinsic_height)=self.prepare_float_box(*node,(**style).clone(),float.available,*depth,true)?;
+                        (width,Self::initial_float_height(&floated,intrinsic_height))
+                    }
+                };
+                let (x,y)=place_float_in(bands.iter().copied(),outer_x+float.left,float.available,hypothetical,width,float.side,float.clear);
+                bands.push((Rect{x,y,width,height},float.side));admitted_floats+=1;
             }
             let requires=bands[..external_count+clearance.float_count].iter().any(|(rect,side)|
                 (clearance.clear==Clear::Both || clearance.clear==Clear::Left&&*side==Float::Left
@@ -16923,26 +17673,32 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
     Ok((floated,width,height))
 }
 
-    fn prepare_float_box(&self,id:NodeId,mut floated:Style,available:f32,depth:usize)
+    /// The float's used style and outer width, and with `need_height` its
+    /// intrinsic outer height (else 0). The intrinsic size lays out the float's
+    /// content, so it is measured only for a replaced element's width or when
+    /// the height is asked for (a vertical flow, or a float another box clears).
+    fn prepare_float_box(&self,id:NodeId,mut floated:Style,available:f32,depth:usize,need_height:bool)
         ->Result<(Style,f32,f32),LayoutError> {
         let key=(id.key(),available.to_bits(),self.parent_height.map_or(u32::MAX,f32::to_bits));
-        if let Some(measured)=self.initial_float_measurements.borrow().get(&key) {return Ok(measured.clone());}
+        if let Some((style,width,height))=self.initial_float_measurements.borrow().get(&key) {
+            if !need_height || height.is_some() {return Ok((style.clone(),*width,height.unwrap_or(0.0)));}
+        }
         self.resolve_intrinsic_dimensions(id,&mut floated,available,self.parent_height,depth)?;
-        let (intrinsic,intrinsic_height)=self.intrinsic_size(id,&floated,depth)?;
         let replaced=matches!(self.document.kind(id),Ok(NodeKind::Element{name,namespace:Namespace::Html,..})
             if matches!(name.as_str(),"img"|"canvas"|"video"))
             || self.document.kind(id).is_ok_and(is_svg_root_element);
-        let width=match floated.width {
-            Some(width)=>width,
-            None if replaced=>specified_dimension(&floated,(intrinsic-box_edges(&floated,true)).max(0.0)),
-            None=>self.shrink_to_fit_width(id,&floated,available,depth)?,
+        let intrinsic=if need_height || (replaced && floated.width.is_none()) {Some(self.intrinsic_size(id,&floated,depth)?)} else {None};
+        let width=match (floated.width,intrinsic) {
+            (Some(width),_)=>width,
+            (None,Some((intrinsic,_))) if replaced=>specified_dimension(&floated,(intrinsic-box_edges(&floated,true)).max(0.0)),
+            _=>self.shrink_to_fit_width(id,&floated,available,depth)?,
         };
         floated.width=Some(width);
         let outer_width=constrained_width(&floated,content_dimension(&floated,width))+box_edges(&floated,true);
-        let result=(floated,outer_width,intrinsic_height);
+        let intrinsic_height=intrinsic.map(|(_,height)|height);
         let mut measurements=self.initial_float_measurements.borrow_mut();
-        if measurements.len()<MAX_DISPLAY_COMMANDS {measurements.insert(key,result.clone());}
-        Ok(result)
+        if measurements.len()<MAX_DISPLAY_COMMANDS {measurements.insert(key,(floated.clone(),outer_width,intrinsic_height));}
+        Ok((floated,outer_width,intrinsic_height.unwrap_or(0.0)))
     }
 
     fn place_float(&self, frame:FloatFrame,start:usize,left:f32,width:f32,cursor:f32,
@@ -17045,6 +17801,14 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
 
     fn paint_decoration_line(
 &mut self, rect: Rect, source: &TextDecoration) -> Result<(), LayoutError> {
+        let saved_owner = self.paint_owner;
+        if source.owner.is_some() { self.paint_owner = source.owner; }
+        let painted = self.paint_decoration_line_owned(rect, source);
+        self.paint_owner = saved_owner;
+        painted
+    }
+
+    fn paint_decoration_line_owned(&mut self, rect: Rect, source: &TextDecoration) -> Result<(), LayoutError> {
         use css::TextDecorationStyle as Pattern;
         let thickness = rect.height;
         match source.style {
@@ -17160,6 +17924,10 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         self.begin_decoration_with_under(style, None)
     }
     fn begin_decoration_with_under(&mut self, style: &Style, under_edge: Option<f32>) -> Result<(), LayoutError> {
+        self.begin_decoration_owned(style, under_edge, self.paint_owner)
+    }
+    fn begin_decoration_owned(&mut self, style: &Style, under_edge: Option<f32>,
+        owner: Option<(NodeId, Option<css::PseudoElement>)>) -> Result<(), LayoutError> {
         if style.text_decoration != 0 && style.has_principal_box() {
             if self.decorations.len() >= 512 {
                 return Err(LayoutError::DepthLimit);
@@ -17169,6 +17937,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 .map_err(|_| LayoutError::CommandLimit)?;
             let mut decoration = TextDecoration::from_style(style);
             decoration.under_edge = under_edge;
+            decoration.owner = owner;
             self.decorations.push(decoration);
         }
         Ok(())
@@ -17230,12 +17999,14 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         // `finish_background_indices` usually replaces this command with the
         // final one, and its record with that command's.
         let previous = self.images.map(|images| images.set_paint_only(true));
+        let mark = self.images.map_or(0, |images| images.pending_mark());
         let (paint, deferred) = self.deferred_background_paint(rect, coverage, style, layer, layer_index, None, sizing);
         let command = background_command_with_fragment_sizing(
             rect,coverage,style,layer,layer_index,&paint,self.viewport,None,self.images,sizing,
         );
         if let (Some(images), Some(previous)) = (self.images, previous) {
             images.set_paint_only(previous);
+            if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, mark, false); }
         }
         if let (Some(deferred), Some(geometry)) = (deferred, self.geometry.as_deref_mut()) {
             geometry.deferred_images.push(deferred);
@@ -17324,6 +18095,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 Command::FillBackground(_) => {
                     if let Some((layer_index, layer)) = layers.next() {
                         let previous = self.images.map(|images| images.set_paint_only(true));
+                        let mark = self.images.map_or(0, |images| images.pending_mark());
                         let (paint, deferred) = deferred_background_paint(self.images, self.geometry.is_some(), self.viewport, rect, coverage, style, &layer, layer_index, local_padding_area, sizing);
                         let replacement = background_command_with_fragment_sizing(
                             rect,coverage,style,&layer,layer_index,&paint,self.viewport,
@@ -17331,6 +18103,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                         );
                         if let (Some(images), Some(previous)) = (self.images, previous) {
                             images.set_paint_only(previous);
+                            if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, mark, false); }
                         }
                         if let Some(geometry) = self.geometry.as_deref_mut() {
                             geometry.deferred_images.retain(|record| !paint_command_holds(command, &record.placeholder));
@@ -18134,8 +18907,8 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 } else { match &source {
                     TableCellContent::Node { node, .. } => {
                         let content = computed.intrinsic_measurement_style(axes.horizontal(true));
-                        let (width, height) = axes.flow.logical(self.intrinsic_size_mode_with_origin(*node, &content, source.style(), depth + 1, false)?);
-                        let minimum = axes.flow.logical(self.intrinsic_size_mode_with_origin(*node, &content, source.style(), depth + 1, true)?).0;
+                        let (width, height) = axes.flow.logical(self.intrinsic_table_cell_size(*node, &content, source.style(), depth + 1, false)?);
+                        let minimum = axes.flow.logical(self.intrinsic_table_cell_size(*node, &content, source.style(), depth + 1, true)?).0;
                         // Store unconstrained canonical content metrics. The
                         // winning collapsed half-borders are not known yet;
                         // width/min/max offsets are applied once after conflict
@@ -19211,6 +19984,9 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 self.push_background(rect, style)?;
             }
         }
+        // Rows, column groups and cells are painted here from their own
+        // styles; the table owns none of those commands.
+        let table_owner = self.paint_owner.take();
         let mut xs = [0f32; 257];
         let mut original_xs = [0f32; 257];
         for col in 0..columns {
@@ -19445,6 +20221,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             if clipped {self.push_command(Command::PopClip)?;}
         }
         if !style.border_collapse && style.visibility_visible {
+            self.paint_owner = table_owner;
             if has_nonuniform_border(style) {
                 for command in side_border_commands(rect, style,self.images) {
                     self.push_command(command)?;
@@ -19452,6 +20229,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             } else if style.border_solid && style.border_width > 0.0 {
                 self.push_command(border(rect, style))?;
             }
+            self.paint_owner = None;
         }
         if !style.border_collapse {
             for paint in &assigned_cells {
@@ -19586,7 +20364,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut text_row = 0;
         let mut text_cell = 0;
         let mut text_cell_count = 0;
+        // A measurement layout keeps only the table's size and baselines, which
+        // the row-sizing pass above already settled. Laying the cells out again
+        // here would repeat every nested table once per enclosing table level.
+        let measures_only = self.cull == MEASUREMENT_CULL && self.geometry.is_none();
         for ((index, cell),assigned) in cells.iter().enumerate().zip(assigned_cells) {
+            if measures_only { break; }
             if collect_table_text && (index == 0 || cell.row != text_row) {
                 text_row = cell.row;
                 text_cell = 0;
@@ -19740,6 +20523,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if table_real {self.stacking_roots.pop();}
             self.surface_roots.pop();
         }
+        self.paint_owner = table_owner;
         self.paint_outline(rect, style)?;
         self.flow_baselines = enclosing_baselines;
         if visible_rows > 0
@@ -19830,7 +20614,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let Some(geometry) = self.geometry.as_deref_mut().filter(|geometry| geometry.collect_rendered_text) else { return Ok(()); };
         if geometry.rendered_table_members.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
         let bytes = geometry.rendered_text_bytes.checked_add(core::mem::size_of::<RenderedTableMember>())
-            .filter(|bytes| *bytes <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::CommandLimit)?;
+            .filter(|bytes| *bytes <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::CommandLimit)?;
         geometry.rendered_table_members.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
         geometry.rendered_table_members.push(member);
         geometry.rendered_text_bytes = bytes;
@@ -19941,6 +20725,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         layout.multicol_depth = self.multicol_depth;
         layout.export_block_table_baselines = self.export_block_table_baselines;
         layout.intrinsics = Rc::clone(&self.intrinsics);
+        layout.retained_read = self.retained_fragments.as_deref().or(self.retained_read);
         layout.quote_positions = Cow::Borrowed(self.quote_positions.as_ref());
         layout.counter_positions = Cow::Borrowed(self.counter_positions.as_ref());
         layout.cull = MEASUREMENT_CULL;
@@ -20063,7 +20848,192 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok((size.1, baselines))
     }
 
+    /// The content size and baselines of a cell laid out at `inline`. A
+    /// measurement is reused, in this and later frames, for an equal cell,
+    /// styles and measuring context until a change inside the cell drops it.
+    /// `intrinsic_size_mode_with_origin` of a table cell, kept with its content
+    /// measurements: each table that encloses a nested table measures and lays
+    /// it out again, and every layout of a table measures all of its cells.
+    fn intrinsic_table_cell_size(&self, node: NodeId, content: &Style, origin: &Style, depth: usize, minimum: bool)
+        -> Result<(f32, f32), LayoutError> {
+        let uncached = || self.intrinsic_size_mode_with_origin(node, content, origin, depth, minimum);
+        if self.measurement_glyphs.as_ref().is_some_and(|glyphs| !glyphs.is_empty()) {
+            return uncached();
+        }
+        let Some(intrinsic) = self.cell_intrinsic_context() else { return uncached() };
+        let context = CellMeasureContext {
+            percentage_basis: self.percentage_basis,
+            multicol_depth: self.multicol_depth,
+            export_block_table_baselines: self.export_block_table_baselines,
+            container_units: self.container_units.get().into(),
+        };
+        let mode = 1 + u8::from(minimum);
+        let slot = node.index() * 2 + usize::from(minimum);
+        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.mode == mode && entry.depth == depth
+            && entry.context == context && *entry.used == *content && *entry.origin == *origin
+            && entry.intrinsic.as_ref().is_some_and(|stored| stored.same_for_slot(&intrinsic, slot));
+        let intrinsics = &*self.intrinsics;
+        {
+            let cells = intrinsics.cells.borrow();
+            if let Some(entry) = cells.get(&node.index()).and_then(|entries| entries.iter().find(|entry| matches(entry))) {
+                let provenance = &entry.provenance;
+                let images_current = match (provenance.pending.as_deref(), self.images) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(pending), Some(images)) => {
+                        let generation = images.generation();
+                        generation != 0 && generation == provenance.pending_generation
+                            || pending.iter().all(|(lookup, _)| images.still_pending(lookup))
+                    }
+                };
+                if images_current {
+                    if let (Some(pending), Some(images)) = (provenance.pending.as_deref(), self.images) {
+                        images.replay_pending(pending);
+                    }
+                    intrinsics.viewport_read((), provenance.axes);
+                    intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
+                    self.text_uses.set(self.text_uses.get().wrapping_add(1));
+                    return Ok(entry.result.0);
+                }
+            }
+        }
+        let mark = self.intrinsic_mark();
+        let size = uncached()?;
+        let mut axes_read = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes_read |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes_read = 3; }
+        let pending = match (self.images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
+        };
+        let mut cells = intrinsics.cells.borrow_mut();
+        let entries = cells.entry(node.index()).or_default();
+        entries.retain(|entry| !matches(entry));
+        if entries.len() >= CELL_MEASURE_WAYS { entries.pop(); }
+        if entries.try_reserve(1).is_ok() {
+            entries.insert(0, CellMeasure {
+                node: node.key(),
+                origin: Arc::new(origin.clone()),
+                used: Arc::new(content.clone()),
+                axes: ((false, false, false), [0; 4]),
+                inline: 0,
+                depth,
+                context,
+                mode,
+                intrinsic: Some(intrinsic),
+                provenance: IntrinsicProvenance {
+                    frame: intrinsics.frame.get(),
+                    axes: axes_read,
+                    context: None,
+                    pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+                    pending: pending.map(|(lookups, _)| lookups),
+                },
+                result: (size, None),
+            });
+        }
+        Ok(size)
+    }
+
     fn measure_table_cell_size(&self, source: &TableCellContent,
+        children: &[Option<FlattenedBoxChild>], style: &Style, axes: TableAxes, inline: f32, depth: usize)
+        -> Result<((f32, f32), Option<FlowBaselines>), LayoutError> {
+        let TableCellContent::Node { node, style: origin } = source else {
+            return self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth);
+        };
+        if self.timeline_values.is_some() || self.measurement_glyphs.as_ref().is_some_and(|glyphs| !glyphs.is_empty()) {
+            return self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth);
+        }
+        let context = CellMeasureContext {
+            percentage_basis: self.percentage_basis,
+            multicol_depth: self.multicol_depth,
+            export_block_table_baselines: self.export_block_table_baselines,
+            container_units: self.container_units.get().into(),
+        };
+        let axes_key = ((axes.flow.vertical, axes.flow.reverse_block, axes.flow.reverse_inline), axes.sides);
+        let inline_key = inline.to_bits();
+        let matches = |entry: &CellMeasure| entry.node == node.key() && entry.mode == 0 && entry.inline == inline_key && entry.depth == depth
+            && entry.axes == axes_key && entry.context == context && *entry.used == *style && *entry.origin == *origin;
+        let intrinsics = &*self.intrinsics;
+        {
+            let cells = intrinsics.cells.borrow();
+            if let Some(entry) = cells.get(&node.index()).and_then(|entries| entries.iter().find(|entry| matches(entry))) {
+                let provenance = &entry.provenance;
+                let images_current = match (provenance.pending.as_deref(), self.images) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(pending), Some(images)) => {
+                        let generation = images.generation();
+                        generation != 0 && generation == provenance.pending_generation
+                            || pending.iter().all(|(lookup, _)| images.still_pending(lookup))
+                    }
+                };
+                if images_current {
+                    if let (Some(pending), Some(images)) = (provenance.pending.as_deref(), self.images) {
+                        images.replay_pending(pending);
+                    }
+                    intrinsics.viewport_read((), provenance.axes);
+                    intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
+                    self.text_uses.set(self.text_uses.get().wrapping_add(1));
+                    return Ok(entry.result);
+                }
+            }
+        }
+        let mark = self.intrinsic_mark();
+        #[cfg(test)]
+        CELL_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+        let result = self.measure_table_cell_size_uncached(source, children, style, axes, inline, depth)?;
+        let mut axes_read = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes_read |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes_read = 3; }
+        let pending = match (self.images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
+        };
+        let mut cells = intrinsics.cells.borrow_mut();
+        let entries = cells.entry(node.index()).or_default();
+        entries.retain(|entry| !matches(entry));
+        if entries.len() >= CELL_MEASURE_WAYS { entries.pop(); }
+        if entries.try_reserve(1).is_ok() {
+            entries.insert(0, CellMeasure {
+                node: node.key(),
+                origin: Arc::new(origin.clone()),
+                used: Arc::new(style.clone()),
+                axes: axes_key,
+                inline: inline_key,
+                depth,
+                context,
+                mode: 0,
+                intrinsic: None,
+                provenance: IntrinsicProvenance {
+                    frame: intrinsics.frame.get(),
+                    axes: axes_read,
+                    context: None,
+                    pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+                    pending: pending.map(|(lookups, _)| lookups),
+                },
+                result,
+            });
+        }
+        Ok(result)
+    }
+
+    fn measure_table_cell_size_uncached(&self, source: &TableCellContent,
         children: &[Option<FlattenedBoxChild>], style: &Style, axes: TableAxes, inline: f32, depth: usize)
         -> Result<((f32, f32), Option<FlowBaselines>), LayoutError> {
         let mut layout = self.measurement_layout();
@@ -22251,11 +23221,30 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
     /// The layout state a measurement may read besides its subtree and the
     /// viewport, whose reads are counted. None when it depends on state that
-    /// is not compared, such as floats placed outside the measured box.
+    /// is not compared, such as a paragraph's column flow. Floats placed
+    /// outside the measured box do not change what its content measures.
     fn intrinsic_context(&self) -> Option<IntrinsicContext> {
-        if !self.floats.is_empty() || self.paragraph_column_flow.is_some()
-            || self.rendered_table_context.is_some() || self.table_cell_projection.is_some()
-            || self.timeline_values.is_some() {
+        if self.rendered_table_context.is_some() || self.table_cell_projection.is_some() {
+            return None;
+        }
+        self.cell_intrinsic_context()
+    }
+
+    /// `intrinsic_context` for measuring the cells of a table: the rendered
+    /// text context and the projection of an enclosing cell being laid out
+    /// tag that cell's own geometry and box, not what a measurement returns.
+    fn cell_intrinsic_context(&self) -> Option<IntrinsicContext> {
+        if self.paragraph_column_flow.is_some() {
+            return None;
+        }
+        self.measurement_context()
+    }
+
+    /// The context of a size measured in a fresh `measurement_layout`, which
+    /// starts without this layout's floats, column flow and table context, so
+    /// only what it carries over keys the result.
+    fn measurement_context(&self) -> Option<IntrinsicContext> {
+        if self.timeline_values.is_some() {
             return None;
         }
         Some(IntrinsicContext {
@@ -22850,6 +23839,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             natural: (f32, f32),
             minimum: (f32, f32),
             measured: bool,
+            /// Measured only as a block size at its column width, after column sizing.
+            block_only: bool,
             block_at_column: Option<(f32, f32)>,
             stretched_natural: Option<f32>,
             lane_position: f32,
@@ -23171,6 +24162,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         natural: (0.0, 0.0),
                         minimum: (0.0, 0.0),
                         measured: false,
+                        block_only: false,
                         block_at_column: None,
                         stretched_natural: None,
                         lane_position: 0.0,
@@ -23270,6 +24262,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 natural: (0.0, 0.0),
                 minimum: (0.0, 0.0),
                 measured: false,
+                block_only: false,
                 block_at_column: None,
                 stretched_natural: None,
                 lane_position: 0.0,
@@ -24606,7 +25599,23 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let baseline_aligned = item.style.self_alignment(style, true).is_baseline()
                 || item.style.self_alignment(style, false).is_baseline()
                 || item.style.content_alignment(false).is_baseline();
-            if columns_needed || rows_needed || baseline_aligned || item.anonymous_text.is_some() {
+            // An item that only sizes auto rows and fills its column needs no
+            // inline contributions: its row contribution is its block size at
+            // the column width, measured once the columns are sized.
+            let block_only = rows_needed && !columns_needed && !baseline_aligned
+                && item.anonymous_text.is_none() && item.generated.is_none()
+                && !axes.vertical && !style.grid_lanes && definite_height.is_none()
+                && !item.style.grid_rows_subgrid && !item.style.grid_columns_subgrid
+                && item.style.width.is_none() && item.style.width_intrinsic.is_none()
+                && item.style.height.is_none() && item.style.height_intrinsic.is_none()
+                && item.style.writing_mode == style.writing_mode
+                && item.style.self_alignment(style, true).alignment == AlignItems::Stretch
+                && item.style.self_alignment(style, false).alignment == AlignItems::Stretch
+                && !axes.automatic_margin(&item.style, true) && !axes.automatic_margin(&item.style, false)
+                && row_definitions[item.row..item.row + item.rows].iter().all(|track| matches!(track, GridTrack::Auto));
+            if block_only {
+                item.block_only = true;
+            } else if columns_needed || rows_needed || baseline_aligned || item.anonymous_text.is_some() {
                 measure_item(self, item)?;
             }
         }
@@ -24662,6 +25671,23 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         // Grid section 12.1); the measured ones are at the max-content width.
         for item in &mut items {
             item.block_at_column = None;
+            if item.block_only && !item.measured {
+                let cw = widths[item.col..item.col + item.cols].iter().sum::<f32>()
+                    + column_gap * (item.cols - 1) as f32;
+                let block = self.column_flex_item_height(
+                    item.node,
+                    &item.style,
+                    style,
+                    cw,
+                    (cw - box_edges(&item.style, true)).max(0.0),
+                    depth + 1,
+                )?;
+                item.natural = (cw, block);
+                item.minimum = (cw, block);
+                item.measured = true;
+                item.block_at_column = Some((cw, block));
+                continue;
+            }
             if !item.measured
                 || axes.vertical
                 || item.generated.is_some()
@@ -26284,6 +27310,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
+            in_place: false,
         })
     }
 
@@ -26333,7 +27360,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             return Ok((empty, empty));
         }
         let bidi = self.paragraph_bidi(paragraph,&paragraph.text,style)?;
-        self.prepare_inline_shaping(paragraph,&bidi,false)?;
+        // The min-content size measures every segment between break
+        // opportunities: one shaping of the paragraph answers them all from its
+        // retained cluster advances, instead of shaping each word again.
+        self.prepare_inline_shaping(paragraph,&bidi,want_minimum)?;
         let mut maximum_width = 0.0f32;
         let mut minimum_width = 0.0f32;
         for (paragraph_index, bidi_paragraph) in bidi.paragraphs.iter().enumerate() {
@@ -26422,38 +27452,53 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             layout.parent_height = self.parent_height;
             layout.box_for(node, container, Some(measured), 0.0, 0.0, container_width, depth)
         };
-        let Some(context) = self.intrinsic_context() else { return measure(); };
+        let Some(context) = self.measurement_context() else { return measure(); };
         let intrinsics = &*self.intrinsics;
-        let frame = intrinsics.frame.get();
-        let hit = intrinsics.stretched.borrow().iter().find(|entry| entry.frame == frame
-            && entry.id == node && entry.width == container_width
+        let images = self.images;
+        // The parent's definite height reaches the item only through sizes
+        // resolved against it, as for retained fragments (`same_parent_style`).
+        let same_container = |entry: &StretchedFlexHeight| entry.container == *container
+            || !entry.reads_block_basis && container.writing_mode == css::WritingMode::HorizontalTb
+                && entry.container.height != container.height
+                && { let mut retained = entry.container.clone(); retained.height = container.height; retained == *container };
+        let hit = intrinsics.stretched.borrow().entries(node).iter().find(|entry| entry.id == node
+            && entry.width == container_width
             && entry.inline_size == inline_size
-            && entry.parent_height == self.parent_height
-            && entry.item == *item && entry.container == *container
-            && entry.context.same_for_slot(&context, node.index() * 2))
-            .map(|entry| (entry.height, entry.axes));
-        if let Some((height, axes)) = hit {
+            && (entry.parent_height == self.parent_height || !entry.reads_block_basis)
+            && entry.item == *item && same_container(entry)
+            && entry.context.same_for_fresh_measurement(&context, node.index() * 2, entry.reads_block_basis)
+            && entry.pending.as_ref().is_none_or(|(pending, generation)| images.is_some_and(|images|
+                *generation != 0 && images.generation() == *generation
+                    || pending.iter().all(|(lookup, _)| images.still_pending(lookup)))))
+            .map(|entry| (entry.height, entry.axes, entry.pending.as_ref().map(|(pending, _)| pending.clone()), entry.reads_block_basis));
+        if let Some((height, axes, pending, reads_block_basis)) = hit {
+            if let (Some(pending), Some(images)) = (pending, images) { images.replay_pending(&pending); }
+            if reads_block_basis { self.note_block_basis_read(); }
             intrinsics.viewport_read((), axes);
             return Ok(height);
         }
         let mark = self.intrinsic_mark();
+        let block_basis_before = intrinsics.block_basis_reads.get();
         let height = measure()?;
+        let reads_block_basis = intrinsics.block_basis_reads.get() != block_basis_before;
         let mut axes = 0;
         for (axis, reads) in intrinsics.reads.iter().enumerate() {
             if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
         }
         if css::viewport_read_counts() != mark.css { axes = 3; }
-        let settled = match (self.images, mark.pending) {
-            (Some(images), Some(since)) => images.pending_mark() == since,
-            _ => true,
+        let pending = match (images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
         };
-        if settled {
-            let mut memo = intrinsics.stretched.borrow_mut();
-            if memo.len() >= MAX_STRETCHED_FLEX_MEMO { memo.remove(0); }
-            memo.push(StretchedFlexHeight { frame, id: node, width: container_width, inline_size,
-                parent_height: self.parent_height, item: item.clone(), container: container.clone(),
-                context, axes, height });
-        }
+        intrinsics.stretched.borrow_mut().push(StretchedFlexHeight { id: node, width: container_width, inline_size,
+            parent_height: self.parent_height, item: item.clone(), container: container.clone(),
+            context, axes, pending, height, reads_block_basis });
         Ok(height)
     }
 
@@ -26514,6 +27559,44 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Some(measured)
     }
 
+    /// Whether a column flex container's items keep their hypothetical main
+    /// sizes: one line, no reversal, and an automatic main size with no
+    /// minimum or maximum, so the free space is zero and nothing flexes or
+    /// shifts. An item whose main size is its content block size is then laid
+    /// out once, at its automatic block size, and placed after the items
+    /// before it, instead of being measured first. Its main size is not
+    /// definite for its descendants' percentages (css-flexbox 9.8), as in the
+    /// measurement.
+    ///
+    /// With `speculate`, a container with a minimum height lays its items out
+    /// in place too, on the guess that their content fills the minimum (as a
+    /// page-sized `min-height: 100vh` column usually does). `flex_children`
+    /// checks the guess once the items are laid out; when free space remains
+    /// that would grow an item, take an auto margin or move the items, the
+    /// layout fails with `LayoutError::FlexSpeculation` and runs again without
+    /// guessing, and the container is not guessed for again.
+    fn column_flex_in_place(&self, container: &Style, speculate: bool) -> bool {
+        !container.flex_main_axis_horizontal() && !container.flex_wrap
+            && container.flex_direction == FlexDirection::Column
+            && container.writing_mode == css::WritingMode::HorizontalTb
+            && !container.axis_start_is_far(false)
+            && container.height.is_none() && container.height_intrinsic.is_none()
+            && container.max_height.is_none() && !container.has_max_height_percentage()
+            && (container.min_height <= 0.0 || speculate && container.min_height_intrinsic.is_none())
+            && !container.has_min_height_percentage()
+            && self.multicol_depth == 0
+            && !css::gap_decorations::enabled(container)
+    }
+
+    /// Whether `flex_children` may guess that the items of `container`, a
+    /// column with a minimum height, fill it (`column_flex_in_place`). Only a
+    /// layout that keeps fragments guesses: it remembers wrong guesses.
+    fn flex_speculation_allowed(&self, container: NodeId, style: &Style) -> bool {
+        style.min_height > 0.0 && self.geometry.is_some()
+            && self.rules.layout_fallback() & css::FALLBACK_NO_FLEX_SPECULATION == 0
+            && self.retained_fragments.as_deref().is_some_and(|cache| !cache.flex_speculation_failed(container))
+    }
+
     fn push_flex_item(
         &mut self,
         items: &mut Vec<FlexItem>,
@@ -26526,6 +27609,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         width: f32,
         source_order: &mut usize,
         depth: usize,
+        speculate: bool,
     ) -> Result<(), LayoutError> {
         let cross_auto_margin = if row {
             item_style.margin_auto[0] || item_style.margin_auto[2]
@@ -26582,8 +27666,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let main_from_measure = item_style.flex_basis.is_none() && !item_style.flex_basis_content
             && item_style.flex_basis_intrinsic.is_none();
         let mut text_minimum = None;
+        let block_measurable = !row && !absolute && !container_style.flex_wrap
+            && self.multicol_depth == 0
+            && anonymous_text.is_none()
+            && item_style.writing_mode == css::WritingMode::HorizontalTb
+            && item_style.aspect_ratio.is_none()
+            && item_style.intrinsic_size_keywords(true).iter().all(Option::is_none)
+            && item_style.intrinsic_size_keywords(false).iter().all(Option::is_none)
+            && !self.is_sized_replaced_element(node)
+            && !self.object_replaced(node)
+            && !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select");
+        let height_needed = item_style.height.is_none()
+            && (main_from_measure || minimum_needed || item_style.flex_basis_content);
+        // A stretched column item whose height is measured below at its used
+        // width needs no max-content measurement: its cross size is that width.
+        let measured_at_stretch = block_measurable && height_needed && stretches_cross && item_style.width.is_none();
         let (w, h) = if shortcuts && !absolute && !main_from_measure && flex_ignores_measured_cross(container_style, row) {
             (0.0, 0.0)
+        } else if shortcuts && measured_at_stretch {
+            (used_content_width(&item_style, width) + box_edges(&item_style, true), 0.0)
         } else if shortcuts && !absolute && minimum_needed && anonymous_text.is_some()
             && if row { item_style.width.is_none() } else { item_style.height.is_none() } {
             let paragraph = anonymous_text.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -26598,16 +27699,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             self.flex_intrinsic_size(node, stretched.as_ref().unwrap_or(&item_style), anonymous_text.as_ref(), depth + 1, false)?
         };
-        let block_measurable = !row && !absolute && !container_style.flex_wrap
-            && self.multicol_depth == 0
-            && anonymous_text.is_none()
-            && item_style.writing_mode == css::WritingMode::HorizontalTb
-            && item_style.aspect_ratio.is_none()
-            && item_style.intrinsic_size_keywords(true).iter().all(Option::is_none)
-            && item_style.intrinsic_size_keywords(false).iter().all(Option::is_none)
-            && !self.is_sized_replaced_element(node)
-            && !self.object_replaced(node)
-            && !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select");
         let mut w = w;
         let inline_size = if !block_measurable {
             None
@@ -26630,9 +27721,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Some(fit)
             }
         };
-        let height_needed = item_style.height.is_none()
-            && (main_from_measure || minimum_needed || item_style.flex_basis_content);
-        let stretched_height = match inline_size.filter(|_| height_needed) {
+        // A content basis (`flex: 1` in an automatic column) is the natural
+        // block size too.
+        let in_place = shortcuts && inline_size.is_some() && height_needed
+            && (main_from_measure || item_style.flex_basis_content) && item_style.flex_basis_intrinsic.is_none()
+            && item_style.height.is_none() && item_style.height_intrinsic.is_none()
+            && item_style.max_height.is_none() && !item_style.has_max_height_percentage()
+            && item_style.min_height <= 0.0 && !item_style.has_min_height_percentage()
+            && !item_style.margin_auto[0] && !item_style.margin_auto[2]
+            && self.column_flex_in_place(container_style, speculate);
+        let stretched_height = match inline_size.filter(|_| height_needed && !in_place) {
             Some(inline_size) => Some(self.column_flex_item_height(
                 node, &item_style, container_style, width, inline_size, depth,
             )?),
@@ -26651,7 +27749,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         let edges = box_edges(&item_style, row);
         let cross_edges = box_edges(&item_style, !row);
-        let content_basis = if item_style.flex_basis_content {
+        let content_basis = if item_style.flex_basis_content && !in_place {
             let mut content_style = item_style.clone();
             if row {
                 content_style.width = None;
@@ -26715,7 +27813,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             constrained_height(&item_style, (main - edges).max(0.0)) + edges
         };
         let min_main =
-            if minimum_needed
+            if minimum_needed && !in_place
             {
                 let mut minimum_style = item_style.clone();
                 let specified_suggestion = if row {
@@ -26777,6 +27875,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
+            in_place,
         });
         *source_order += 1;
         Ok(())
@@ -26877,6 +27976,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut items: Vec<FlexItem> = Vec::new();
         let mut positioned = Vec::new();
         let mut source_order = 0;
+        let speculate = !style.flex_main_axis_horizontal() && self.flex_speculation_allowed(parent, style);
         let children=match prepared_children {Some(children)=>children,
             None=>self.box_children_with_pseudos(parent,style,width,depth+1,false)?};
         let children=self.anonymous_formatting_items(children,style)?;
@@ -26884,7 +27984,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let child=match item {
                 AnonymousFormattingItem::Text(run)=>{
                     self.push_flex_item(&mut items,&mut positioned,run.node,run.style,Some(run.paragraph),
-                        style,row,width,&mut source_order,depth+1)?;
+                        style,row,width,&mut source_order,depth+1,speculate)?;
                     continue;
                 }
                 AnonymousFormattingItem::Box(child)=>child,
@@ -26963,6 +28063,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 width,
                 &mut source_order,
                 depth + 1,
+                speculate,
             )?;
         }
 
@@ -27110,9 +28211,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     .map(|item| if item.frozen { item.main } else { item.base_main })
                     .sum::<f32>()
             };
+            let in_place = items.iter().any(|item| item.in_place);
             let initial_free = available - gaps - used_space(items);
             let mut freeze_passes = 0usize;
-            while freeze_passes <= items.len() && items.iter().any(|item| !item.frozen) {
+            while !in_place && freeze_passes <= items.len() && items.iter().any(|item| !item.frozen) {
                 freeze_passes += 1;
                 let mut free = available - gaps - used_space(items);
                 let factor_sum: f32 = items
@@ -27170,7 +28272,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     }
                 }
             }
-            let remaining = available - gaps - items.iter().map(|item| item.main).sum::<f32>();
+            let remaining = if in_place { 0.0 } else { available - gaps - items.iter().map(|item| item.main).sum::<f32>() };
             let (main_start, main_end) = match (row, reverse) {
                 (true, false) => (3, 1),
                 (true, true) => (1, 3),
@@ -27277,7 +28379,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         &computed,
                         (item.main - item.edges).max(0.0),
                     ));
-                } else {
+                } else if !item.in_place {
                     computed.height = Some(specified_height(
                         &computed,
                         (item.main - item.edges).max(0.0),
@@ -27449,6 +28551,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         if row { item.main } else { width },
                         depth + 1,
                     )?;
+                    if item.in_place {
+                        item.main = height.max(item.edges);
+                    }
                     if row {
                         height
                     } else {
@@ -27618,6 +28723,24 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 item.main_baselines = item.main_baselines.map(|value| value.translated(dx, dy));
             }
             lines[line_index].2 = align_extent;
+            let available = if in_place {
+                let natural = items.iter().map(|item| item.main).sum::<f32>() + gaps;
+                let used = constrained_height(style, natural);
+                // Only a guessed minimum leaves free space: it must change
+                // nothing an item was laid out or placed with.
+                let free = used - natural;
+                if free > 0.01 {
+                    let (lead, extra) = grid_content_distribution(items.len(), free, style.justify_content);
+                    let shifted = style.content_alignment(true).positional_offset(free, style, row, false)
+                        .is_some_and(|offset| offset != 0.0);
+                    if shifted || lead != 0.0 || extra != 0.0 || items.iter().any(|item| item.style.flex_grow > 0.0
+                        || item.style.margin_auto[main_start] || item.style.margin_auto[main_end]) {
+                        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.note_flex_speculation_failed(parent); }
+                        return Err(LayoutError::FlexSpeculation);
+                    }
+                }
+                used
+            } else { available };
             total_main = total_main.max(available);
         }
         let natural_cross = lines.iter().map(|line| line.2).sum::<f32>()
@@ -29346,7 +30469,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut root = self.document.flat_tree_parent(node).map_err(|_| LayoutError::InvalidTree)?.unwrap_or(node);
         for _ in 0..512 {
             if matches!(self.document.kind(root), Ok(NodeKind::Element { .. })) {
-                let style = self.computed_style(root, None).map_err(LayoutError::Css)?;
+                // Inherited values must come from the tree: a parentless
+                // computation would also replace the node's cached style.
+                let style = self.computed_style_from_tree(root)?;
                 if !style.is_inline_level() || style.is_atomic_inline() { return Ok(root); }
             }
             let Some(parent) = self.document.flat_tree_parent(root).map_err(|_| LayoutError::InvalidTree)? else { return Ok(root); };
@@ -29437,8 +30562,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
     fn prepare_case_context(&self, paragraph: &mut InlineParagraph,
         shared: &mut Option<(NodeId, Option<Rc<InlineCaseContext>>)>) -> Result<(), LayoutError> {
-        if !self.rules.has_typographic_content() && !paragraph.spans.iter().any(|span|span.style.text_transform.needs_case_context()) {
-            paragraph.case_context_prepared=true;
+        if !paragraph.spans.iter().any(|span|span.style.text_transform.needs_case_context()) {
+            // A `::first-letter`/`::first-line` style may still bring a
+            // transform once the paragraph is split; `transform_paragraph`
+            // prepares the context then, so no subtree walk is spent on the
+            // paragraphs that never transform.
+            if !self.rules.has_typographic_content() { paragraph.case_context_prepared=true; }
             return Ok(());
         }
         let Some(source) = paragraph.case_sources.first() else { return Ok(()); };
@@ -29739,7 +30868,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let geometry = self.geometry.as_deref_mut().ok_or(LayoutError::InvalidTree)?;
         if shared.is_none() {
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(paragraph.text.len())
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             *shared = Some(Arc::from(paragraph.text.as_str()));
         }
         let text = shared.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -29761,7 +30890,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if start >= stop && !hard_break_after { continue; }
             if geometry.rendered_text_boxes.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(core::mem::size_of::<RenderedTextBox>())
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             geometry.rendered_text_boxes.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
             let order = geometry.rendered_text_boxes.len();
             geometry.rendered_text_boxes.push(RenderedTextBox { node: source.node, text: text.clone(), range: start.min(stop)..stop, order, hard_break_after, table_context: self.rendered_table_context });
@@ -29773,7 +30902,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         if !visible || text.is_empty() || !self.collects_rendered_text() { return Ok(()); }
         let geometry = self.geometry.as_deref_mut().ok_or(LayoutError::InvalidTree)?;
         geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(text.len()).and_then(|bytes| bytes.checked_add(core::mem::size_of::<RenderedTextBox>()))
-            .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+            .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
         if geometry.rendered_text_boxes.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
         geometry.rendered_text_boxes.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
         let order = geometry.rendered_text_boxes.len();
@@ -32260,6 +33389,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 .any(|frame| frame.scroll_container)
         {
             self.scroll_hazards = self.scroll_hazards.saturating_add(1);
+            self.unretainable_hazards = self.unretainable_hazards.saturating_add(1);
         }
         for port in &mut geometry.scroll_ports {
             if port.owner_hit.is_some_and(|index| hits.contains(&index)) {
@@ -32453,6 +33583,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             let hit=Self::inline_filter_projected_extent(hits,context.prefix.1,context.end.1)?;
             context.prefix=(command.0,hit.0);context.end=(command.1,hit.1);
         }
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         for values in [&mut self.pending_escapes,&mut self.surface_records] {
             let mut result=Vec::new();
             for value in values.iter() {
@@ -33418,6 +34549,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                         hit_start: hit.unwrap_or(0), hit_end: hit.map_or(0, |hit|hit+1),
                     },false)?; }
                 let frame_paint_start = self.commands.len();
+                let saved_owner = self.paint_owner.replace(paragraph.frames[index].paint_owner());
                 let frame_style = &paragraph.frames[index].style;
                 let (start, end) = if bounds[index].present { (bounds[index].start, bounds[index].end) } else { (x, x) };
                 let rect = self.inline_fragment_border_rect(frame_style, start, end-start,
@@ -33435,6 +34567,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 }
                 self.finish_hit(hit, rect);
                 self.paint_outline(rect, frame_style)?;
+                self.paint_owner = saved_owner;
                 Self::record_inline_filter_piece(paragraph, owners, Some(index), FlowContentRanges {
                     command_start: frame_paint_start, command_end: self.commands.len(),
                     hit_start: 0, hit_end: 0,
@@ -33828,12 +34961,14 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         frame_edges[frame]|=if token.advance_opening!=rtl {1}else{2};
                     }}
                 }
+                let saved_owner = self.paint_owner;
                 for (index, bounds) in frame_line.iter().enumerate() {
                     paragraph.frames[index].line_background =
                         self.commands.len()..self.commands.len();
                     let Some((start_x, end_x)) = bounds else {
                         continue;
                     };
+                    self.paint_owner = Some(paragraph.frames[index].paint_owner());
                     let background_start = self.commands.len();
                     let frame_style = &paragraph.frames[index].style;
                     if paragraph.frames[index].virtual_pseudo == Some(css::PseudoElement::FirstLetter) {
@@ -33891,6 +35026,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         hit_start: 0, hit_end: 0,
                     },true)?;
                 }
+                self.paint_owner = saved_owner;
                 let first_command = line.command;
                 let first_line_hit = self
                     .geometry
@@ -33917,7 +35053,9 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         if paragraph.frames[index].style.opacity < 1.0 { self.push_command(Command::PopLayer)?; }
                     }
                     letter_groups.truncate(common);
+                    let saved_owner = self.paint_owner;
                     for &index in &desired_groups[common..] {
+                        self.paint_owner = Some(paragraph.frames[index].paint_owner());
                         let frame_style = &paragraph.frames[index].style;
                         let first=visual_fragments.partition_point(|fragment|fragment.frame<index);
                         let last=visual_fragments.partition_point(|fragment|fragment.frame<=index);
@@ -33941,6 +35079,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         letter_groups.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
                         letter_groups.push(index);
                     }
+                    self.paint_owner = saved_owner;
                     let hit_start = self
                         .geometry
                         .as_ref()
@@ -33999,7 +35138,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 .map_or(0, |geometry| geometry.hits.len());
                             let decoration_depth = self.decorations.len();
                             for frame in &token.frames {
-                                self.begin_decoration_with_under(&paragraph.frames[*frame].style, frame_under.get(*frame).copied())?;
+                                self.begin_decoration_owned(&paragraph.frames[*frame].style, frame_under.get(*frame).copied(), Some(paragraph.frames[*frame].paint_owner()))?;
                             }
                             let previous_baselines = if has_atomic {
                                 self.flow_baselines.take()
@@ -34103,7 +35242,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 || self.source_capture_depth != 0 || Self::inline_filter_captures_source(paragraph,owners,token.frames.last().copied()) || style.text_shadows.is_some() || self.collects_text_runs() || token.x < self.paint_cull_right() && *cursor < self.paint_cull_bottom())
                         {
                             let decoration_depth = self.decorations.len();
-                            for frame in &token.frames { self.begin_decoration_with_under(&paragraph.frames[*frame].style, frame_under.get(*frame).copied())?; }
+                            for frame in &token.frames { self.begin_decoration_owned(&paragraph.frames[*frame].style, frame_under.get(*frame).copied(), Some(paragraph.frames[*frame].paint_owner()))?; }
                             let text_ink=self.begin_text_ink(style)?;
                             let decoration_start = self.commands.len();
                             self.decorate_text(token.x, *cursor + self.baseline(block_style), token.width, block_style, 3, line_under)?;
@@ -34131,10 +35270,14 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                         self.push_command(Command::PushClip(Rect{x:token.x+left,y:*cursor+self.baseline(style)+bounds.y,width:right-left,height:bounds.height}))?;
                                     }
                                     let command=self.commands.len();
-                                    self.push_command(Command::GlyphRun {
+                                    let saved_owner=self.paint_owner;
+                                    if let Some(&frame)=token.frames.last() {self.paint_owner=Some(paragraph.frames[frame].paint_owner());}
+                                    let pushed=self.push_command(Command::GlyphRun {
                                         origin_x:token.x,baseline_y:*cursor+self.baseline(style),size:style.font_size,color:style.color,
                                         glyphs:if first==0&&end==shaped.glyphs.len(){shaped.glyphs.clone()}else{Arc::from(glyphs)},
-                                    })?;
+                                    });
+                                    self.paint_owner=saved_owner;
+                                    pushed?;
                                     if token.command.is_none(){token.command=Some(command);}
                                     if strip.is_some(){self.push_command(Command::PopClip)?;}
                                     first=end;
@@ -34169,7 +35312,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 path[count] = index; count += 1;
                                 parent = paragraph.frames[index].parent;
                             }
-                            for index in path[..count].iter().rev() { self.begin_decoration_with_under(&paragraph.frames[*index].style, frame_under.get(*index).copied())?; }
+                            for index in path[..count].iter().rev() { self.begin_decoration_owned(&paragraph.frames[*index].style, frame_under.get(*index).copied(), Some(paragraph.frames[*index].paint_owner()))?; }
                             if !self.decorations.is_empty() {
                                 let decoration_start = self.commands.len();
                                 self.decorate_text(token.x, *cursor + self.baseline(block_style), token.width, block_style, 7, line_under)?;
@@ -34538,7 +35681,12 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                 x: left + *advance, y: *cursor, width: 0.0, height: 0.0,
             }));
             let start = self.commands.len();
-            if let Some(rect) = frame.bounds { self.paint_outline(rect, &frame.style)?; }
+            if let Some(rect) = frame.bounds {
+                let saved_owner = self.paint_owner.replace(frame.paint_owner());
+                let painted = self.paint_outline(rect, &frame.style);
+                self.paint_owner = saved_owner;
+                painted?;
+            }
             Self::record_inline_filter_piece(paragraph, owners, Some(index), FlowContentRanges {
                 command_start: start, command_end: self.commands.len(), hit_start: 0, hit_end: 0,
             },false)?;
@@ -35063,7 +36211,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         self.commands.push(command);
         self.command_bytes = bytes;
+        self.note_paint_source(self.commands.len() - 1);
         Ok(())
+    }
+
+    /// Records the box the command at `index` is drawn from, when a paint-only
+    /// style change of that box can rewrite it.
+    fn note_paint_source(&mut self, index: usize) {
+        let Some((node, pseudo)) = self.paint_owner else { return };
+        if self.svg_geometry_operation.is_some() { return; }
+        let Some(geometry) = self.geometry.as_deref_mut() else { return };
+        if !self.commands.get(index).is_some_and(paint_source_command) { return; }
+        if geometry.paint_sources.last().is_some_and(|last| last.command == index) { return; }
+        if geometry.paint_sources.len() >= MAX_DISPLAY_COMMANDS || geometry.paint_sources.try_reserve(1).is_err() { return; }
+        geometry.paint_sources.push(PaintSource { command: index, node, pseudo });
     }
 
     fn replace_command(&mut self, index: usize, command: Command) -> Result<(), LayoutError> {
@@ -35079,6 +36240,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         replace_command_bytes(current, &mut self.command_bytes, command)?;
         if let Some(operation)=self.svg_geometry_operation.as_mut(){operation.charge_commands(self.command_bytes,command_capacity,0)?;}
+        if self.geometry.as_deref().is_some_and(|geometry| !geometry.paint_sources.iter().rev().take(64).any(|source| source.command == index)) {
+            self.note_paint_source(index);
+        }
         Ok(())
     }
 
@@ -35272,10 +36436,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // for a pop, which carries no geometry.
         let mut sources=Vec::new();
         if tracked {sources.try_reserve_exact(actions.len()).map_err(|_|LayoutError::CommandLimit)?;}
+        let mut reopened=Vec::new();
         for action in actions{
             match action{
                 PositionedClipAction::Original(index)=>{indices[index]=output.len();output.push(core::mem::replace(&mut self.commands[index],Command::PopClip));if tracked{sources.push(index);}},
-                PositionedClipAction::Push(scope)=>{output.push(self.commands[scope].clone());if tracked{sources.push(scope);}},
+                PositionedClipAction::Push(scope)=>{reopened.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;reopened.push((scope,output.len()));output.push(self.commands[scope].clone());if tracked{sources.push(scope);}},
                 PositionedClipAction::Pop(scope)=>{let _=close_indices.get(&scope).ok_or(LayoutError::InvalidTree)?;output.push(paint_scope_pop(&self.commands[scope])?);if tracked{sources.push(usize::MAX);}}
             }
         }
@@ -35304,7 +36469,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.commands=output;
         // Scope owners/policies are no longer consulted after this final pass.
         self.overflow_clip_commands.clear();
+        let copies:Vec<PaintSource>=self.geometry.as_ref().map(|geometry|reopened.iter().filter_map(|&(scope,copy)|
+            geometry.paint_sources.iter().find(|source|source.command==scope).map(|source|PaintSource{command:copy,..*source})).collect()).unwrap_or_default();
         self.remap_overflow_commands(&indices,&boundaries)?;
+        if let Some(geometry)=self.geometry.as_mut(){geometry.paint_sources.try_reserve(copies.len()).map_err(|_|LayoutError::CommandLimit)?;geometry.paint_sources.extend(copies);}
         }
         // One temporary interval index avoids scanning every positioned
         // sibling for every clip. Queries visit only overlapping hit sources.
@@ -35405,6 +36573,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             for region in &mut geometry.scroll_regions { range(&mut region.commands)?; }
             if let Some(region) = geometry.root_scroll_region.as_mut() { range(&mut region.commands)?; }
+            remap_paint_sources(&mut geometry.paint_sources,|index|indices.get(index).copied().unwrap_or(usize::MAX),&[]);
         }
         Ok(())
     }
@@ -35663,9 +36832,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn finish_display_list(&mut self) -> Result<DisplayList, LayoutError> {
+        // Text laid out outside every retained fragment has no owner.
+        let unowned = self.text.family_record().map_or(u64::MAX, core::cell::Cell::get);
+        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.orphan_families |= unowned; }
         self.elide_overflow_paint()?;
         self.correct_positioned_clip_scopes()?;
         self.commands.shrink_to_fit();
+        if let Some(geometry) = self.geometry.as_deref_mut() {
+            for lookup in self.img_lookups.take() { geometry.note_lookup(lookup, true); }
+            let commands = &self.commands;
+            geometry.paint_sources.retain(|source| commands.get(source.command).is_some_and(paint_source_command));
+            geometry.paint_sources.sort_by_key(|source| (source.command, source.node.key()));
+            geometry.paint_sources.dedup();
+            geometry.paint_sources.shrink_to_fit();
+        }
         let list = DisplayList(core::mem::take(&mut self.commands));
         let timeline_bytes=self.geometry.as_deref().and_then(|geometry|geometry.transform_timeline_values.as_deref()).map_or(Some(0),|values|values.checked_retained_bytes()).ok_or(LayoutError::CommandLimit)?;
         let reference_bytes=self.geometry.as_deref().and_then(|geometry|geometry.transform_reference_boxes.as_deref())
@@ -35889,7 +37069,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let mut root=self.document.flat_tree_parent(node).map_err(|_|LayoutError::InvalidTree)?.unwrap_or(node);
         for _ in 0..512 {
             if matches!(self.document.kind(root),Ok(NodeKind::Element{..})) {
-                let computed=self.computed_style(root,None).map_err(LayoutError::Css)?;
+                let computed=self.computed_style_from_tree(root)?;
                 if !computed.is_inline_level() || computed.is_atomic_inline() {break;}
             }
             let Some(parent)=self.document.flat_tree_parent(root).map_err(|_|LayoutError::InvalidTree)? else {break;};
@@ -35909,7 +37089,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     if id==target {*range=Some(start..text.len());}return Ok(());
                 }
                 NodeKind::Element{name,namespace,..}=> {
-                    let style=layout.computed_style(id,None).map_err(LayoutError::Css)?;
+                    let style=layout.computed_style_from_tree(id)?;
                     if style.display==Display::None || style.display.is_table_column() || depth>0 && matches!(style.position,Position::Absolute|Position::Fixed) {return Ok(());}
                     if *namespace==Namespace::Html && matches!(name.as_str(),"img"|"input"|"textarea"|"canvas"|"iframe"|"audio"|"video"|"embed") && (name != "input" || crate::control_appearance::presentation(layout.document,id,&style).is_none_or(|control|control.replaced)) {
                         push_context(text,"\u{fffc}")?;return Ok(());
@@ -36673,6 +37853,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let inline_paint = computed.as_ref().filter(|style| style.display == Display::Inline
             && style.paints_as_group() && self.measurement_glyphs.is_none())
             .map(|_| (self.commands.len(), self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len()), self.next_paint_order()));
+        let saved_owner = self.paint_owner;
+        if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) { self.paint_owner = Some((id, None)); }
         let layer = self.begin_opacity(computed.as_ref().filter(|style| {
             !matches!(
                 style.display,
@@ -36682,7 +37864,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     | Display::Flex
                     | Display::Grid
             )
-        }))?;
+        }));
+        self.paint_owner = saved_owner;
+        let layer = layer?;
         let spatial = computed.as_ref().is_some_and(Style::has_spatial_filters);
         let mask_binding = computed.as_ref().filter(|_| layer.is_some()).and_then(MaskBinding::from_style);
         let result = self.with_spatial_source_capture(spatial, |layout| layout.inline_content(
@@ -36713,6 +37897,25 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn inline_content(
+        &mut self,
+        id: NodeId,
+        parent_style: &Style,
+        computed: Option<Style>,
+        x: f32,
+        y: f32,
+        available: f32,
+        depth: usize,
+    ) -> Result<(f32, f32), LayoutError> {
+        if !matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+            return self.inline_content_owned(id, parent_style, computed, x, y, available, depth);
+        }
+        let saved_owner = self.paint_owner.replace((id, None));
+        let result = self.inline_content_owned(id, parent_style, computed, x, y, available, depth);
+        self.paint_owner = saved_owner;
+        result
+    }
+
+    fn inline_content_owned(
         &mut self,
         id: NodeId,
         parent_style: &Style,
@@ -36807,6 +38010,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         if has_layer_attachment(&style, css::BackgroundAttachment::Fixed) {
             self.scroll_hazards += 1;
+            self.unretainable_hazards += 1;
             self.root_scroll_hazards += 1;
         }
         if matches!(
@@ -36984,6 +38188,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     fn bind_css_mask(&mut self,layer:usize,binding:MaskBinding,border:Rect)->Result<(),LayoutError> {
         let saved=core::mem::take(&mut self.commands);
         let saved_bytes=core::mem::replace(&mut self.command_bytes,0);
+        // Mask layers paint into their own lists, which own no paint sources.
+        let saved_owner=self.paint_owner.take();
         let mut layers=Vec::new();
         let mut painted=Ok(());
         if let Some(paint_layers)=background_layers(&binding.layers) {
@@ -36998,6 +38204,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         self.commands=saved;
         self.command_bytes=saved_bytes;
+        self.paint_owner=saved_owner;
         painted?;
         let mut command=self.commands.get(layer).cloned().ok_or(LayoutError::InvalidTree)?;
         let Command::PushLayer{svg_clip,..}=&mut command else{return Err(LayoutError::InvalidTree);};
@@ -37247,6 +38454,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     if let Some(index) = run.hit_index.as_mut() { remap_index(index); }
                     if let Some(index)=run.command_index.as_mut(){let mut range=*index..*index+1;raise_range(&mut range,commands.start,commands.end,command_end);*index=range.start;}
                 }
+                for source in &mut geometry.paint_sources {
+                    let mut range=source.command..source.command+1;raise_range(&mut range,commands.start,commands.end,command_end);source.command=range.start;
+                }
                 for fragment in &mut geometry.hit_fragments { remap_index(&mut fragment.hit); }
                 geometry.hit_fragments.sort_unstable_by_key(|fragment| fragment.hit);
                 for transform in &mut geometry.transforms {
@@ -37272,6 +38482,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 raise_range(command_range, commands.start, commands.end, command_end);
                 raise_range(hit_range, hits.start, hits.end, hit_end);
             }
+            self.outer_paint_edits = self.outer_paint_edits.wrapping_add(1);
             for entry in &mut self.pending_escapes {
                 let mut range = entry.2..entry.3;
                 raise_range(&mut range, commands.start, commands.end, command_end);
@@ -37669,6 +38880,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // Ranking rewrites the order field, so parts are found by identity.
         let reach_key=|entry:&StackingEscape|(entry.7.0.key(),entry.7.1.map(|pseudo|pseudo.generated_source_order()),entry.2,entry.4);
         let mut reaches:Vec<((u128,Option<u8>,usize,usize),(usize,usize))>=Vec::new();
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         for entry in self.pending_escapes.drain(..){
             let parts=Self::transparent_stacking_parts(entry,ownership.get(&(entry.8,entry.2,entry.4)).map_or(&[],Vec::as_slice))?;
             if sources.len().saturating_add(parts.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
@@ -37750,6 +38962,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // this final step. Published retained payloads and geometry are remapped
         // once by the shared scope-aware permutation below.
         self.completed_stacking_contexts.clear();self.paint_contexts.clear();
+        self.outer_paint_edits=self.outer_paint_edits.wrapping_add(1);
         self.positioned_flow_paints.clear();self.content_range_fragments.clear();
         self.flow_content_ranges=None;self.last_box_content_ranges=None;
         self.permute_stacking_ranges(&ranges)?;
@@ -37951,6 +39164,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 if let Some(index)=value.hit_index.as_mut(){*index=hit_map.index(*index);}
                 if let Some(index)=value.command_index.as_mut(){*index=command_map.index(*index);}
             }
+            remap_paint_sources(&mut geometry.paint_sources,|index|command_map.index(index),&command_map.reopened);
             for entry in &mut geometry.hit_fragments {entry.hit=hit_map.index(entry.hit);}
             geometry.hit_fragments.sort_unstable_by_key(|entry|entry.hit);
             if let Some(entries)=geometry.transform_reference_boxes.as_mut(){
@@ -37971,6 +39185,17 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         Ok((command_map,hit_map))
     }
 
+    /// A plain block size measurement that replays retained fragments
+    /// (`RetainedLayoutCache::measured`): no geometry, no min/max-content
+    /// sizing, and none of the contexts `intrinsic_context` keeps out of
+    /// retained sizes.
+    fn measures_from_retained(&self) -> bool {
+        self.retained_read.is_some() && self.retained_fragments.is_none() && self.geometry.is_none()
+            && self.intrinsic_inline_axis.is_none() && !self.intrinsic_minimum_atomics
+            && self.paragraph_column_flow.is_none() && self.rendered_table_context.is_none()
+            && self.table_cell_projection.is_none() && self.timeline_values.is_none()
+    }
+
     fn retained_fragment_key(
         &self,
         id: NodeId,
@@ -37986,37 +39211,40 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             NodeKind::Element { name, .. } => name,
             _ => return None,
         };
-        // Keep the retained path narrow: ordinary block-level boxes (block,
-        // list item, flow root, flex and grid containers) in a block container
-        // (block, list item, flow root, inline block, table cell or caption).
-        // Flex and grid items, inline-level and table boxes, positioned boxes
-        // and scroll containers stay on the normal layout path and can still
-        // reuse safe descendants.
+        // Keep the retained path narrow: in-flow block-level boxes (block,
+        // list item, flow root, flex, grid and table containers, statically or
+        // relatively positioned, transformed or not) in a block container
+        // (block, list item, flow root, inline block, table cell or caption)
+        // or as flex and grid items, whose used size is in their style.
+        // Inline-level boxes, table parts, out-of-flow boxes and scroll
+        // containers stay on the normal layout path and can still reuse safe
+        // descendants. A box whose own paint records (stacking contexts,
+        // z-index order, escapes) reach outside it is retained with them, in
+        // `RetainedPaintPhases`. Inside a transformed ancestor a fragment
+        // replays in the ancestor's local space, which its key's transform
+        // depth pins.
         if depth == 0
             || matches!(name.as_str(), "html" | "body")
-            || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption)
-            || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid)
-            || style.position != Position::Static
-            || style.float != Float::None
-            || style.paints_as_group()
-            || style.z_index.is_some()
-            || style.has_transform()
+            || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption | Display::Flex | Display::Grid)
+            || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid | Display::Table)
+            || !matches!(style.position, Position::Static | Position::Relative)
+            // A flex or grid item does not float, whatever its `float`.
+            || style.float != Float::None && !matches!(parent_style.display, Display::Flex | Display::Grid)
             || style.overflow_clip
             || style.overflow_x != css::Overflow::Visible
             || style.overflow_y != css::Overflow::Visible
-            || css::columns::active(&style)
+            // A multicol container outside any column flow lays out its
+            // columns inside its own fragment and is retained with them;
+            // inside an enclosing flow its lines feed the outer plan.
+            || css::columns::active(&style) && self.paragraph_column_flow.is_some()
             || self.paragraph_column_flow.as_ref().is_some_and(|flow|flow.pending || !flow.wrappers.is_empty())
             || style.sibling_position_dependent
-            || style.background_images.is_some()
             || style.background_attachment.as_ref().is_some_and(|items| {
                 items
                     .iter()
                     .any(|item| *item != css::BackgroundAttachment::Scroll)
             })
-            || self.transform_depth != 0
-            || self.pending_escapes.len() > RETAINED_OUTER_PAINT_RECORDS
-            || self.positioned_flow_paints.len() > RETAINED_OUTER_PAINT_RECORDS
-            || self.geometry.is_none()
+            || (self.geometry.is_none() && !self.measures_from_retained())
         {
             return None;
         }
@@ -38033,7 +39261,12 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             fixed_containing_block: self.fixed_containing_block,
             fixed_containing_block_node: self.fixed_containing_block_node,
             sticky_bounds: self.sticky_bounds,
-            scroll_hazards: self.scroll_hazards,
+            // No `scroll_hazards`: it counts hazards laid out before the box,
+            // and a fragment is retained only when its own layout adds none
+            // but those of absolutely positioned descendants, which its replay
+            // adds again (see `stable` in `box_for_with_children_output`), so
+            // scroll containers inside it compare equal counts wherever it
+            // replays.
             transform_depth: self.transform_depth,
             svg_geometry_capture: self.svg_geometry_capture,
             source_capture: self.source_capture_depth != 0,
@@ -38087,7 +39320,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
         }
         let Some(geometry) = self.geometry.as_deref_mut() else {
-            return Err(LayoutError::InvalidTree);
+            // A block size measurement (`RetainedLayoutCache::measured`)
+            // discards commands and keeps no geometry: only the margin state
+            // and overflow that the boxes after this one see remain.
+            if !self.measures_from_retained() {
+                return Err(LayoutError::InvalidTree);
+            }
+            self.collapsed_top = fragment.collapsed_top;
+            self.collapsed_bottom = fragment.collapsed_bottom;
+            self.was_through = fragment.was_through;
+            return self.include_local_overflow_with_margin(fragment.overflow.parent, fragment.overflow.margin, placement, OverflowRoute::Parent, 0..0, movable);
         };
         if geometry.collect_rendered_text {
             let boxes = fragment.rendered_text_boxes.as_deref().unwrap_or(&[]);
@@ -38097,7 +39339,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 return Err(LayoutError::CommandLimit);
             }
             geometry.rendered_text_bytes = geometry.rendered_text_bytes.checked_add(fragment.rendered_text_bytes)
-                .filter(|total| *total <= lumen_common::bidi::MAX_TEXT_BYTES).ok_or(LayoutError::Text)?;
+                .filter(|total| *total <= MAX_RENDERED_TEXT_BYTES).ok_or(LayoutError::Text)?;
             geometry.rendered_text_boxes.try_reserve(boxes.len()).map_err(|_| LayoutError::CommandLimit)?;
             for value in boxes.iter() {
                 let mut value = value.clone();
@@ -38258,6 +39500,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 .transpose()?;
             geometry.control_text_runs.push(run);
         }
+        geometry.paint_sources.try_reserve(fragment.paint_sources.len()).map_err(|_| LayoutError::CommandLimit)?;
+        for source in fragment.paint_sources.iter() {
+            geometry.paint_sources.push(PaintSource { command: command_base.checked_add(source.command).ok_or(LayoutError::InvalidTree)?, ..*source });
+        }
         if self.active_box == Some(fragment.key.node)
             && self.document.parent(fragment.key.node).ok().flatten() == Some(self.document.root()) {
             self.canvas_root_box = fragment.hits.first().filter(|hit| hit.node == fragment.key.node)
@@ -38288,6 +39534,37 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     entry.2=command_base.checked_add(entry.2).ok_or(LayoutError::CommandLimit)?;entry.3=command_base.checked_add(entry.3).ok_or(LayoutError::CommandLimit)?;
                     entry.4=hit_base.checked_add(entry.4).ok_or(LayoutError::CommandLimit)?;entry.5=hit_base.checked_add(entry.5).ok_or(LayoutError::CommandLimit)?;
                     if !is_surface{entry.8=self.next_paint_order.checked_add(entry.8).ok_or(LayoutError::CommandLimit)?;}output.push(entry);
+                }
+            }
+            if self.positioned_flow_paints.len().saturating_add(phases.positioned.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            self.positioned_flow_paints.try_reserve(phases.positioned.len()).map_err(|_|LayoutError::CommandLimit)?;
+            for paint in phases.positioned.iter(){
+                self.positioned_flow_paints.push(PositionedFlowPaint{order:self.next_paint_order.checked_add(paint.order).ok_or(LayoutError::CommandLimit)?,
+                    commands:rebase_range(paint.commands.clone(),command_base)?,hits:rebase_range(paint.hits.clone(),hit_base)?});
+            }
+            if self.positioned_clip_policies.len().saturating_add(phases.clips.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            self.positioned_clip_policies.try_reserve(phases.clips.len()).map_err(|_|LayoutError::CommandLimit)?;
+            for policy in phases.clips.iter(){
+                self.positioned_clip_policies.push(PositionedClipPolicy{source:policy.source,containing_block:policy.containing_block,
+                    commands:rebase_range(policy.commands.clone(),command_base)?,hits:rebase_range(policy.hits.clone(),hit_base)?});
+            }
+            if self.overflow_clip_commands.len().saturating_add(phases.clip_owners.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+            for &(index,owner) in phases.clip_owners.iter(){
+                self.overflow_clip_commands.insert(command_base.checked_add(index).ok_or(LayoutError::CommandLimit)?,owner);
+            }
+            self.scroll_hazards=self.scroll_hazards.saturating_add(phases.hazards);
+            if let Some(geometry)=self.geometry.as_deref_mut(){
+                for record in phases.containers.iter(){
+                    let key=record.node.key();
+                    match geometry.container_unit_index.get(&key).copied() {
+                        Some(index) if index<geometry.container_units.len() => geometry.container_units[index]=*record,
+                        _ => {
+                            if geometry.container_units.len()>=MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
+                            geometry.container_units.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                            geometry.container_unit_index.insert(key,geometry.container_units.len());
+                            geometry.container_units.push(*record);
+                        }
+                    }
                 }
             }
             self.next_paint_order=self.next_paint_order.checked_add(phases.order_advance).ok_or(LayoutError::CommandLimit)?;
@@ -38340,7 +39617,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         advance: f32,
         overflow: OverflowMetrics,
         has_text: bool,
-        paint_starts:(usize,usize,usize,usize,u64),
+        paint_starts:(usize,usize,usize,usize,u64,usize,usize,usize,usize),
+        paint_source_start: usize,
     ) -> Option<RetainedFragment> {
         let geometry = self.geometry.as_deref()?;
         let (
@@ -38388,6 +39666,19 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             SharedSlice::from(clone_vec(geometry.viewport_fixed_nodes.get(viewport_fixed_start..)?)?);
         let mut scroll_regions = clone_vec(geometry.scroll_regions.get(region_start..)?)?;
         let mut control_text_runs = clone_vec(geometry.control_text_runs.get(run_start..)?)?;
+        let mut paint_sources = Vec::new();
+        // Reorders inside the box may have dropped earlier records; the box's
+        // own are those at or after its start pointing into its commands.
+        let mut first = paint_source_start.min(geometry.paint_sources.len());
+        while first > 0 && geometry.paint_sources[first - 1].command >= command_start { first -= 1; }
+        for source in &geometry.paint_sources[first..] {
+            if source.command >= command_start && source.command < self.commands.len() {
+                paint_sources.try_reserve(1).ok()?;
+                paint_sources.push(PaintSource { command: source.command - command_start, ..*source });
+            }
+        }
+        let paint_source_bytes = paint_sources.len().checked_mul(core::mem::size_of::<PaintSource>())?;
+        let paint_sources = SharedSlice::from(paint_sources);
         let rendered_text_boxes = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_text_boxes.get(rendered_box_start..)?)?) } else { None };
         let rendered_table_members = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_table_members.get(rendered_member_start..)?)?) } else { None };
         let typographic_origins = if self.rules.has_typographic_content() {
@@ -38441,7 +39732,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_boxes.as_deref().unwrap_or(&[]),
             rendered_table_members.as_deref().unwrap_or(&[]),
         )?;
-        let (context_start,completed_start,escape_start,surface_start,order_start)=paint_starts;
+        let (context_start,completed_start,escape_start,surface_start,order_start,positioned_start,clip_start,hazard_start,container_start)=paint_starts;
         let mut contexts=Vec::new();
         for context in self.paint_contexts.get(context_start..)? {
             let mut context=*context;
@@ -38465,15 +39756,47 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let escapes=relative_sources(self.pending_escapes.get(escape_start..)?,false)?;
         let surfaces=relative_sources(self.surface_records.get(surface_start..)?,true)?;
+        // The box's own `position: relative` records, and those of
+        // descendants its block walks left for an outer walk to order.
+        let local=|range:&Range<usize>,base:usize|Some(range.start.checked_sub(base)?..range.end.checked_sub(base)?);
+        let mut positioned=Vec::new();
+        for paint in self.positioned_flow_paints.get(positioned_start..)?{
+            positioned.try_reserve(1).ok()?;
+            positioned.push(PositionedFlowPaint{order:paint.order.checked_sub(order_start)?,
+                commands:local(&paint.commands,command_start)?,hits:local(&paint.hits,hit_start)?});
+        }
+        let mut clips=Vec::new();
+        for policy in self.positioned_clip_policies.get(clip_start..)?{
+            clips.try_reserve(1).ok()?;
+            clips.push(PositionedClipPolicy{source:policy.source,containing_block:policy.containing_block,
+                commands:local(&policy.commands,command_start)?,hits:local(&policy.hits,hit_start)?});
+        }
+        let hazards=self.scroll_hazards.checked_sub(hazard_start)?;
+        // Size containers inside the box answer container queries from their
+        // records; the replay records them again.
+        let containers:Vec<ContainerUnitRecord>=geometry.container_units.get(container_start..)?.to_vec();
+        // The clip correction for those descendants finds the overflow clips
+        // around them by their commands.
+        let mut clip_owners=Vec::new();
+        if !clips.is_empty() {
+            for (&index,&owner) in self.overflow_clip_commands.range(command_start..){
+                clip_owners.try_reserve(1).ok()?;clip_owners.push((index-command_start,owner));
+            }
+        }
         let phase_bytes=core::mem::size_of::<RetainedPaintPhases>()
+            .checked_add(positioned.len().checked_mul(core::mem::size_of::<PositionedFlowPaint>())?)?
+            .checked_add(clips.len().checked_mul(core::mem::size_of::<PositionedClipPolicy>())?)?
+            .checked_add(containers.len().checked_mul(core::mem::size_of::<ContainerUnitRecord>())?)?
+            .checked_add(clip_owners.len().checked_mul(core::mem::size_of::<(usize,(NodeId,Option<css::PseudoElement>))>())?)?
             .checked_add(contexts.len().checked_mul(core::mem::size_of::<PaintContext>())?)?
             .checked_add(completed.len().checked_mul(core::mem::size_of::<usize>())?)?
             .checked_add(escapes.len().checked_add(surfaces.len())?.checked_mul(core::mem::size_of::<StackingEscape>())?)?;
-        let paint_phases=(!contexts.is_empty() || !escapes.is_empty() || !surfaces.is_empty()).then(||Arc::new(RetainedPaintPhases{
-            contexts:contexts.into(),completed:completed.into(),escapes:escapes.into(),surfaces:surfaces.into(),order_advance:self.next_paint_order-order_start,
+        let paint_phases=(!contexts.is_empty() || !escapes.is_empty() || !surfaces.is_empty() || !positioned.is_empty() || !clips.is_empty() || hazards != 0 || !containers.is_empty()).then(||Arc::new(RetainedPaintPhases{
+            contexts:contexts.into(),completed:completed.into(),escapes:escapes.into(),surfaces:surfaces.into(),positioned:positioned.into(),
+            clips:clips.into(),clip_owners:clip_owners.into(),hazards,containers:containers.into(),order_advance:self.next_paint_order-order_start,
         }));
         let bytes=bytes.checked_add(if paint_phases.is_some(){phase_bytes.checked_add(core::mem::size_of::<usize>()*10)?}else{0})?;
-        let bytes = bytes.checked_add(overflow_bytes)?;
+        let bytes = bytes.checked_add(overflow_bytes)?.checked_add(paint_source_bytes)?;
         let bytes = bytes.checked_add(typographic_origins.as_ref().map_or(0, |origins| origins.len() * core::mem::size_of::<NodeId>()))?;
         let bytes=hit_fragments.iter().try_fold(bytes,|bytes,entry|bytes.checked_add(core::mem::size_of::<HitFragments>())?.checked_add(entry.rects.len().checked_mul(core::mem::size_of::<Rect>())?))?;
         let bytes=bytes.checked_add(transform_reference_boxes.as_ref().map_or(0,|entries:&Arc<[(usize,TransformReferenceBox)]>|entries.len()*core::mem::size_of::<(usize,TransformReferenceBox)>()))?;
@@ -38529,6 +39852,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             viewport_fixed_nodes,
             scroll_regions,
             control_text_runs,
+            paint_sources,
             overflow_lines,
             paint_phases,
             rendered_text_collected: geometry.collect_rendered_text,
@@ -38538,6 +39862,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_bytes: geometry.rendered_text_bytes.checked_sub(rendered_bytes_start)?,
             rendered_table_context: self.rendered_table_context,
             has_text,
+            own_families: 0,
+            reads_block_basis: true,
             pending_images: None,
             deferred_images: None,
             pending_generation: 0,
@@ -38847,6 +40173,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }else{(x,y)};
         let saved_column_flow=if shared_column_owner {None}else{self.paragraph_column_flow.take()};
         let saved_active_box = self.active_box.replace(id);
+        let owner_pseudo = child_override.as_ref().and_then(|child| child.generated.as_ref()).map(|generated| generated.pseudo);
+        let saved_paint_owner = self.paint_owner.replace((id, owner_pseudo));
         let saved_computed_parent = computed_parent.map(|parent| self.computed_parent.replace(parent));
         // CSS Align 3 §9.1: inline-block baseline discovery skips block
         // table contributions. Table cells still discover a nested table's
@@ -38861,12 +40189,21 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let multicol = css::columns::active(&computed);
         if multicol { self.multicol_depth += 1; }
+        // The families this box shapes with are its own: a kept fragment
+        // records them, otherwise they belong to the enclosing box.
+        let families = self.text.family_record();
+        let enclosing_families = families.map(|record| record.replace(0));
         let result =
             self.box_for_baseline_scope(id, parent_style, Some(computed), x, y, available, depth, child_override, output_rect);
+        if let (Some(record), Some(enclosing)) = (families, enclosing_families) {
+            let owned = self.retained_owner.take() == Some(id);
+            record.set(if owned { enclosing } else { enclosing | record.get() });
+        }
         if multicol { self.multicol_depth -= 1; }
         self.export_block_table_baselines = saved_table_baselines;
         if let Some(saved) = saved_computed_parent { self.computed_parent = saved; }
         self.active_box = saved_active_box;
+        self.paint_owner = saved_paint_owner;
         if shared_column_owner {
             if let Some(flow)=self.paragraph_column_flow.as_mut(){flow.wrappers.truncate(column_wrapper_depth);}
         } else {self.paragraph_column_flow=saved_column_flow;}
@@ -38951,13 +40288,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         let placement=self.pending_overflow_placement.take().unwrap_or_else(||self.overflow_placement(x,y));
         let retain_to_parent=core::mem::take(&mut self.pending_overflow_moves);
+        if computed.as_ref().is_none_or(Style::reads_block_basis) {
+            self.note_block_basis_read();
+        }
         let key = if computed.as_ref().is_some_and(|style|style.transform_timeline_source().is_some()) || child_override.is_some() || self.table_cell_projection.is_some_and(|(node, level, _)| node == id && level == depth) {
             None
         } else { self.retained_fragment_key(id, parent_style, &computed, x, y, available, depth) };
         let collect_rendered_text = self.collects_rendered_text();
+        let read = self.retained_read.filter(|_| self.measures_from_retained());
         if let Some((fragment, shift)) = key
             .as_ref()
-            .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key, parent_style, computed.as_ref()?, (x, y)))
+            .and_then(|key| match self.retained_fragments.as_deref_mut() {
+                Some(cache) => cache.lookup(key, parent_style, computed.as_ref()?, (x, y)),
+                None => read?.measured(key, parent_style, computed.as_ref()?, (x, y)),
+            })
             .filter(|(fragment, _)| !collect_rendered_text || fragment.rendered_text_collected)
             .filter(|(fragment, _)| self.retained_pending_images_unchanged(fragment))
             .filter(|(fragment, _)| self.retained_floats_fit(fragment, y))
@@ -38984,6 +40328,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             if fragment.has_text {
                 self.text_uses.set(self.text_uses.get().wrapping_add(1));
+            }
+            if fragment.reads_block_basis {
+                self.note_block_basis_read();
             }
             return Ok(fragment.advance);
         }
@@ -39032,12 +40379,15 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
 
         let command_start = self.commands.len();
-        let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order);
+        let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order,self.positioned_flow_paints.len(),self.positioned_clip_policies.len(),self.scroll_hazards,
+            self.geometry.as_deref().map_or(0,|geometry|geometry.container_units.len()));
         let text_uses_before = self.text_uses.get();
+        let block_basis_before = self.intrinsics.block_basis_reads.get();
         let pending_mark = self.images.map_or(0, |images| images.pending_mark());
         let deferred_mark = self.geometry.as_deref().map_or(0, |geometry| geometry.deferred_images.len());
         let timeline_source_uses_before=self.timeline_source_uses;
         let filter_source_uses_before=self.filter_source_uses;
+        let paint_source_start = self.geometry.as_deref().map_or(0, |geometry| geometry.paint_sources.len());
         let geometry_start = self.geometry.as_deref().map(|geometry| {
             (
                 geometry.hits.len(),
@@ -39055,11 +40405,15 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             )
         });
         let retained_capture = key.as_ref().map(|_| (computed.clone(), self.typographic_origins.len(), self.positioned_uses));
-        let pending_before = key.as_ref().map(|_| self.pending_escapes.clone());
-        let positioned_before = key.as_ref().map(|_| self.positioned_flow_paints.clone());
+        // Up to `RETAINED_OUTER_PAINT_RECORDS` outer records are copied and
+        // compared; past that, the edit count and the lengths stand in.
+        let outer_before = (self.outer_paint_edits, self.pending_escapes.len(), self.positioned_flow_paints.len());
+        let pending_before = key.as_ref().filter(|_| self.pending_escapes.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.pending_escapes.clone());
+        let positioned_before = key.as_ref().filter(|_| self.positioned_flow_paints.len() <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.positioned_flow_paints.clone());
         let clip_policies_before=self.positioned_clip_policies.len();
+        let clips_before = key.as_ref().filter(|_| clip_policies_before <= RETAINED_OUTER_PAINT_RECORDS).map(|_| self.positioned_clip_policies.clone());
+        let unretainable_before = self.unretainable_hazards;
         let stacking_before = key.as_ref().map(|_| self.stacking_roots.clone());
-        let next_paint_before = self.next_paint_order;
         let hazards_before = self.scroll_hazards;
         let root_hazards_before = self.root_scroll_hazards;
 
@@ -39091,7 +40445,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             self.cull = self.viewport;
             self.cull_scroll = (0.0, 0.0);
         }
-        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.laid_out += 1; }
+        match self.retained_fragments.as_deref_mut() {
+            Some(cache) => cache.laid_out += 1,
+            None => self.intrinsics.boxes_measured.set(self.intrinsics.boxes_measured.get() + 1),
+        }
         let result = self.box_for_uncached(id, parent_style, computed, x, y, available, depth, child_override, output_rect);
         self.cull = saved_cull;
         self.cull_scroll = saved_cull_scroll;
@@ -39155,12 +40512,40 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             // Timeline-bearing fragments are sampled by the current source
             // operation. Retain unrelated fragments, without freezing rare
             // descendant map matrices or allocating per-fragment provenance.
-            let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && self.positioned_clip_policies.len()==clip_policies_before && self.floats.len() == floats_before
-                && self.next_paint_order == next_paint_before
-                && self.scroll_hazards == hazards_before
+            // Absolutely positioned descendants are retained with the box when
+            // their containing block is inside it: their clip policies and
+            // scroll hazards are replayed, and their overflow reaches no box
+            // outside the fragment.
+            let inside = |node: Option<NodeId>| {
+                let mut current = node;
+                for _ in 0..=512 {
+                    let Some(at) = current else { return false };
+                    if at == id { return true; }
+                    current = match self.document.composed_parent(at) { Ok(parent) => parent, Err(_) => return false };
+                }
+                false
+            };
+            let clips_kept = match clips_before.as_ref() {
+                Some(before) => self.positioned_clip_policies.starts_with(before)
+                    && self.positioned_clip_policies[before.len()..].iter().all(|policy| policy.commands.start >= command_start
+                        && policy.hits.start >= starts.0 && inside(policy.containing_block)),
+                None => self.positioned_clip_policies.len() == clip_policies_before && self.scroll_hazards == hazards_before,
+            };
+            let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && clips_kept && self.floats.len() == floats_before
+                && self.unretainable_hazards == unretainable_before
                 && self.root_scroll_hazards == root_hazards_before
-                && pending_before.as_ref() == Some(&self.pending_escapes)
-                && positioned_before.as_ref() == Some(&self.positioned_flow_paints)
+                && match pending_before.as_ref() {
+                    Some(before) => self.pending_escapes.starts_with(before),
+                    None => self.outer_paint_edits == outer_before.0 && self.pending_escapes.len() >= outer_before.1,
+                }
+                // The box may add records of its own, within its commands, for
+                // an outer block walk to order; the fragment keeps them.
+                && match positioned_before.as_ref() {
+                    Some(before) => self.positioned_flow_paints.starts_with(before)
+                        && self.positioned_flow_paints[before.len()..].iter()
+                            .all(|paint| paint.commands.start >= command_start && paint.hits.start >= starts.0),
+                    None => self.outer_paint_edits == outer_before.0 && self.positioned_flow_paints.len() == outer_before.2,
+                }
                 && stacking_before.as_ref() == Some(&self.stacking_roots)
                 && self.parent_height == key.parent_height
                 && self.containing_block == key.containing_block
@@ -39186,7 +40571,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     overflow,
                     self.text_uses.get() != text_uses_before,
                     paint_starts,
+                    paint_source_start,
                 ) {
+                    fragment.reads_block_basis = self.intrinsics.block_basis_reads.get() != block_basis_before;
                     if fragment.key.floats_above {
                         fragment.float_floor = box_float_floor;
                         fragment.float_base = y - self.float_offset.1;
@@ -39212,8 +40599,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                         fragment.bytes = fragment.bytes.saturating_add(deferred.len() * 512);
                         fragment.deferred_images = Some(Arc::from(deferred));
                     }
+                    fragment.own_families = self.text.family_record().map_or(u64::MAX, core::cell::Cell::get);
                     if let Some(cache) = self.retained_fragments.as_deref_mut() {
-                        cache.store(fragment);
+                        if cache.store(fragment) { self.retained_owner = Some(id); }
                     }
                     }
                 }
@@ -39282,6 +40670,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         child_override: Option<BoxChildOverride>,
         output_rect: Option<&mut Rect>,
     ) -> Result<(f32, OverflowMetrics), LayoutError> {
+        crate::progress::tick();
         if child_override.as_ref().is_none_or(|source|source.generated.is_none()) && self.embed_nothing(id) {return Ok((0.0,OverflowMetrics::default()));}
         let generated = child_override.as_ref().and_then(|source| source.generated.as_ref());
         let generated_pseudo = generated.map(|source| source.pseudo);
@@ -39433,6 +40822,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             };
             if out_of_flow || style.position == Position::Sticky {
                 self.scroll_hazards += 1;
+                if style.position != Position::Absolute { self.unretainable_hazards += 1; }
             }
             // The physical-width margin equation below owns only a
             // horizontal containing block's inline axis. A vertical parent's
@@ -40270,8 +41660,14 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         // arriving (see `ImageResolver::set_paint_only`).
         let sized_img=style.width.is_some()&&style.height.is_some()&&crate::forms::html_element_local_name(self.document,id)==Some("img");
         let previous=if sized_img{self.images.map(|images|images.set_paint_only(true))}else{None};
+        let mark=self.images.map_or(0,|images|images.pending_mark());
         let presentation=self.html_image_presentation_with_dimensions(id,attributes,style.width.is_some()||style.height.is_some());
-        if let (Some(images),Some(previous))=(self.images,previous){images.set_paint_only(previous);}
+        if let (Some(images),Some(previous))=(self.images,previous){
+            images.set_paint_only(previous);
+            if self.geometry.is_some() && images.pending_mark()!=mark {
+                self.img_lookups.borrow_mut().extend(images.pending_since(mark).into_iter().map(|(lookup,_)|lookup).take(4097));
+            }
+        }
         presentation
     }
     /// Whether an `<img>` can present its alternative text, which needs its
@@ -41218,6 +42614,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             style.width=Some(specified_dimension(&style,width));
             style.height=Some(specified_height(&style,height));
         }
+        // A block container with `content-visibility: hidden` lays out and
+        // paints its own box only, sized as if empty by its size containment.
+        let skips_contents = !virtual_parent && !generated_box && contents_origin.is_none()
+            && matches!(style.display, Display::Block | Display::FlowRoot | Display::InlineBlock) && style.skips_contents();
         let display_contents = contents_origin.is_some();
         let pseudo_style = contents_origin.as_ref()
             .or_else(|| virtual_children.as_ref().map(|source| &source.origin_style)).unwrap_or(&style);
@@ -41227,12 +42627,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         } else {
             replacement_content_url(&style)?
         };
-        let mut generated_before = if is_fieldset || virtual_parent || iframe || object_replaced {
+        let mut generated_before = if is_fieldset || virtual_parent || iframe || object_replaced || skips_contents {
             None
         } else {
             self.virtual_generated_child(id, pseudo_style, css::PseudoElement::Before, available)?
         };
-        let mut generated_after = if is_fieldset || virtual_parent || iframe || object_replaced {
+        let mut generated_after = if is_fieldset || virtual_parent || iframe || object_replaced || skips_contents {
             None
         } else {
             self.virtual_generated_child(id, pseudo_style, css::PseudoElement::After, available)?
@@ -41295,6 +42695,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             // A scrolling ancestor must relayout so fixed layers keep their
             // viewport positioning area while the element's clip moves.
             self.scroll_hazards += 1;
+            self.unretainable_hazards += 1;
             self.root_scroll_hazards += 1;
         }
         if style.display.is_table() {
@@ -41528,6 +42929,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             let paint_only_image = tag == "img" && replacement_source.is_none() && source.is_some()
                 && specified_width.is_some() && specified_height.is_some();
             let previous_paint_only = if paint_only_image { self.images.map(|images| images.set_paint_only(true)) } else { None };
+            let paint_only_mark = self.images.map_or(0, |images| images.pending_mark());
             let mut poster_source: Option<&str> = None;
             let procedural_replacement=if let Some(source)=replacement_source.as_deref() {
                 let image=css::computed_image_source(source,style.color);
@@ -41615,6 +43017,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
             if let (Some(images), Some(previous)) = (self.images, previous_paint_only) {
                 images.set_paint_only(previous);
+                if let Some(geometry) = self.geometry.as_deref_mut() { geometry.note_paint_only_lookups(images, paint_only_mark, true); }
             }
             // A blank canvas is still a replaced element: its bitmap dimensions
             // size the box even when no renderer bitmap has been allocated.
@@ -42053,7 +43456,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let virtual_children_are_flex_grid = matches!(style.display, Display::Flex | Display::Grid);
         let (mut flattened_block_children,column_generated_source) = if let Some(children) = virtual_children {
             (children.children,children.generated)
-        } else if is_fieldset || is_form_control || widget_replaced || iframe || object_replaced || virtual_children_are_flex_grid {
+        } else if is_fieldset || is_form_control || widget_replaced || iframe || object_replaced || virtual_children_are_flex_grid || skips_contents {
             (Vec::new(),None)
         } else {
             // Layout uses the anonymous box style, while descendant cascade
@@ -42846,7 +44249,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.next_paint_order(),
                 ));
             } else if computed.as_ref().is_some_and(|s| s.float != Float::None) {
-                let (mut floated,outer_width,intrinsic_height)=self.prepare_float_box(current,computed.unwrap(),content_width,depth+1)?;
+                let (mut floated,outer_width,intrinsic_height)=self.prepare_float_box(current,computed.unwrap(),content_width,depth+1,vertical_block_flow)?;
                 let frame = if vertical_block_flow {
                     FloatFrame::vertical(
                         &style,
@@ -43818,9 +45221,6 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             content_extent_height -= text_box_trim_end;
         }
         let content_extent_without_last_margin = (content_extent_height - previous_margin.value()).max(0.0);
-        // The last margin of a box that ends its parent's flow still reaches
-        // the parent's scrollable overflow; elsewhere it stays inside the box.
-        let ends_parent_flow = self.ends_parent_flow(id);
         let min_height_affects_used_size = style.min_height_intrinsic.is_some()
             || style.min_height > content_extent_without_last_margin;
         // Clearance followed by collapse-through boxes cannot join the parent's
@@ -44047,6 +45447,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
         }
         self.cull = saved_cull;
+        // Column fragments move with their container; only scroll replay
+        // of a suffix must lay them out again.
         if column_fragment_count > 1 {
             self.scroll_hazards += 1;
         }
@@ -44189,6 +45591,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             }
         }
         self.finish_hit(hit,hit_rect);
+        // The last margin of a box that ends its parent's flow still reaches
+        // the parent's scrollable overflow; elsewhere it stays inside the box.
+        // Only a box with such a margin scans its following siblings' styles.
+        let ends_parent_flow = content_extent_height != content_extent_without_last_margin
+            && self.overflow_frames.last().is_some_and(|frame| frame.node == id)
+            && self.ends_parent_flow(id);
         if let Some(frame) = self
             .overflow_frames
             .last_mut()
@@ -44210,7 +45618,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             if let Some(rect)=OverflowRect::new(local_x,local_y,padding_box.width,padding_box.height){frame.set_padding_box(rect);}
                         // Flex's natural line measurements size auto boxes; final movable
             // child projections, not pre-alignment measurements, own overflow.
-            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),(if scroll_container||vertical_block_flow||style.contain_layout||bottom_collapses||ends_parent_flow {content_extent_height} else {content_extent_without_last_margin}).max(content_height))};
+            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),(if scroll_container||vertical_block_flow||style.contain_layout||bottom_collapses
+||ends_parent_flow {content_extent_height} else {content_extent_without_last_margin}).max(content_height))};
             // Overflowing content of a scroll container keeps its end padding
             // reachable (CSS Overflow 3 §2.2).
             let reverse=scroll_reverse(&style);
@@ -44575,11 +45984,13 @@ fn laid_out_display_list(
             Err(LayoutError::UnsupportedMulticolumnLayout) => css::FALLBACK_NO_COLUMNS,
             Err(LayoutError::UnsupportedWidgetAppearance) => css::FALLBACK_PLAIN_SELECT,
             Err(LayoutError::UnsupportedGeneratedContent) => css::FALLBACK_NO_GENERATED,
+            Err(LayoutError::FlexSpeculation) => css::FALLBACK_NO_FLEX_SPECULATION,
             _ => 0,
         };
         if added == 0 || flags & added != 0 {
             rules.set_layout_fallback(0);
-            if flags != initial_flags {
+            // A layout without guesses lays out what a right guess does.
+            if (flags ^ initial_flags) & !css::FALLBACK_NO_FLEX_SPECULATION != 0 {
                 // Fragments laid out with a feature switched off must not be
                 // replayed by a later layout that runs with it enabled.
                 if let Some(cache) = retained_fragments.as_deref_mut() {
@@ -44697,6 +46108,8 @@ fn laid_out_display_list_once(
         inner: text,
         uses: core::cell::Cell::new(0),
         memo: RefCell::default(),
+        families: core::cell::Cell::new(0),
+        last_families: RefCell::new(None),
     };
     let mut layout = Layout::new(document, &counting, &counting.uses, rules, images,
         viewport, geometry, scrolls, style_cache, retained_fragments);
@@ -46459,6 +47872,49 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         .unwrap();
         let images = |_: &str| -> ImageState { panic!("offscreen image was loaded") };
         display_list_with_images(&document, 20, 10, &NoShape, &images).unwrap();
+    }
+
+    #[test]
+    fn fragments_inside_a_positioned_ancestor_replay_after_content_above_them_grows() {
+        for (inner, replays) in [
+            ("<p>two</p><p>three</p><p>four</p>", true),
+            ("<p>two</p><div style='height:10px'><i style='position:absolute;top:0'>x</i></div><p>four</p>", true),
+        ] {
+            let markup = alloc::format!("<!doctype html><style>body{{margin:0}}p{{height:10px;margin:0}}</style>\
+                <div style='position:relative'><p id='changed'>one</p>{inner}</div>");
+            let document = crate::html::parse(&markup, 64).unwrap();
+            let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+            let mut session = crate::session::RenderSession::new(document);
+            session.display_list(100, 100, &FixedText).unwrap();
+            session.document_mut().set_attribute(changed, "style", "height:30px").unwrap();
+            let list = session.display_list(100, 100, &FixedText).unwrap().clone();
+            if replays { assert!(session.layout_cache_stats().hits >= 2, "{inner}: the paragraphs below the grown one replay"); }
+
+            let document = crate::html::parse(&markup, 64).unwrap();
+            let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+            let mut fresh = crate::session::RenderSession::new(document);
+            fresh.document_mut().set_attribute(changed, "style", "height:30px").unwrap();
+            assert_eq!(&list, fresh.display_list(100, 100, &FixedText).unwrap(), "{inner}");
+        }
+    }
+
+    #[test]
+    fn fragments_after_a_box_that_becomes_sticky_still_replay() {
+        let markup = "<!doctype html><style>body{margin:0}p{height:10px;margin:0}</style><p id='changed'>one</p><p>two</p><p>three</p><p>four</p>";
+        let changed_style = "position:sticky;top:0";
+        let document = crate::html::parse(markup, 64).unwrap();
+        let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        session.display_list(100, 100, &FixedText).unwrap();
+        session.document_mut().set_attribute(changed, "style", changed_style).unwrap();
+        let list = session.display_list(100, 100, &FixedText).unwrap().clone();
+        assert!(session.layout_cache_stats().hits >= 3, "the paragraphs after the sticky one replay");
+
+        let document = crate::html::parse(markup, 64).unwrap();
+        let changed = crate::selector::query_selector(&document, document.root(), "#changed").unwrap().unwrap();
+        let mut fresh = crate::session::RenderSession::new(document);
+        fresh.document_mut().set_attribute(changed, "style", changed_style).unwrap();
+        assert_eq!(&list, fresh.display_list(100, 100, &FixedText).unwrap());
     }
 
     #[test]
@@ -54631,7 +56087,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn counting_shaper_answers_repeated_queries_from_its_memo() {
         let inner = CallCountingText { shapes: core::cell::Cell::new(0), metrics: core::cell::Cell::new(0) };
-        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default() };
+        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default(), families: core::cell::Cell::new(0), last_families: RefCell::new(None) };
         let font = FontSpec::default();
         let first = counting.shape_styled("one two", 16.0, false, &font).unwrap();
         let again = counting.shape_styled("one two", 16.0, false, &font).unwrap();
@@ -54670,6 +56126,110 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             assert_eq!(first, second);
             assert_eq!(layout.intrinsics.measured.get(), measured);
             assert_eq!(layout.intrinsics.reused.get(), reused + 1, "one lookup serves the repeat");
+        }
+    }
+
+    #[test]
+    fn intrinsic_sizes_measured_beside_floats_are_reused_in_later_frames() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=f style='float:left'><span>one two three</span></div>", 32).unwrap();
+        let float = crate::selector::query_selector(&document, document.root(), "#f").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let mut layout = Layout::new(&document, &FixedText, &uses, &rules, None,
+            Rect { x:0.0,y:0.0,width:100.0,height:100.0 }, None, &[], &styles, None);
+        // A float placed earlier in the formatting context does not change
+        // what the next float's content measures.
+        layout.floats.push((Rect { x:0.0, y:0.0, width:30.0, height:20.0 }, Float::Left));
+        let style = layout.computed_style_from_tree(float).unwrap();
+        let first = layout.intrinsic_size_mode(float, &style, 0, false).unwrap();
+        layout.intrinsics.begin_frame();
+        let second = layout.intrinsic_size_mode(float, &style, 0, false).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(layout.intrinsics.measured.get(), 0, "the next frame measures nothing again");
+        assert!(layout.intrinsics.reused.get() > 0);
+    }
+
+    #[test]
+    fn a_loaded_font_lays_out_again_only_the_text_that_uses_its_family() {
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}p{margin:0;font-family:Body,serif}i::before{content:'x';font-family:Icons}</style>");
+        for index in 0..24 { markup.push_str(&alloc::format!("<section><p>paragraph {index}</p></section>")); }
+        markup.push_str("<div id=icons><span><i></i></span></div>");
+        let fresh = |markup: &str| {
+            let document = crate::html::parse(markup, 512).unwrap();
+            crate::session::RenderSession::new(document).display_list(200, 900, &FixedText).unwrap().clone()
+        };
+        let document = crate::html::parse(&markup, 512).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        session.display_list(200, 900, &FixedText).unwrap();
+        let laid_out = |session: &crate::session::RenderSession| session.invalidation_stats().boxes_laid_out;
+        let before = laid_out(&session);
+        session.invalidate_font_families(["icons"], FixedText.generation());
+        let targeted = session.display_list(200, 900, &FixedText).unwrap().clone();
+        let icons = laid_out(&session) - before;
+        assert_eq!(targeted, fresh(&markup));
+        assert!(icons > 0, "the icon's text is laid out again");
+
+        let before = laid_out(&session);
+        session.invalidate_font_families(["BODY"], FixedText.generation());
+        session.display_list(200, 900, &FixedText).unwrap();
+        let body = laid_out(&session) - before;
+        assert!(body > icons * 4, "every paragraph uses the body font: {body} vs {icons}");
+
+        let before = laid_out(&session);
+        session.invalidate_font_families(["Unused"], FixedText.generation());
+        session.display_list(200, 900, &FixedText).unwrap();
+        assert_eq!(laid_out(&session) - before, 0, "nothing uses the family");
+    }
+
+    #[test]
+    fn a_loaded_font_whose_metrics_a_style_read_computes_styles_again() {
+        let styles_after_load = |icon_style: &str, family: &str| {
+            let mut markup = alloc::format!("<!doctype html><style>p{{font-family:Body}}i::before{{content:'x';font-family:{family};{icon_style}}}</style>");
+            for _ in 0..16 { markup.push_str("<p>text <i></i></p>"); }
+            let document = crate::html::parse(&markup, 512).unwrap();
+            let mut session = crate::session::RenderSession::new(document);
+            session.display_list(200, 600, &FixedText).unwrap();
+            let before = session.invalidation_stats().styles_computed;
+            session.invalidate_font_families([family], FixedText.generation());
+            session.display_list(200, 600, &FixedText).unwrap();
+            session.invalidation_stats().styles_computed - before
+        };
+        let kept = styles_after_load("padding-left:2px", "Glyphs");
+        let recomputed = styles_after_load("padding-left:1ex", "Metrics");
+        assert!(recomputed > kept, "an ex length read the loaded font: {recomputed} vs {kept}");
+    }
+
+    #[test]
+    fn styles_survive_a_font_generation_change_their_families_did_not_reach() {
+        struct Loading { loaded: core::cell::Cell<bool>, family: &'static str }
+        impl TextShaper for Loading {
+            fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+                Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+            }
+            fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> crate::paint::FontRelativeMetrics {
+                let wide = self.loaded.get() && font.family_bits() & crate::paint::font_family_bit(self.family) != 0;
+                let ex = if wide { size * 0.8 } else { size * 0.5 };
+                crate::paint::FontRelativeMetrics { ex, ch: ex }
+            }
+            fn generation(&self) -> u64 { 1 + u64::from(self.loaded.get()) }
+            fn ascent(&self, _: f32) -> f32 { 2.0 }
+            fn line_height(&self, _: f32) -> f32 { 3.0 }
+        }
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}p{margin:0;height:3px;font-family:Plain}.m{font-family:Metrics;display:block;width:2ex;height:1ex;background:red}.m b{display:block;height:1ex;font-family:Body;background:blue}</style>");
+        for _ in 0..30 { markup.push_str("<p></p>"); }
+        markup.push_str("<div class=m><b></b></div>");
+        for family in ["Metrics", "Body"] {
+            let text = Loading { loaded: core::cell::Cell::new(false), family };
+            let mut session = crate::session::RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+            session.display_list(200, 300, &text).unwrap();
+            let before = session.invalidation_stats().styles_computed;
+            text.loaded.set(true);
+            session.invalidate_font_families([family], text.generation());
+            let after_load = session.display_list(200, 300, &text).unwrap().clone();
+            let restyled = session.invalidation_stats().styles_computed - before;
+            let mut fresh = crate::session::RenderSession::new(crate::html::parse(&markup, 512).unwrap());
+            assert_eq!(after_load, *fresh.display_list(200, 300, &text).unwrap(), "{family}");
+            assert!(restyled < 20, "{family}: only styles using the family compute again, not {restyled}");
         }
     }
 
@@ -55149,6 +56709,17 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn column_flex_item_main_size_is_indefinite_in_an_automatic_container() {
+        // css-flexbox 9.8: without a definite container main size or flex
+        // basis, a percentage block size inside the item behaves as auto.
+        let inner = "<div style='background:green'><div style='height:100%;background:red'>aa</div><div>bb</div></div>";
+        let flex = colored_boxes(&alloc::format!("<div style='display:flex;flex-direction:column;width:20px'>{inner}</div>"));
+        let block = colored_boxes(&alloc::format!("<div style='width:20px'>{inner}</div>"));
+        assert_eq!(flex.len(), 2);
+        assert_eq!(flex, block);
+    }
+
+    #[test]
     fn unstretched_column_flex_item_shrinks_to_its_content() {
         let boxes = colored_boxes(
             "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='background:green'>aa</div></div><div style='display:flex;flex-direction:column;align-items:center;width:20px'><div style='background:green;height:2px'>aa</div></div>",
@@ -55549,7 +57120,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[derive(Default)]
-    struct RecordingText(core::cell::RefCell<Vec<String>>);
+    pub(super) struct RecordingText(core::cell::RefCell<Vec<String>>);
 
     fn native_button_fills_and_strokes(item_style: &str) -> Vec<String> {
         let html = alloc::format!(
@@ -56750,6 +58321,55 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn content_visibility_hidden_skips_the_contents_of_a_block() {
+        let shaped = painted_text_runs("<div style='content-visibility:hidden;background:red'>secret<span>inner</span><table><tr><td>cell</td></tr></table></div><p>shown</p>");
+        assert!(shaped.iter().any(|text| text == "shown"), "{shaped:?}");
+        assert!(!shaped.iter().any(|text| text.contains("secret") || text.contains("inner") || text.contains("cell")), "{shaped:?}");
+        // Size containment sizes the skipping box as if it were empty.
+        let document = crate::html::parse("<body style='margin:0'><div style='content-visibility:hidden'><p style='height:80px;margin:0'>x</p></div><p id=after style='margin:0;height:5px;background:blue'></p>", 64).unwrap();
+        let list = display_list(&document, 200, 200, &NoShape).unwrap();
+        assert!(list.0.iter().any(|command| matches!(command, Command::FillRect { rect, .. } if rect.y == 0.0 && rect.height == 5.0)), "{:?}", list.0);
+    }
+
+    #[test]
+    fn until_found_content_is_skipped_unless_the_author_shows_it() {
+        let shaped = painted_text_runs("<div hidden=until-found>secret</div><div hidden=UNTIL-FOUND style='content-visibility:visible'>open</div><p>shown</p>");
+        assert!(shaped.iter().any(|text| text == "shown") && shaped.iter().any(|text| text == "open"), "{shaped:?}");
+        assert!(!shaped.iter().any(|text| text == "secret"), "{shaped:?}");
+    }
+
+    fn live_value_session(value: &Rc<RefCell<String>>, generation: &Rc<core::cell::Cell<u64>>) -> crate::session::RenderSession {
+        let rows: String = (0..120).map(|row| alloc::format!("<p style='margin:0;height:10px'>row {row}</p>")).collect();
+        let mut document = crate::html::parse(&alloc::format!("<body style='margin:0'><form><input id=i></form>{rows}</body>"), 4096).unwrap();
+        let input = crate::selector::query_selector(&document, document.root(), "#i").unwrap().unwrap();
+        let read_generation = generation.clone();
+        document.set_validity_resolver(Rc::new(|_, _| None), Rc::new(move || read_generation.get()));
+        let read_value = value.clone();
+        document.set_form_value_resolver(Rc::new(move |node, read| {
+            if node == input { read(Some(&read_value.borrow())) } else { read(None) }
+        }));
+        crate::session::RenderSession::new(document)
+    }
+
+    #[test]
+    fn a_live_form_value_lays_out_the_boxes_around_its_control() {
+        let text = RecordingText::default();
+        let value = Rc::new(RefCell::new(String::from("a")));
+        let generation = Rc::new(core::cell::Cell::new(1));
+        let mut session = live_value_session(&value, &generation);
+        session.display_list(300, 2000, &text).unwrap();
+        *value.borrow_mut() = String::from("a longer value");
+        generation.set(2);
+        let before = session.invalidation_stats();
+        let list = session.display_list(300, 2000, &text).unwrap().clone();
+        let after = session.invalidation_stats();
+        assert!(after.boxes_laid_out - before.boxes_laid_out < 20, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
+        let fresh_value = Rc::new(RefCell::new(String::from("a longer value")));
+        let mut fresh = live_value_session(&fresh_value, &Rc::new(core::cell::Cell::new(2)));
+        assert_eq!(list, *fresh.display_list(300, 2000, &text).unwrap());
     }
 
     #[test]
@@ -59651,6 +61271,16 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let mut runs: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| !run.is_empty()).collect();
         runs.sort_unstable();
         assert_eq!(runs, ["1", "2", "x"], "{shaped:?}");
+    }
+
+    #[test]
+    fn list_items_count_with_authored_increments_of_other_counters() {
+        // Wikipedia's references: `ol.references > li { counter-increment: mw-references 1 }`.
+        let shaped = painted_text_runs(
+            "<style>body,ol{margin:0}ol{padding-left:24px;counter-reset:refs 0 list-item 0}li{counter-increment:refs 1}.none{counter-increment:none}.own{counter-increment:list-item 5}</style>\
+             <ol><li>a</li><li class=none>b</li><li>c</li><li class=own>d</li></ol>");
+        let markers: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| run.ends_with('.')).collect();
+        assert_eq!(markers, ["1.", "2.", "3.", "8."], "{shaped:?}");
     }
 
     #[test]
@@ -62608,6 +64238,45 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         assert_same_frame(&third, &fresh_frame(&document));
     }
 
+    const RETAINED_POSITIONED_PAGE: &str = "<!doctype html><style>html,body{margin:0}div,table{width:200px}\
+        #abs,#escaped{position:absolute;left:5px;top:5px;width:30px;height:30px;background:red}#clip{overflow:hidden;width:20px;height:20px}</style>\
+        <div id=rel style='position:relative;left:3px'>moved <b>text</b></div>\
+        <div id=cb style='position:relative;height:40px'><div id=abs></div>kept</div>\
+        <table id=t><tr><td>one</td><td>two</td></tr></table>\
+        <div id=outer style='position:relative;height:30px'><div id=clip><div id=escaped></div></div></div>\
+        <div id=z style='height:10px'></div>";
+
+    #[test]
+    fn retained_relative_absolute_and_table_boxes_replay_beside_a_change() {
+        let mut document = crate::html::parse(RETAINED_POSITIONED_PAGE, 64).unwrap();
+        let z = retained_node(&document, "#z");
+        let mut cache = RetainedLayoutCache::default();
+        let first = retained_frame(&document, &mut cache);
+        assert_same_frame(&first, &fresh_frame(&document));
+        // The relative box, the box holding an absolute child, the table and
+        // the box whose absolute child escapes an overflow clip all replay.
+        document.set_attribute(z, "style", "height:30px").unwrap();
+        cache.invalidate_changed(&document, &[z], &[], &[], &|_| false);
+        let second = retained_frame(&document, &mut cache);
+        assert!(cache.stats().hits >= 4, "{:?}", cache.stats());
+        assert_same_frame(&second, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_positioned_boxes_moved_by_a_change_above_match_a_fresh_layout() {
+        let source = RETAINED_POSITIONED_PAGE.replace("<div id=rel", "<div id=top style='height:10px'></div><div id=rel");
+        let mut document = crate::html::parse(&source, 64).unwrap();
+        let top = retained_node(&document, "#top");
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        for height in ["35px", "2px"] {
+            document.set_attribute(top, "style", &alloc::format!("height:{height}")).unwrap();
+            cache.invalidate_changed(&document, &[top], &[], &[], &|_| false);
+            let frame = retained_frame(&document, &mut cache);
+            assert_same_frame(&frame, &fresh_frame(&document));
+        }
+    }
+
     #[test]
     fn retained_changed_block_is_laid_out_again_while_siblings_replay() {
         let mut document = crate::html::parse(RETAINED_PAGE, 64).unwrap();
@@ -62659,7 +64328,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         for _ in 0..8 { markup.push_str("<div>row</div>"); }
         let document = crate::html::parse(&markup, 64).unwrap();
         let mut cache = RetainedLayoutCache::default();
-        assert_eq!(RetainedLayoutBudget::default(), RetainedLayoutBudget { max_entries: 16384, max_bytes: 8 * 1024 * 1024 });
+        assert_eq!(RetainedLayoutBudget::default(), RetainedLayoutBudget { max_entries: 16384, max_bytes: 32 * 1024 * 1024 });
         cache.set_budget(RetainedLayoutBudget { max_entries: 3, max_bytes: 8 * 1024 * 1024 });
         let first = retained_frame(&document, &mut cache);
         assert!(cache.stats().entries <= 3, "{:?}", cache.stats());
@@ -62802,7 +64471,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         cache.intrinsics_measured().0
     }
 
-    const FLEX_SHORTCUT_PAGES: [&str; 6] = [
+    const FLEX_SHORTCUT_PAGES: [&str; 10] = [
         "<style>html,body{margin:0}.f{display:flex;width:300px}.f>div{flex:1 1 20px}p{margin:0}</style>\
          <div class=f><div><p>aa bb cc</p><p>dd ee</p></div><div style='display:flex'><p>ff gg</p><p>hh ii jj</p></div></div>",
         "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:120px;height:200px}.f>*{flex:1 1 30px}</style>\
@@ -62815,6 +64484,19 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
          <div class=f><div>wrapped one</div><div>wrapped <b>two</b> words</div><div>three</div></div>",
         "<style>html,body{margin:0}.f{display:flex;min-height:80px;width:260px}.f>div{flex:0 0 90px;border:1px solid red}</style>\
          <div class=f><div>tall <i>item</i></div><div style='position:absolute'>abs</div><div>last one</div></div>",
+        "<style>html,body{margin:0}body{display:flex;flex-direction:column;min-height:100px}main{flex:1}p{margin:0}</style>\
+         <header style='padding:4px;max-width:150px'><p>head words that wrap at the width</p></header><main><table><tr><td>cell one</td><td>cell two</td></tr></table></main>\
+         <footer style='border:2px solid;min-width:50px'><p>foot</p><p>more foot text</p></footer>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:180px}p{margin:0}</style>\
+         <div class=f><div style='margin:0 10px'><p>stretched with margins and words</p></div><div style='align-self:start'>start</div>\
+         <div style='box-sizing:border-box;padding:0 20px'><p>padded words to wrap</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:200px;row-gap:6px;justify-content:center;align-items:center}p{margin:4px 0}</style>\
+         <div class=f><div style='margin:5px 3px;padding:2px;border:1px solid'><p>first item words that wrap</p></div>\
+         <div style='order:-1;display:flex;flex-direction:column'><p>nested column</p><p>two lines of nested words</p></div>\
+         <div style='align-self:stretch;flex:0 1 auto'>x</div><span>inline item</span></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:160px;align-items:baseline}p{margin:0}</style>\
+         <div class=f><div><p>baseline item words</p></div><div style='max-height:30px;overflow:hidden'><p>capped item with more words</p></div>\
+         <div style='height:20px'>fixed</div><div style='margin-top:auto'>auto margin</div><div style='position:relative;top:3px'><p>last words</p></div></div>",
     ];
 
     #[test]
@@ -62829,6 +64511,54 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         }
     }
 
+    /// Column containers with a minimum height: the items fill it (the guess
+    /// holds), leave free space that grows an item, leave free space nothing
+    /// takes, leave space that centering or an auto margin takes, and nested.
+    const MIN_HEIGHT_COLUMN_PAGES: [&str; 6] = [
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:120px;width:200px}main{flex:1}p{margin:0}</style>\
+         <div class=f><header style='height:10px'></header><main><p>words in the main part</p><div style='height:300px;background:red'></div></main>\
+         <footer style='margin-top:auto'><p>foot</p></footer></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px}main{flex:1;background:blue}p{margin:0}</style>\
+         <div class=f><header style='height:10px'></header><main><p>short main</p><div style='height:50%;background:red'>half</div></main><footer><p>foot</p></footer></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px;background:#eee}p{margin:0}</style>\
+         <div class=f><div><p>no item grows</p></div><div style='border:2px solid'><p>second</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px;justify-content:center}p{margin:0}</style>\
+         <div class=f><div><p>centred</p></div><div><p>items</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:220px;width:200px}p{margin:0}</style>\
+         <div class=f><div><p>top</p></div><div style='margin-top:auto;border-top:1px solid'><p>bottom</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;min-height:160px;width:220px}.g{display:flex;flex-direction:column;min-height:60px}.g>div{flex:1}p{margin:0}</style>\
+         <div class=f><div><div class=g><div><p>inner grows</p></div></div></div><div style='height:200px'></div><div class=g><p>fills</p><div style='height:90px'></div></div></div>",
+    ];
+
+    #[test]
+    fn column_flex_containers_with_a_minimum_height_render_like_full_measurement() {
+        for markup in MIN_HEIGHT_COLUMN_PAGES.iter().chain(&FLEX_SHORTCUT_PAGES[6..7]) {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let full = with_flex_shortcuts_disabled(|| fresh_frame(&document));
+            let mut cache = RetainedLayoutCache::default();
+            assert_same_frame(&retained_frame(&document, &mut cache), &full);
+            // A wrong guess is not made again, and a right one replays.
+            let guessed = cache.flex_speculation_failed.len();
+            assert_same_frame(&retained_frame(&document, &mut cache), &full);
+            assert_eq!(cache.flex_speculation_failed.len(), guessed, "{markup}");
+        }
+        let failed = |markup: &str| {
+            let mut cache = RetainedLayoutCache::default();
+            retained_frame(&crate::html::parse(markup, 4096).unwrap(), &mut cache);
+            cache.flex_speculation_failed.len()
+        };
+        let failures = MIN_HEIGHT_COLUMN_PAGES.map(failed);
+        assert_eq!(failures, [0, 1, 0, 1, 1, 1], "only free space an item or alignment takes fails the guess");
+    }
+
+    #[test]
+    fn a_column_that_fills_its_minimum_height_lays_its_items_out_once() {
+        let document = crate::html::parse(MIN_HEIGHT_COLUMN_PAGES[0], 4096).unwrap();
+        let shortcut = measured_in_first_frame(&document);
+        let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+        assert!(shortcut < full, "shortcut {shortcut}, full {full}");
+    }
+
     #[test]
     fn flex_items_with_a_given_basis_skip_their_max_content_measurement() {
         let document = crate::html::parse(FLEX_SHORTCUT_PAGES[0], 4096).unwrap();
@@ -62841,6 +64571,14 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
             assert!(shortcut <= full, "shortcut {shortcut}, full {full}: {markup}");
         }
+    }
+
+    #[test]
+    fn stretched_column_flex_items_skip_their_max_content_measurement() {
+        let document = crate::html::parse(FLEX_SHORTCUT_PAGES[6], 4096).unwrap();
+        let shortcut = measured_in_first_frame(&document);
+        let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+        assert!(shortcut < full, "shortcut {shortcut}, full {full}");
     }
 
     #[test]
@@ -62903,6 +64641,35 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                 counts.push(measured);
             }
             assert!(counts[1] <= counts[0] * 3, "doubling the depth multiplied measurements: {counts:?}");
+        }).unwrap().join().unwrap();
+    }
+
+    fn nested_table_page(depth: usize) -> String {
+        let mut open = String::new();
+        let mut close = String::new();
+        for level in 0..depth {
+            open.push_str(&alloc::format!("<table><tr><th>group {level}</th><td><div>"));
+            close.push_str("</div></td></tr></table>");
+        }
+        alloc::format!("<!doctype html>{open}<ul><li>alpha</li><li>beta gamma</li></ul>{close}")
+    }
+
+    #[test]
+    fn nested_table_layout_does_not_double_per_level() {
+        extern crate std;
+        // Unoptimized frames of nested table layout exceed the test thread's stack.
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut counts = Vec::new();
+            for depth in [4usize, 8] {
+                let document = crate::html::parse(&nested_table_page(depth), 4096).unwrap();
+                PARAGRAPH_MEASUREMENTS.with(|runs| runs.set(0));
+                fresh_frame(&document);
+                counts.push(PARAGRAPH_MEASUREMENTS.with(core::cell::Cell::get));
+            }
+            // Each level's text is laid out once per enclosing level, so twice
+            // the depth costs about four times as much. Before measurement
+            // layouts skipped the final cell pass, it cost about twenty times.
+            assert!(counts[1] <= counts[0] * 5, "doubling the depth multiplied layouts: {counts:?}");
         }).unwrap().join().unwrap();
     }
 
@@ -62997,5 +64764,35 @@ mod type_sizes {
             "retained slots: IntrinsicSizes holds one {} B IntrinsicSlot per measured (node*2) slot plus one {} B shared Style per way",
             size_of::<IntrinsicSlot>(), size_of::<Style>()
         );
+    }
+}
+
+#[test]
+fn auto_rows_over_definite_columns_size_to_each_item_at_its_column_width() {
+    let content = [
+        "a long run of words that wraps several times inside a narrow column",
+        "short",
+        "<div style='padding:7px'>nested block with a few more words in it</div>",
+    ];
+    let rect_of = |markup: &str, id: &str| {
+        let document = crate::html::parse(markup, 256).unwrap();
+        let node = crate::selector::get_element_by_id(&document, document.root(), id).unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        display_list_with_styles(&document, 800, 600, &tests::RecordingText::default(), &rules, None, Some(&mut geometry), &[]).unwrap();
+        geometry.hits.iter().find(|hit| hit.node == node).unwrap().rect
+    };
+    for (columns, widths) in [("100px 1fr 150px", [100.0, 350.0, 150.0]), ("1fr 2fr 1fr", [150.0, 300.0, 150.0])] {
+        let alone: Vec<f32> = content.iter().zip(widths).map(|(text, width)| {
+            rect_of(&alloc::format!("<style>body{{margin:0}}</style><div id=x style='width:{width}px;border:2px solid'>{text}</div>"), "x").height
+        }).collect();
+        let row = alone.iter().copied().fold(0.0f32, f32::max);
+        let items: String = content.iter().enumerate()
+            .map(|(i, text)| alloc::format!("<div id=i{i} style='border:2px solid'>{text}</div>")).collect();
+        let markup = alloc::format!("<style>body{{margin:0}}</style><div style='display:grid;width:600px;grid-template-columns:{columns}'>{items}</div>");
+        for (i, width) in widths.iter().enumerate() {
+            let rect = rect_of(&markup, &alloc::format!("i{i}"));
+            assert_eq!((rect.width, rect.height), (*width, row), "{columns} item {i}, alone {alone:?}");
+        }
     }
 }
